@@ -335,6 +335,10 @@
 
       <fieldset>
         <legend>代理（可选；批量模式可后续单独配置）</legend>
+        <div class="proxy-parse">
+          <input id="proxyRawInput" autocomplete="off" placeholder="粘贴代理链接后点“一键解析”：http://user:pass@1.2.3.4:8080 、socks5://1.2.3.4:1080 、1.2.3.4:8080:user:pass 、user:pass@1.2.3.4:8080">
+          <button type="button" class="btn small" id="btnParseProxyInForm">一键解析</button>
+        </div>
         <div class="grid4">
           <label>协议
             <select name="proxy_scheme">

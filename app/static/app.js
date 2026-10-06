@@ -485,6 +485,96 @@ $("#btnProxyTest").addEventListener("click", async () => {
   } catch (e) { toast(`测试失败：${e.message}`, "err"); }
 });
 
+/* ------------------------------------------------ 一键解析代理 */
+
+function isPortLike(v) {
+  return /^\d+$/.test(v) && Number(v) >= 1 && Number(v) <= 65535;
+}
+
+function splitHostPort(s) {
+  const i = s.lastIndexOf(":");
+  if (i < 0) return { host: s, port: "" };
+  const host = s.slice(0, i), port = s.slice(i + 1);
+  return isPortLike(port) ? { host, port } : { host: s, port: "" };
+}
+
+function splitUserPass(s) {
+  const i = s.indexOf(":");
+  return i < 0 ? { username: s, password: "" } : { username: s.slice(0, i), password: s.slice(i + 1) };
+}
+
+function normalizeScheme(sch) {
+  if (!sch) return null;
+  sch = sch.toLowerCase();
+  if (sch === "socks5h") return "socks5";
+  if (sch === "socks4a") return "socks4";
+  return ["http", "https", "socks5", "socks4"].includes(sch) ? sch : null;
+}
+
+// 支持：scheme://user:pass@host:port、user:pass@host:port、host:port@user:pass、
+//      host:port:user:pass、user:pass:host:port、host:port
+function parseProxyString(raw) {
+  let s = (raw || "").trim();
+  if (!s) return null;
+  let scheme = null;
+  const m = s.match(/^([a-zA-Z][a-zA-Z0-9+.\-]*):\/\//);
+  if (m) { scheme = normalizeScheme(m[1]); s = s.slice(m[0].length); }
+  s = s.split(/[\/?#]/)[0];   // 去掉路径/查询/片段
+  if (!s) return null;
+
+  let host = "", port = "", username = "", password = "";
+
+  if (s.includes("@")) {
+    const i = s.lastIndexOf("@");
+    const left = s.slice(0, i), right = s.slice(i + 1);
+    const leftHP = splitHostPort(left), rightHP = splitHostPort(right);
+    if (leftHP.port && !rightHP.port) {
+      host = leftHP.host; port = leftHP.port;                    // host:port@user:pass
+      const up = splitUserPass(right); username = up.username; password = up.password;
+    } else {
+      const up = splitUserPass(left); username = up.username; password = up.password;
+      host = rightHP.host; port = rightHP.port;                  // user:pass@host:port
+    }
+  } else {
+    const parts = s.split(":");
+    if (parts.length === 2) {
+      host = parts[0]; port = parts[1];
+    } else if (parts.length === 3 && isPortLike(parts[1])) {
+      host = parts[0]; port = parts[1]; username = parts[2];
+    } else if (parts.length === 4) {
+      if (isPortLike(parts[1]) && !isPortLike(parts[3])) {
+        host = parts[0]; port = parts[1]; username = parts[2]; password = parts[3];
+      } else if (isPortLike(parts[3]) && !isPortLike(parts[1])) {
+        username = parts[0]; password = parts[1]; host = parts[2]; port = parts[3];
+      } else { return null; }
+    } else { return null; }
+  }
+
+  host = (host || "").trim();
+  if (!host || !isPortLike(String(port))) return null;
+  return { scheme, host, port: Number(port), username, password };
+}
+
+function parseProxyFromForm() {
+  const f = $("#profileForm"), box = $("#proxyResult");
+  const raw = $("#proxyRawInput").value;
+  if (!raw.trim()) { box.textContent = "请先粘贴代理链接"; box.className = "proxy-result bad"; return; }
+  const p = parseProxyString(raw);
+  if (!p) { box.textContent = "✘ 无法识别该代理格式，请检查后重试"; box.className = "proxy-result bad"; return; }
+  if (p.scheme) f.proxy_scheme.value = p.scheme;
+  f.proxy_host.value = p.host;
+  f.proxy_port.value = p.port;
+  f.proxy_username.value = p.username;
+  f.proxy_password.value = p.password;
+  box.textContent = `✔ 已解析：${f.proxy_scheme.value} ${p.host}:${p.port}${p.username ? "（含账号密码）" : "（无账号密码）"}`;
+  box.className = "proxy-result good";
+}
+
+$("#btnParseProxyInForm").addEventListener("click", parseProxyFromForm);
+$("#proxyRawInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); parseProxyFromForm(); }
+});
+
 /* ------------------------------------------------ 自检链接 */
 
 async function loadDetectLinks() {
