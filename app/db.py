@@ -257,14 +257,19 @@ def update_profile(
     return get_profile(profile_id)
 
 
-def delete_profile(profile_id: str) -> bool:
+def delete_profile(profile_id: str, *, tombstone: bool = True) -> bool:
+    """删除环境。
+
+    tombstone=False 供同步应用远端删除时使用：墓碑时间戳由调用方（远端）
+    提供并另行写入，避免这里用本地 _now() 覆盖掉远端更早的真实删除时间。
+    """
     conn = _require_conn()
     with _lock, conn:
         row = conn.execute(
             "SELECT sync_id FROM profiles WHERE id = ?", (profile_id,)
         ).fetchone()
         cur = conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
-        if cur.rowcount and row and row["sync_id"]:
+        if cur.rowcount and tombstone and row and row["sync_id"]:
             # 记录删除墓碑，供同步时传播删除
             conn.execute(
                 "INSERT OR REPLACE INTO sync_deletes (sync_id, deleted_at) VALUES (?, ?)",
@@ -306,6 +311,10 @@ def upsert_profile_by_sync(*, sync_id: str, rev: str, name: str, group_name: str
     local = get_profile_by_sync_id(sync_id)
     if local and (local.get("rev") or "") >= rev:
         return "skipped"
+    # 删除墓碑同样参与 LWW：墓碑时间不早于本次 rev 时不复活（删除优先）
+    tomb = get_sync_delete(sync_id)
+    if tomb and (tomb.get("deleted_at") or "") >= rev:
+        return "skipped"
     with _lock, conn:
         if local:
             conn.execute(
@@ -343,10 +352,30 @@ def list_sync_deletes(since: Optional[str] = None) -> list[dict[str, Any]]:
         return [dict(r) for r in conn.execute(query, params).fetchall()]
 
 
-def clear_sync_delete(sync_id: str) -> None:
+def get_sync_delete(sync_id: str) -> Optional[dict[str, Any]]:
     conn = _require_conn()
+    with _lock:
+        row = conn.execute(
+            "SELECT * FROM sync_deletes WHERE sync_id = ?", (sync_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def record_sync_delete(sync_id: str, deleted_at: str = "") -> None:
+    """写入/更新删除墓碑，时间戳取较新者（LWW）。
+
+    墓碑不再在推送/拉取后立即清空：否则其它节点再次推送旧副本时会被复活。
+    仅在更新版本（rev 更晚）的 profile 同步进来时才清除（见 upsert_profile_by_sync）。
+    """
+    conn = _require_conn()
+    ts = deleted_at or _now()
     with _lock, conn:
-        conn.execute("DELETE FROM sync_deletes WHERE sync_id = ?", (sync_id,))
+        conn.execute(
+            """INSERT INTO sync_deletes (sync_id, deleted_at) VALUES (?, ?)
+               ON CONFLICT(sync_id) DO UPDATE SET
+               deleted_at = MAX(deleted_at, excluded.deleted_at)""",
+            (sync_id, ts),
+        )
 
 
 # ---------------------------------------------------------------- RPA 任务
