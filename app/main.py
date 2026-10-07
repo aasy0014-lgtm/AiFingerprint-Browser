@@ -417,7 +417,11 @@ async def update_settings(request: Request, body: SettingsUpdate) -> dict:
     if body.regenerate_sync_token:
         sync_cfg["regenerate_sync_token"] = True
 
-    if body.api_key_enabled is not None or body.regenerate_key:
+    # 全局敏感项统一要求管理员：认证开关、同步服务器（开启即暴露 /api/sync/*，
+    # 且重新生成令牌会让其它节点的配置全部失效）、远端同步目标
+    if (body.api_key_enabled is not None or body.regenerate_key
+            or body.sync_server_enabled is not None or body.regenerate_sync_token
+            or body.sync_remote_url is not None or body.sync_remote_token is not None):
         require_admin(request)
 
     settings = security.update_settings(
@@ -1242,9 +1246,18 @@ async def get_task_run(request: Request, run_id: str) -> dict:
 
 
 @app.post("/api/v1/task-runs/{run_id}/cancel")
-async def cancel_task_run(run_id: str) -> dict:
-    if not db.get_run(run_id):
+async def cancel_task_run(request: Request, run_id: str) -> dict:
+    member = member_of(request)
+    r = db.get_run(run_id)
+    if not r:
         raise ApiError(404, "运行记录不存在")
+    if not is_admin(member):
+        # 与 get_task_run 一致：operator 只能取消自己任务/环境的运行
+        t = db.get_task(r["task_id"])
+        p = db.get_profile(r["profile_id"])
+        owned = (t or {}).get("owner") == member["id"] or (p or {}).get("owner") == member["id"]
+        if not owned:
+            raise ApiError(403, "无权操作该运行记录")
     if not task_engine.cancel(run_id):
         raise ApiError(409, "该运行已结束，无法取消")
     return ok()
