@@ -243,7 +243,10 @@ def update_profile(
         proxy = json.loads(updates["proxy_json"])
         updates["proxy_json"] = json.dumps(encrypt_proxy(proxy), ensure_ascii=False)
     conn = _require_conn()
-    updates = {**updates, "updated_at": _now()}
+    # rev 必须与 updated_at 一起前移：远端 LWW 按 rev 比较，
+    # 若本地编辑只更新 updated_at，推送/拉取会永远判定为"无变化"（skipped）
+    now = _now()
+    updates = {**updates, "updated_at": now, "rev": now}
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     with _lock, conn:
         cur = conn.execute(
