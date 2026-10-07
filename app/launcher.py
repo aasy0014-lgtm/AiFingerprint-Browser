@@ -10,6 +10,7 @@ from .kernels import camoufox_kernel, chromium_kernel, fp_chromium_kernel
 from .config import PROFILE_ROOT
 from . import db, security
 from .models import LaunchConfig, ProxyConfig
+from .proxy_dns import is_ip_address, resolve_real_ip
 from .proxy_forwarder import AuthProxyForwarder, needs_forwarder
 from .risk_presets import apply_preset
 
@@ -73,6 +74,12 @@ class LaunchManager:
             # 环境自身未配代理时，兜底使用全局代理
             proxy_data = profile.get("proxy") or security.get_global_proxy()
             proxy = ProxyConfig(**proxy_data) if proxy_data else None
+            # 本机 fake-IP（TUN）会把代理域名解析成 198.18.x.x，改用 DoH 取真实 IP
+            if proxy and not is_ip_address(proxy.host):
+                real_ip = await resolve_real_ip(proxy.host)
+                if real_ip and real_ip != proxy.host:
+                    log.info("代理域名 %s 经 DoH 解析为真实 IP %s", proxy.host, real_ip)
+                    proxy = proxy.model_copy(update={"host": real_ip})
 
             # Chromium 系内核不支持带账密代理命令行：本地起认证转发器桥接
             forwarder: AuthProxyForwarder | None = None
