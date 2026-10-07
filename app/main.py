@@ -1238,12 +1238,11 @@ async def list_task_runs(request: Request, task_id: Optional[str] = None,
                          profile_id: Optional[str] = None,
                          limit: int = 50) -> dict:
     member = member_of(request)
-    runs = db.list_runs(task_id=task_id, profile_id=profile_id, limit=limit)
-    if not is_admin(member):
-        # operator 只能看到自己任务/环境的运行记录
-        my_tasks = {t["id"] for t in db.list_tasks(owner=member["id"])}
-        my_profiles = {p["id"] for p in db.list_profiles(owner=member["id"])}
-        runs = [r for r in runs if r["task_id"] in my_tasks or r["profile_id"] in my_profiles]
+    # 归属过滤必须在 SQL 层完成（见 db.list_runs）：先 LIMIT 再由 Python 过滤会让
+    # operator 自己的运行记录被他人记录挤出返回窗口，且分页条数不稳定
+    runs = db.list_runs(task_id=task_id, profile_id=profile_id,
+                        limit=max(1, min(limit, 200)),
+                        owner=None if is_admin(member) else member["id"])
     return ok(runs)
 
 
@@ -1439,7 +1438,9 @@ async def run_schedule_now(request: Request, schedule_id: str) -> dict:
 async def audit_logs(request: Request, action: Optional[str] = None, limit: int = 100,
                      offset: int = 0) -> dict:
     require_admin(request)
-    return ok(db.list_audit_logs(action=action, limit=min(limit, 500), offset=offset))
+    # 负数 limit 会让 SQLite 的 LIMIT 失效并返回全量日志，负 offset 亦无意义，统一收敛
+    return ok(db.list_audit_logs(action=action, limit=min(max(limit, 1), 500),
+                                 offset=max(offset, 0)))
 
 
 @app.post("/api/v1/proxy/test")

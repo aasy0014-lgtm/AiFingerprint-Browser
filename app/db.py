@@ -483,7 +483,7 @@ def get_run(run_id: str) -> Optional[dict[str, Any]]:
 
 
 def list_runs(task_id: str | None = None, profile_id: str | None = None,
-              limit: int = 50) -> list[dict[str, Any]]:
+              limit: int = 50, owner: str | None = None) -> list[dict[str, Any]]:
     conn = _require_conn()
     query, params = "SELECT * FROM task_runs", []
     conds = []
@@ -491,6 +491,12 @@ def list_runs(task_id: str | None = None, profile_id: str | None = None,
         conds.append("task_id = ?"); params.append(task_id)
     if profile_id:
         conds.append("profile_id = ?"); params.append(profile_id)
+    if owner is not None:
+        # 归属必须在 SQL 层过滤：若先 LIMIT 再由调用方在 Python 里筛，
+        # operator 自己的运行记录会被他人记录挤出返回窗口而"看不见"
+        conds.append("(task_id IN (SELECT id FROM tasks WHERE owner = ?) "
+                     "OR profile_id IN (SELECT id FROM profiles WHERE owner = ?))")
+        params += [owner, owner]
     if conds:
         query += " WHERE " + " AND ".join(conds)
     query += " ORDER BY started_at DESC LIMIT ?"
