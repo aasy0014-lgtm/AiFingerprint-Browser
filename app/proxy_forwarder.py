@@ -12,6 +12,7 @@ fp-chromium / chromium 内核也能使用带账密的代理。
 import asyncio
 import base64
 import logging
+import ssl
 from typing import Optional
 
 import httpx
@@ -120,8 +121,14 @@ class AuthProxyForwarder:
         host, _, port_s = target.rpartition(":")
         host = host.strip("[]")
         port = int(port_s) if port_s.isdigit() else 443
-        ur, uw = await asyncio.open_connection(self.upstream.host, self.upstream.port)
         scheme = self.upstream.scheme
+        # https 上游：代理本身走 TLS。必须先完成 TLS 握手再发 CONNECT，
+        # 否则明文 CONNECT 会被对端当作非法握手而断开（此前的 502 根因）。
+        # 使用默认校验上下文，与下方明文 HTTP 走 httpx 的校验行为保持一致。
+        ssl_ctx = ssl.create_default_context() if scheme == "https" else None
+        ur, uw = await asyncio.open_connection(
+            self.upstream.host, self.upstream.port, ssl=ssl_ctx
+        )
         try:
             if scheme in ("http", "https"):
                 req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
