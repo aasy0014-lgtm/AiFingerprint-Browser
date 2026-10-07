@@ -6,11 +6,14 @@
 """
 import base64
 import json
+import logging
 import secrets
 from pathlib import Path
 from typing import Any, Optional
 
 from .config import DATA_DIR, ensure_dirs
+
+log = logging.getLogger(__name__)
 
 _SECRET_FILE = DATA_DIR / "secret.key"
 _SETTINGS_FILE = DATA_DIR / "settings.json"
@@ -57,9 +60,16 @@ def load_settings() -> dict[str, Any]:
     if _SETTINGS_FILE.exists():
         try:
             data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
-            return {**_default_settings(), **data}
+            if not isinstance(data, dict):
+                raise ValueError("settings.json 顶层不是对象")
+            merged = {**_default_settings(), **data}
+            # 默认值里有随机密钥（api_key/sync_token）：补齐缺失键后必须落盘，
+            # 否则每次读取都会得到不同的随机值（认证/同步随机失败）
+            if set(merged) != set(data):
+                save_settings(merged)
+            return merged
         except Exception:
-            pass
+            log.warning("settings.json 无法解析，已重建（原文件内容将被覆盖）", exc_info=True)
     settings = _default_settings()
     save_settings(settings)
     return settings
@@ -67,9 +77,11 @@ def load_settings() -> dict[str, Any]:
 
 def save_settings(settings: dict[str, Any]) -> None:
     ensure_dirs()
-    _SETTINGS_FILE.write_text(
-        json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    # 先写临时文件再原子替换：直接覆盖写入若被中断会留下半截 JSON，
+    # 下次启动会解析失败并重新生成 api_key/sync_token，把已配置的客户端全部锁死
+    tmp = _SETTINGS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(_SETTINGS_FILE)
 
 
 def update_settings(api_key_enabled: Optional[bool] = None, regenerate: bool = False,
