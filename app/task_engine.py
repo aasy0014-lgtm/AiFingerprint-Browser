@@ -407,9 +407,12 @@ class TaskEngine:
             shot_dir = DATA_DIR / "runs" / ctx.run_id
             shot_dir.mkdir(parents=True, exist_ok=True)
             name = step.get("name") or f"step_{entry['index']}"
-            path = shot_dir / f"{name}.png"
+            # 用户已在 name 里带 .png 后缀时不再重复追加（否则会存成 xxx.png.png）
+            if not name.lower().endswith(".png"):
+                name = f"{name}.png"
+            path = shot_dir / name
             await page.screenshot(path=str(path), full_page=bool(step.get("full_page")))
-            entry["screenshot"] = f"/runs/{ctx.run_id}/{name}.png"
+            entry["screenshot"] = f"/runs/{ctx.run_id}/{name}"
             entry["detail"] = f"截图已保存 {path.name}"
             return None
 
