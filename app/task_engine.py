@@ -151,6 +151,7 @@ class TaskEngine:
         started_by_us = False
         pw = None          # fp-chromium/chromium：本 run 专属 playwright 连接
         conn_browser = None
+        results: list[dict] = []
         try:
             inst = self.manager.get_instance(profile["id"])
             if inst is None:
@@ -189,9 +190,13 @@ class TaskEngine:
                                        "failed" if failed else "success", results)
         except asyncio.CancelledError:
             db.update_run(run_id, {"status": "cancelled", "finished": True})
+            # 取消同样是「运行结束」，需回调，否则调用方永远等不到通知
+            await self._notify_webhook(task, profile, run_id, "cancelled", results)
         except Exception as e:
             log.exception("任务运行 %s 失败", run_id)
             db.update_run(run_id, {"status": "failed", "error": str(e)[:500], "finished": True})
+            # 浏览器启动失败等异常路径此前也不回调，一并补齐
+            await self._notify_webhook(task, profile, run_id, "failed", results)
         finally:
             self._jobs.pop(run_id, None)
             # CDP 连接只断开不杀浏览器；auto_close 时由 manager.stop 统一关闭
