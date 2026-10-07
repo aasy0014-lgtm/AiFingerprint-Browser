@@ -109,6 +109,7 @@ async function enterMain(status) {
   $("#main").hidden = false;
   $("#connState").textContent = "已连接";
   $("#connState").className = "ok";
+  $("#openWorkbench").href = config.serverUrl + "/";  // 跟随已配置地址，而非写死 127.0.0.1:18080
   renderStatus(status);
   await Promise.all([loadProfiles(), loadCurrentTab()]);
 }
