@@ -270,10 +270,13 @@ async def test_mcp_protocol():
                         "params": {"protocolVersion": "2025-03-26"}})
         check("MCP initialize", r.get("result", {}).get("serverInfo", {}).get("name") == "fpworkbench")
 
-        # tools/list
+        # tools/list：数量与 app.mcp_server 实际注册保持一致（避免工具增减后断言失效）
+        from app.mcp_server import build_tools
+        expected_tools = len(build_tools(None))
         r = send_recv({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = r.get("result", {}).get("tools", [])
-        check("MCP tools/list 19 个工具", len(tools) == 19, f"实际 {len(tools)} 个")
+        check(f"MCP tools/list 与实现一致（{expected_tools} 个）",
+              len(tools) == expected_tools, f"实际 {len(tools)} 个")
         tool_names = {t["name"] for t in tools}
         for expected in ["status", "list_profiles", "create_profile", "start_browser",
                          "navigate", "screenshot", "matrix_report", "run_task", "list_schedules"]:

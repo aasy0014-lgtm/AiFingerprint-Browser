@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from app.mcp_server import build_tools  # noqa: E402
 # venv 解释器路径跨平台不同（Windows: Scripts/python，POSIX: bin/python）；
 # 找不到时退回当前解释器，避免脚本在 macOS/Linux 上直接崩掉
 _VENV_PY = ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / "python"
@@ -43,7 +45,8 @@ send({"jsonrpc": "2.0", "method": "notifications/initialized"}, expect_response=
 
 r = send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
 names = [t["name"] for t in r["result"]["tools"]]
-check("tools/list 数量>=19", len(names) >= 19, f"共 {len(names)} 个")
+expected_tools = len(build_tools(None))
+check(f"tools/list 与实现一致（{expected_tools} 个）", len(names) == expected_tools, f"共 {len(names)} 个")
 check("工具含 inputSchema", all("inputSchema" in t for t in r["result"]["tools"]))
 
 r = send({"jsonrpc": "2.0", "id": 3, "method": "ping"})
