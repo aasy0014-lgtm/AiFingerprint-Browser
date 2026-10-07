@@ -586,6 +586,9 @@ async def update_profile(request: Request, profile_id: str, body: ProfileUpdate)
     require_profile_access(request, p)
     if manager.is_running(profile_id):
         raise ApiError(409, "环境正在运行，请先停止再修改")
+    # 与创建路径保持一致：改成本机不可用的内核（如 macOS 上的 fp-chromium）应拒绝
+    if body.kernel is not None and body.kernel != p["kernel"]:
+        _check_kernel_available(body.kernel)
 
     updates: dict[str, Any] = {}
     if body.name is not None:
