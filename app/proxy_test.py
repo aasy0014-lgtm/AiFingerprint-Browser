@@ -9,6 +9,7 @@ from typing import Any, Optional
 import httpx
 
 from .models import ProxyConfig
+from .proxy_dns import is_ip_address, resolve_real_ip
 
 # (url, 字段归一化函数)；归一化失败/数据无效返回 None 触发下一端点
 _PROVIDERS: list[tuple[str, Any]] = [
@@ -61,6 +62,11 @@ def _ip_type_label(ip_proxy: Optional[bool], ip_hosting: Optional[bool],
 async def test_proxy(proxy: Optional[ProxyConfig], timeout: float = 15) -> dict:
     mode = "proxy" if proxy else "direct"
     t0 = time.perf_counter()
+    # 本机 fake-IP（TUN）会把代理域名解析成 198.18.x.x，这里同样用 DoH 取真实 IP
+    if proxy and not is_ip_address(proxy.host):
+        real_ip = await resolve_real_ip(proxy.host)
+        if real_ip and real_ip != proxy.host:
+            proxy = proxy.model_copy(update={"host": real_ip})
     errors: list[str] = []
     for url, extract in _PROVIDERS:
         try:
