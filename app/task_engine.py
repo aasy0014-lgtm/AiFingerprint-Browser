@@ -525,7 +525,13 @@ class TaskEngine:
         if action == "tab_close":
             closing = ctx.page
             ctx.pages.pop(ctx.current)
+            if not ctx.pages:
+                # 关闭最后一个标签页：立即补一个空白页，否则后续步骤取 ctx.page
+                # 会越界（列表为空）。先补新页再关旧页，避免浏览器窗口被一并关闭
+                ctx.pages.append(await ctx.context.new_page())
             ctx.current = max(0, ctx.current - 1)
+            if ctx.current >= len(ctx.pages):
+                ctx.current = len(ctx.pages) - 1
             await closing.close()
             entry["detail"] = f"已关闭标签页（剩 {len(ctx.pages)} 个）"
             return None
