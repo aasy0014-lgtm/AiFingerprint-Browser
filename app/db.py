@@ -114,7 +114,6 @@ _MIGRATIONS = [
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    existing = {r[1] for r in conn.execute("PRAGMA table_info(profiles)")}
     for table, column, decl in _MIGRATIONS:
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in cols:
@@ -513,7 +512,7 @@ def ensure_default_member() -> None:
     from .security import load_settings
 
     conn = _require_conn()
-    with _lock:
+    with _lock, conn:
         row = conn.execute("SELECT 1 FROM members LIMIT 1").fetchone()
         if row:
             return
@@ -571,7 +570,7 @@ def set_member_enabled(member_id: str, enabled: bool) -> bool:
 
 def delete_member(member_id: str) -> bool:
     conn = _require_conn()
-    with _lock:
+    with _lock, conn:
         # 不允许删掉最后一个管理员
         admins = conn.execute(
             "SELECT COUNT(*) AS c FROM members WHERE role='admin' AND enabled=1"

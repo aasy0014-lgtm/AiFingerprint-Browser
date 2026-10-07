@@ -55,7 +55,8 @@ async def start_server(
     """为 camoufox 环境启动 Playwright Server，返回 ws 端点等信息。"""
     profile_id = profile["id"]
     if profile_id in _servers:
-        stop_server(profile_id)
+        # 必须 await：否则旧 node 进程不会被终止，端口也不会释放（进程泄漏）
+        await stop_server(profile_id)
 
     launch = apply_preset(LaunchConfig(**(profile.get("launch") or {})))
     proxy = ProxyConfig(**profile["proxy"]) if profile.get("proxy") else None
