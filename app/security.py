@@ -47,6 +47,8 @@ def _default_settings() -> dict[str, Any]:
         "sync_remote_token": "",
         # 自动同步（已配置远端后每 30 分钟自动 push）
         "auto_sync": False,
+        # 全局代理：新建环境默认继承、启动时兜底（密码加密存储）
+        "global_proxy": None,
     }
 
 
@@ -71,7 +73,9 @@ def save_settings(settings: dict[str, Any]) -> None:
 
 
 def update_settings(api_key_enabled: Optional[bool] = None, regenerate: bool = False,
-                    sync: Optional[dict] = None) -> dict:
+                    sync: Optional[dict] = None,
+                    global_proxy: Optional[dict] = None,
+                    clear_global_proxy: bool = False) -> dict:
     settings = load_settings()
     if api_key_enabled is not None:
         settings["api_key_enabled"] = api_key_enabled
@@ -84,6 +88,15 @@ def update_settings(api_key_enabled: Optional[bool] = None, regenerate: bool = F
                 settings[key] = sync[key]
         if "regenerate_sync_token" in sync:
             settings["sync_token"] = secrets.token_hex(16)
+    if clear_global_proxy:
+        settings["global_proxy"] = None
+    elif global_proxy is not None:
+        merged = dict(global_proxy)
+        if not merged.get("password"):
+            # 密码留空表示沿用原密码（接口回显的是掩码，不回传明文）
+            old = settings.get("global_proxy") or {}
+            merged["password"] = decrypt_text(old.get("password")) or None
+        settings["global_proxy"] = encrypt_proxy(merged)
     save_settings(settings)
     return settings
 
@@ -148,4 +161,23 @@ def decrypt_proxy(proxy: Optional[dict]) -> Optional[dict]:
     out = dict(proxy)
     if out.get("password"):
         out["password"] = decrypt_text(str(out["password"]))
+    return out
+
+
+def get_global_proxy() -> Optional[dict]:
+    """全局代理（明文，含密码）；未配置返回 None。
+
+    供新建环境继承与启动兜底使用。
+    """
+    return decrypt_proxy(load_settings().get("global_proxy"))
+
+
+def global_proxy_masked() -> Optional[dict]:
+    """全局代理（接口回显用，密码打码）。"""
+    proxy = get_global_proxy()
+    if not proxy:
+        return None
+    out = dict(proxy)
+    if out.get("password"):
+        out["password"] = "****"
     return out

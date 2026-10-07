@@ -250,6 +250,44 @@
         <p class="muted" style="margin-top:8px">插件配对码 5 分钟内有效、一次性：在浏览器插件的「一键配置」中输入即可自动完成连接（认证关闭时同样可用）。</p>
       </div>
 
+      <div class="settings-section" id="globalProxySection">
+        <h3>全局代理</h3>
+        <p class="muted" style="margin-bottom:12px">
+          一处配置、全体生效：<b>新建环境默认继承</b>该代理；环境自身没配代理时<b>启动时兜底</b>使用它。
+          单个环境仍可在编辑弹窗里覆盖或清除。密码加密存储，界面仅回显掩码。
+        </p>
+        <div class="kv">
+          <div class="item"><div class="k">当前状态</div><div class="v" id="gpState">-</div></div>
+          <div class="item"><div class="k">生效地址</div><div class="v mono" id="gpSummary">-</div></div>
+        </div>
+        <div class="proxy-parse" style="margin-top:12px">
+          <input id="gpRawInput" placeholder="粘贴代理串一键解析：host:port:user:pass 或 http://user:pass@host:port">
+          <button class="btn" id="btnGpParse">一键解析</button>
+        </div>
+        <div class="proxy-result muted" id="gpParseResult"></div>
+        <div class="grid3" style="margin-top:12px">
+          <label>协议<select id="gpScheme">
+            <option value="http">http</option>
+            <option value="https">https</option>
+            <option value="socks5">socks5</option>
+            <option value="socks4">socks4</option>
+          </select></label>
+          <label>地址<input id="gpHost" placeholder="host 或 IP"></label>
+          <label>端口<input id="gpPort" placeholder="6666" inputmode="numeric"></label>
+        </div>
+        <div class="grid3" style="margin-top:12px">
+          <label>用户名<input id="gpUser" autocomplete="off"></label>
+          <label>密码<input id="gpPass" type="password" autocomplete="new-password" placeholder="留空=不修改"></label>
+          <label><button class="btn primary" id="btnSaveGp" style="width:100%">保存全局代理</button></label>
+        </div>
+        <div class="toolbar">
+          <button class="btn" id="btnApplyGp">套用到所有环境（覆盖）</button>
+          <button class="btn" id="btnApplyGpFill">仅补没有代理的环境</button>
+          <button class="btn danger" id="btnClearGp">清除全局代理</button>
+          <span class="muted" id="gpResult"></span>
+        </div>
+      </div>
+
       <div class="settings-section">
         <h3>环境同步（自托管）</h3>
         <p class="muted" style="margin-bottom:12px">
@@ -334,7 +372,7 @@
       </div>
 
       <fieldset>
-        <legend>代理（可选；批量模式可后续单独配置）</legend>
+        <legend>代理（留空 = 自动使用「设置 → 全局代理」；批量模式可后续单独配置）</legend>
         <div class="proxy-parse">
           <input id="proxyRawInput" autocomplete="off" placeholder="粘贴代理链接后点“一键解析”：http://user:pass@1.2.3.4:8080 、socks5://1.2.3.4:1080 、1.2.3.4:8080:user:pass 、user:pass@1.2.3.4:8080">
           <button type="button" class="btn small" id="btnParseProxyInForm">一键解析</button>

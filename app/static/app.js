@@ -575,6 +575,90 @@ $("#proxyRawInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); parseProxyFromForm(); }
 });
 
+/* ------------------------------------------------ 全局代理（设置页） */
+
+function renderGlobalProxy(gp) {
+  const has = !!gp;
+  $("#gpState").textContent = has ? "已配置 ✅（新建环境默认继承 + 启动兜底）" : "未配置";
+  $("#gpSummary").textContent = has
+    ? `${gp.scheme}://${gp.host}:${gp.port}${gp.username ? "（含账号密码）" : ""}`
+    : "-";
+  if (!has) return;
+  $("#gpScheme").value = gp.scheme || "http";
+  $("#gpHost").value = gp.host || "";
+  $("#gpPort").value = gp.port || "";
+  $("#gpUser").value = gp.username || "";
+  // 接口只回显掩码，密码框留空表示沿用原密码
+  $("#gpPass").value = "";
+}
+
+function collectGlobalProxy() {
+  const host = $("#gpHost").value.trim();
+  if (!host) return null;
+  return {
+    scheme: $("#gpScheme").value,
+    host,
+    port: Number($("#gpPort").value),
+    username: $("#gpUser").value.trim() || null,
+    password: $("#gpPass").value || null,
+  };
+}
+
+async function saveGlobalProxy() {
+  const proxy = collectGlobalProxy();
+  if (!proxy) { toast("请先填写代理地址", "err"); return; }
+  if (!proxy.port) { toast("请填写有效端口", "err"); return; }
+  try {
+    const r = await api("POST", "/settings", { global_proxy: proxy });
+    renderGlobalProxy(r.global_proxy);
+    toast("全局代理已保存");
+  } catch (e) { toast(`保存失败：${e.message}`, "err"); }
+}
+
+async function applyGlobalProxy(overwrite) {
+  try {
+    const r = await api("POST", "/settings/global-proxy/apply", { overwrite });
+    $("#gpResult").textContent = `已更新 ${r.changed} 个环境`;
+    await loadProfiles();
+  } catch (e) { $("#gpResult").textContent = `失败：${e.message}`; }
+}
+
+async function clearGlobalProxy() {
+  if (!confirm("确定清除全局代理？新建环境将不再自动继承。")) return;
+  try {
+    const r = await api("POST", "/settings", { clear_global_proxy: true });
+    renderGlobalProxy(r.global_proxy);
+    ["#gpRawInput", "#gpHost", "#gpPort", "#gpUser", "#gpPass"].forEach((s) => {
+      const el = $(s); if (el) el.value = "";
+    });
+    $("#gpParseResult").textContent = "";
+    $("#gpResult").textContent = "";
+    toast("全局代理已清除");
+  } catch (e) { toast(`失败：${e.message}`, "err"); }
+}
+
+$("#btnGpParse").addEventListener("click", () => {
+  const box = $("#gpParseResult");
+  const raw = $("#gpRawInput").value;
+  if (!raw.trim()) { box.textContent = "请先粘贴代理链接"; box.className = "proxy-result bad"; return; }
+  const p = parseProxyString(raw);
+  if (!p) { box.textContent = "✘ 无法识别该代理格式，请检查后重试"; box.className = "proxy-result bad"; return; }
+  if (p.scheme) $("#gpScheme").value = p.scheme;
+  $("#gpHost").value = p.host;
+  $("#gpPort").value = p.port;
+  $("#gpUser").value = p.username;
+  $("#gpPass").value = p.password;
+  box.textContent = `✔ 已解析：${$("#gpScheme").value} ${p.host}:${p.port}${p.username ? "（含账号密码）" : "（无账号密码）"}`;
+  box.className = "proxy-result good";
+});
+$("#gpRawInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); $("#btnGpParse").click(); }
+});
+$("#btnSaveGp").addEventListener("click", saveGlobalProxy);
+$("#btnApplyGp").addEventListener("click", () => applyGlobalProxy(true));
+$("#btnApplyGpFill").addEventListener("click", () => applyGlobalProxy(false));
+$("#btnClearGp").addEventListener("click", clearGlobalProxy);
+
 /* ------------------------------------------------ 自检链接 */
 
 async function loadDetectLinks() {
@@ -908,6 +992,7 @@ async function loadSettings() {
   $("#syncTokenHint").textContent = s.sync_server_enabled ? `令牌：${s.sync_token_masked}` : "";
   if (document.activeElement !== $("#syncRemoteUrl")) $("#syncRemoteUrl").value = s.sync_remote_url || "";
   if (!s.sync_remote_configured) $("#syncRemoteToken").value = "";
+  renderGlobalProxy(s.global_proxy);
   await Promise.all([loadMembers(), loadIdentity()]);
 }
 

@@ -11,6 +11,7 @@ code 非 0 表示业务失败，便于自动化脚本统一处理。
 所有变更操作写入审计日志（含操作成员）。
 """
 import asyncio
+import json
 import logging
 import secrets as _secrets_mod
 from contextlib import asynccontextmanager
@@ -35,6 +36,7 @@ from .models import (
     EvaluateRequest,
     ExtractRequest,
     GetHtmlRequest,
+    GlobalProxyApply,
     HoverRequest,
     IdsRequest,
     MemberCreate,
@@ -389,6 +391,7 @@ async def delete_member(request: Request, member_id: str) -> dict:
 @app.get("/api/v1/settings")
 async def get_settings(request: Request) -> dict:
     settings = security.load_settings()
+    gp = security.global_proxy_masked()
     return ok({
         "api_key_enabled": settings["api_key_enabled"],
         "api_key_masked": settings["api_key"][:4] + "****" + settings["api_key"][-4:],
@@ -396,6 +399,8 @@ async def get_settings(request: Request) -> dict:
         "sync_token_masked": (settings.get("sync_token") or "")[:4] + "****",
         "sync_remote_url": settings.get("sync_remote_url", ""),
         "sync_remote_configured": bool(settings.get("sync_remote_token")),
+        "global_proxy": gp,
+        "global_proxy_configured": bool(settings.get("global_proxy")),
     })
 
 
@@ -418,16 +423,43 @@ async def update_settings(request: Request, body: SettingsUpdate) -> dict:
     settings = security.update_settings(
         api_key_enabled=body.api_key_enabled, regenerate=body.regenerate_key,
         sync=sync_cfg or None,
+        global_proxy=body.global_proxy.model_dump() if body.global_proxy else None,
+        clear_global_proxy=body.clear_global_proxy,
     )
+    gp_note = "清除" if body.clear_global_proxy else (
+        "更新" if body.global_proxy else "无")
     audit("settings.update", "系统设置",
-          f"api_key_enabled={settings['api_key_enabled']} sync={sync_cfg or '无'}", member=member)
+          f"api_key_enabled={settings['api_key_enabled']} sync={sync_cfg or '无'} "
+          f"global_proxy={gp_note}", member=member)
     out = {
         "api_key_enabled": settings["api_key_enabled"],
         "api_key": settings["api_key"] if body.regenerate_key else None,
         "sync_token": settings["sync_token"] if body.regenerate_sync_token else None,
         "sync_server_enabled": settings.get("sync_server_enabled"),
+        "global_proxy": security.global_proxy_masked(),
+        "global_proxy_configured": bool(settings.get("global_proxy")),
     }
     return ok(out)
+
+
+@app.post("/api/v1/settings/global-proxy/apply")
+async def apply_global_proxy(request: Request, body: GlobalProxyApply) -> dict:
+    """把全局代理套用到已有环境：overwrite=True 覆盖全部，否则只补无代理的环境。"""
+    member = member_of(request)
+    proxy = security.get_global_proxy()
+    if not proxy:
+        raise ApiError(400, "尚未配置全局代理")
+    changed = 0
+    for p in db.list_profiles():
+        if manager.is_running(p["id"]):
+            continue
+        if p.get("proxy") and not body.overwrite:
+            continue
+        db.update_profile(p["id"], {"proxy_json": json.dumps(proxy, ensure_ascii=False)})
+        changed += 1
+    audit("settings.global_proxy_apply", "全局代理",
+          f"overwrite={body.overwrite} 影响 {changed} 个环境", member=member)
+    return ok({"changed": changed})
 
 
 @app.get("/api/v1/detect-links")
@@ -481,7 +513,7 @@ async def create_profile(request: Request, body: ProfileCreate) -> dict:
         notes=body.notes,
         kernel=body.kernel,
         target_os=body.target_os,
-        proxy=body.proxy.model_dump() if body.proxy else None,
+        proxy=body.proxy.model_dump() if body.proxy else security.get_global_proxy(),
         fingerprint=fingerprint,
         launch=body.launch.model_dump(),
         owner=member["id"],
@@ -501,6 +533,8 @@ async def create_profiles_batch(request: Request, body: ProfileBatchCreate) -> d
             proxy = body.proxy_pool[min(i, len(body.proxy_pool) - 1)].model_dump()
         elif body.template.proxy:
             proxy = body.template.proxy.model_dump()
+        else:
+            proxy = security.get_global_proxy()  # 未指定代理池/模板代理时继承全局代理
         fingerprint = create_fingerprint(
             body.template.target_os, body.template.fingerprint_mode
         )

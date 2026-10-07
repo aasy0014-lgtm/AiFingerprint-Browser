@@ -188,6 +188,14 @@ class SettingsUpdate(BaseModel):
     sync_remote_url: Optional[str] = Field(default=None, max_length=300)
     sync_remote_token: Optional[str] = Field(default=None, max_length=128)
     regenerate_sync_token: bool = False
+    # 全局代理：新建环境默认继承、启动时兜底
+    global_proxy: Optional[ProxyConfig] = None
+    clear_global_proxy: bool = False
+
+
+class GlobalProxyApply(BaseModel):
+    """把全局代理套用到已有环境。overwrite=True 覆盖全部，否则只补没有代理的环境。"""
+    overwrite: bool = False
 
 
 class MemberCreate(BaseModel):

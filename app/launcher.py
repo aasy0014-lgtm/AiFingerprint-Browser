@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from .kernels import camoufox_kernel, chromium_kernel, fp_chromium_kernel
 from .config import PROFILE_ROOT
-from . import db
+from . import db, security
 from .models import LaunchConfig, ProxyConfig
 from .proxy_forwarder import AuthProxyForwarder, needs_forwarder
 from .risk_presets import apply_preset
@@ -70,11 +70,9 @@ class LaunchManager:
 
             launch = LaunchConfig(**(profile.get("launch") or {}))
             launch = apply_preset(launch)  # 风控预设参数组合
-            proxy = (
-                ProxyConfig(**profile["proxy"])
-                if profile.get("proxy")
-                else None
-            )
+            # 环境自身未配代理时，兜底使用全局代理
+            proxy_data = profile.get("proxy") or security.get_global_proxy()
+            proxy = ProxyConfig(**proxy_data) if proxy_data else None
 
             # Chromium 系内核不支持带账密代理命令行：本地起认证转发器桥接
             forwarder: AuthProxyForwarder | None = None
