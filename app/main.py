@@ -373,6 +373,13 @@ async def toggle_member(request: Request, member_id: str) -> dict:
     if not target:
         raise ApiError(404, "成员不存在")
     enabled = not target["enabled"]
+    if not enabled and target["role"] == ROLE_ADMIN:
+        # 与删除保持同一不变量：不可停用最后一个启用的管理员，
+        # 否则管理接口（设置/成员/调度等）将彻底无人可访问，只能改库解救
+        admins = sum(1 for m in db.list_members()
+                     if m["role"] == ROLE_ADMIN and m["enabled"])
+        if admins <= 1:
+            raise ApiError(409, "最后一个启用的管理员不可停用")
     if not db.set_member_enabled(member_id, enabled):
         raise ApiError(409, "操作失败")
     audit("member.toggle", target["name"], f"启用={enabled}", member=admin)
@@ -449,7 +456,7 @@ async def update_settings(request: Request, body: SettingsUpdate) -> dict:
 @app.post("/api/v1/settings/global-proxy/apply")
 async def apply_global_proxy(request: Request, body: GlobalProxyApply) -> dict:
     """把全局代理套用到已有环境：overwrite=True 覆盖全部，否则只补无代理的环境。"""
-    member = member_of(request)
+    member = require_admin(request)
     proxy = security.get_global_proxy()
     if not proxy:
         raise ApiError(400, "尚未配置全局代理")
@@ -1200,6 +1207,7 @@ async def run_task(request: Request, task_id: str, body: TaskRunRequest) -> dict
     t = db.get_task(task_id)
     if not t:
         raise ApiError(404, "任务不存在")
+    _require_task_access(request, t)
     profiles = []
     for pid in body.profile_ids:
         p = db.get_profile(pid)
