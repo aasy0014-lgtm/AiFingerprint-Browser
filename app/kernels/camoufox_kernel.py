@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from camoufox.async_api import AsyncNewBrowser
+from camoufox.ip import InvalidIP
 from playwright.async_api import BrowserContext, Page, Playwright
 
 from ..models import LaunchConfig, ProxyConfig
@@ -101,13 +102,23 @@ async def start(
         config.setdefault("headers.Accept-Encoding", "gzip, deflate")
     if launch.locale:
         kwargs["locale"] = launch.locale
+    warning: Optional[str] = None
     if proxy is not None:
         kwargs["proxy"] = proxy.to_playwright()
         # 有代理时默认按出口 IP 自动对齐时区/经纬度/语言，避免环境穿帮
         if launch.geoip:
             kwargs["geoip"] = True
 
-    context: BrowserContext = await AsyncNewBrowser(playwright, **kwargs)
+    try:
+        context: BrowserContext = await AsyncNewBrowser(playwright, **kwargs)
+    except InvalidIP as e:
+        # 取出口 IP 失败（IP 服务抖动、代理拒绝 CONNECT 等）不应阻断启动：
+        # 降级为不按属地对齐，并在返回信息里明确告警。
+        if kwargs.pop("geoip", None) is None:
+            raise
+        warning = f"geoip 取出口 IP 失败，已降级启动（时区/语言未按代理属地对齐）：{e}"
+        log.warning("环境 %s %s", profile_id, warning)
+        context = await AsyncNewBrowser(playwright, **kwargs)
 
     page: Page = context.pages[0] if context.pages else await context.new_page()
     url = start_url or launch.start_url
@@ -117,15 +128,14 @@ async def start(
         except Exception as e:
             log.warning("环境 %s 打开起始页失败: %s", profile_id, e)
 
-    return {
-        "context": context,
-        "page": page,
-        "info": {
-            "kernel": KERNEL_NAME,
-            "note": "Camoufox 使用 Playwright(Juggler) 协议，无 CDP 端口；"
-            "自动化请走本服务 REST API，或用 camoufox server 模式。",
-        },
+    info = {
+        "kernel": KERNEL_NAME,
+        "note": "Camoufox 使用 Playwright(Juggler) 协议，无 CDP 端口；"
+        "自动化请走本服务 REST API，或用 camoufox server 模式。",
     }
+    if warning:
+        info["warning"] = warning
+    return {"context": context, "page": page, "info": info}
 
 
 async def stop(instance: dict[str, Any]) -> None:
