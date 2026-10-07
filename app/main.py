@@ -425,10 +425,13 @@ async def update_settings(request: Request, body: SettingsUpdate) -> dict:
         sync_cfg["regenerate_sync_token"] = True
 
     # 全局敏感项统一要求管理员：认证开关、同步服务器（开启即暴露 /api/sync/*，
-    # 且重新生成令牌会让其它节点的配置全部失效）、远端同步目标
+    # 且重新生成令牌会让其它节点的配置全部失效）、远端同步目标、全局代理
+    # （新建环境默认继承 + 启动兜底，改它等于替所有环境改出口，与
+    # /settings/global-proxy/apply 同属系统级变更）
     if (body.api_key_enabled is not None or body.regenerate_key
             or body.sync_server_enabled is not None or body.regenerate_sync_token
-            or body.sync_remote_url is not None or body.sync_remote_token is not None):
+            or body.sync_remote_url is not None or body.sync_remote_token is not None
+            or body.global_proxy is not None or body.clear_global_proxy):
         require_admin(request)
 
     settings = security.update_settings(
