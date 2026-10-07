@@ -9,69 +9,107 @@
 ## 功能特性
 
 ### 环境与指纹
+
 - **环境管理**：每个环境独立的 Cookie/存储（持久化 user-data-dir）、独立指纹身份、独立代理，支持分组与备注、使用统计（启动次数/最近启动）
+
 - **指纹固定**：创建环境时生成一次指纹，跨重启保持一致——UA/平台/硬件参数/屏幕/WebGL/字体子集/语音列表/Canvas·Audio·字体间距噪声种子全部固定
+
 - **双指纹模式**：合成生成（BrowserForge 真实统计分布，无限独特组合）或 真实预设（Camoufox 内置真实设备指纹库，泛化 WebGL 自动替换真实 GPU 参数）
+
 - **指纹健康分**：创建/更新时自动做跨信号一致性体检（UA↔platform↔GPU↔屏幕↔硬件参数），矛盾项警示
+
 - **三内核**：
+
   - `camoufox`（推荐）：Firefox 定制，C++ 层指纹伪装
+
   - `fp-chromium`：[fingerprint-chromium](https://github.com/adryfish/fingerprint-chromium) 定制 Chromium，内核层伪装 + **标准 CDP 端点**（Selenium/Puppeteer/Playwright 可直连），种子驱动 Canvas/WebGL/GPU 伪造，自带 navigator.webdriver=false 与 CDP 检测规避。安装：下载 Release 解压后设置环境变量 `FPWB_FPCHROMIUM` 或放入 `tools/fp-chromium/`
+
   - `chromium`：系统浏览器直启（无伪装，调试用）
 
 ### 矩阵风控（Phase 3）
+
 - **分布统计**：OS / GPU / 屏幕 / CPU 核心的特征分布可视化
+
 - **查重扫描**：检测多个环境呈现相同指纹（UA+屏幕+GPU 完全一致）→ 高危
+
 - **拥挤检测**：同一 GPU+屏幕组合被 ≥4 个环境共用 → 中危
+
 - **矩阵感知重生成**：一键重生成风险环境指纹，生成时避开现有矩阵指纹组合（有界重试 + 拥挤度偏好），防止"重生成又撞车"
 
 ### 团队协作（Phase 3）
+
 - **多成员**：admin / operator 双角色，成员级独立 API Key（仅创建时显示一次）
+
 - **数据隔离**：operator 只能看到和操作自己创建的环境，越权访问返回 403
+
 - **审计归属**：所有变更操作记录操作成员，认证拒绝事件入审计日志
 
 ### 自托管同步（Phase 3）
+
 - 任意实例可开启**同步服务器**（独立 X-Sync-Token 保护）
+
 - 其它节点配置远端后即可 **push / pull** 环境配置与指纹（不含 Cookie，多机矩阵/云端备份）
+
 - LWW（最新修改优先）合并 + **删除墓碑自动传播**；`--home` 参数支持多实例独立数据目录
+
 - **自动同步推送**：开启后每 30 分钟自动向远端推送变更（系统设置中 `auto_sync` 开关）
 
 ### 批量与流转
+
 - **批量操作**：按模板批量创建（支持代理池依次分配）、批量启动/停止/删除/导出
+
 - **导入/导出**：单环境或批量导出为可移植 JSON（可选含数据目录归档，Cookie 一并迁移）；一键导入
+
 - **整机备份/恢复**：全部环境配置与指纹的备份下载与恢复
 
 ### 自动化
+
 - **本地 API**：AdsPower 风格响应（`{"code":0,"msg":"success","data":...}`），65 条路由（`/docs` 查看 Swagger）
+
 - **Playwright 正式对接**（详见 [docs/Playwright对接指南.md](docs/Playwright对接指南.md)）：
+
   - camoufox：`POST /browser/{id}/playwright-server` 暴露标准 Playwright Server 端点，
     `firefox.connect(ws://...)` 直连，指纹与界面启动完全一致
+
   - fp-chromium：启动环境即得 CDP 端点，`chromium.connect_over_cdp(ws://...)` / Selenium 4 / Puppeteer 直连
+
 - **RPA 任务引擎**：21 类步骤可视化编排（打开页面/点击/输入/按键/等待/等待元素/滚动/截图/抽取/执行JS/
   悬停/下拉选择/上传/下载/多标签管理/变量设置/标签跳转/条件分支），支持 `{{变量名}}` 插值、
   失败重试（abort/continue/goto）、iframe 内操作，多环境并发执行，逐步留痕、截图存档、结果可查
+
 - **定时调度**：每日固定时刻或固定间隔自动执行任务；**IANA 时区支持**（Asia/Shanghai 等），
   **周几过滤**（可选仅周一/三/五执行），**停机错过补跑**（服务重启后补触发当日未运行计划），可暂停/立即运行
+
 - **Webhook 通知**：任务运行结束回调运行结果 JSON（对接企微/钉钉/飞书机器人或自有系统）
+
 - **代理**：HTTP/HTTPS/SOCKS4/SOCKS5，按环境绑定，可选按出口 IP 自动对齐时区/经纬度/语言（geoip），WebRTC IP 自动伪造，一键测试连通性与归属地
 
 ### 安全与审计
+
 - **API Key 认证**：成员级密钥（X-API-Key），本地单用户模式可关闭
+
 - **代理密码加密存储**：Fernet 加密落库（`enc:` 前缀），数据库文件不泄露明文
+
 - **代理认证转发器**：上游代理需认证时，自动创建本地无认证中间端口转发（无需将密码暴露给 Playwright/Selenium 脚本）
+
 - **审计日志**：全部变更操作、认证与同步拒绝事件记录在案（保留最近 5000 条），界面可查
 
 ### AI 集成（Phase 4）
+
 - **MCP Server**：标准 Model Context Protocol（stdio JSON-RPC 2.0），提供 48 个工具覆盖环境管理、
   浏览器页面交互（点击/输入/滚动等，所有内核通用）、RPA 任务、定时调度、矩阵风控等全流程。
   Claude Desktop / Cursor 直接调用，配置示例见 [docs/MCP对接指南.md](docs/MCP对接指南.md)
 
 ### 管理界面
+
 中文 Web UI（无外部依赖）：环境管理（多选批量栏、健康分徽章、指纹详情、使用统计）、
 RPA 任务（步骤编辑器、运行记录、截图预览、Webhook）、调度计划、矩阵风控（分布图/重复组/一键重生成）、
 审计日志（过滤/分页）、系统设置（成员管理/认证/同步/备份）六页签，内置 CreepJS/BrowserLeaks/Pixelscan 等自检链接。
+
 - **内核健康公告**：服务启动时自动检查 Camoufox GitHub 状态，界面与 API 实时展示维护预警或分支推荐
 
 ### 浏览器插件（Chrome/Edge）
+
 [extension/](extension/README.md)：一键连接（配对码自动换取密钥）、环境启停面板、
 **右键任意链接 → 在指纹环境中打开**、当前页发送到环境。安装：`chrome://extensions`
 开启开发者模式 → 加载已解压的扩展程序 → 选择 `extension` 目录。
@@ -84,12 +122,12 @@ RPA 任务（步骤编辑器、运行记录、截图预览、Webhook）、调度
 （Python 虚拟环境 → 依赖安装（失败自动切换清华镜像）→ Camoufox 内核下载），
 随后启动服务并自动打开管理界面；以后每次双击直接启动。
 
-| 文件 | 作用 |
-|---|---|
-| `一键启动工作台.bat` | 一键启动（缺什么自动补什么）并打开界面 |
-| `停止工作台.bat` | 停止服务（含浏览器与 Playwright 子进程） |
-| `创建桌面快捷方式.bat` | 在桌面创建带图标的快捷方式 |
-| `launcher/设置开机自启.bat` / `取消开机自启.bat` | 开机自动启动开关 |
+| 文件                                   | 作用                         |
+| ------------------------------------ | -------------------------- |
+| `一键启动工作台.bat`                        | 一键启动（缺什么自动补什么）并打开界面        |
+| `停止工作台.bat`                          | 停止服务（含浏览器与 Playwright 子进程） |
+| `创建桌面快捷方式.bat`                       | 在桌面创建带图标的快捷方式              |
+| `launcher/设置开机自启.bat` / `取消开机自启.bat` | 开机自动启动开关                   |
 
 也可用引擎直接调用：`powershell -File launcher/workbench.ps1 -Action check|setup|start|stop`
 
@@ -115,27 +153,27 @@ python -m venv .venv
 
 ## API 一览（节选）
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/v1/status` | 服务与内核状态 |
-| GET/POST | `/api/v1/profiles` | 环境列表 / 创建（fingerprint_mode: generate/preset；kernel: camoufox/fp-chromium/chromium） |
-| POST | `/api/v1/profiles/batch` `batch-delete` | 批量创建（模板+代理池）/ 批量删除 |
-| GET | `/api/v1/profiles/{id}/export` / POST `/profiles/import` | 导出（?include_data=true 含数据目录）/ 导入 |
-| GET/POST | `/api/v1/system/backup` `/system/restore` | 整机备份 / 恢复 |
-| POST | `/api/v1/browser/start` `start-batch` `stop` `stop-batch` | 启停（含批量；fp-chromium 返回 ws_endpoint） |
-| POST | `/api/v1/browser/{id}/navigate` `screenshot` `evaluate` | 页面控制（camoufox 直接） |
-| POST | `/api/v1/browser/{id}/click` `type` `press` `wait` `wait_for` | 页面交互（所有内核通用，CDP 桥接） |
-| POST | `/api/v1/browser/{id}/scroll` `hover` `select` `extract` | 页面交互（所有内核通用） |
-| POST | `/api/v1/browser/{id}/page_info` `get_html` | 页面信息（所有内核通用） |
-| GET/POST/PUT/DELETE | `/api/v1/tasks` | RPA 任务 CRUD（21 类步骤 + webhook_url） |
-| POST | `/api/v1/tasks/{id}/run` / GET `/task-runs` / POST `/{id}/cancel` | 运行 / 记录 / 取消 |
-| GET/POST/PUT/DELETE | `/api/v1/schedules` / POST `/{id}/run-now` | 定时调度 CRUD 与立即运行 |
-| GET | `/api/v1/matrix/report` / POST `/matrix/regenerate` | 矩阵风控扫描 / 风险指纹重生成 |
-| GET/POST/DELETE | `/api/v1/members` / POST `/{id}/toggle` | 团队成员管理（admin） |
-| GET/POST | `/api/v1/settings` | 认证 / 同步服务器 / 远端配置 |
-| POST | `/api/v1/sync/push` `pull` | 推送 / 拉取远端同步服务器 |
-| GET | `/api/v1/audit-logs` | 审计日志 |
-| POST | `/api/v1/proxy/test` | 测试代理（body 的 proxy 为 null 时测直连） |
+| 方法                  | 路径                                                                | 说明                                                                                  |
+| ------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| GET                 | `/api/v1/status`                                                  | 服务与内核状态                                                                             |
+| GET/POST            | `/api/v1/profiles`                                                | 环境列表 / 创建（fingerprint\_mode: generate/preset；kernel: camoufox/fp-chromium/chromium） |
+| POST                | `/api/v1/profiles/batch` `batch-delete`                           | 批量创建（模板+代理池）/ 批量删除                                                                  |
+| GET                 | `/api/v1/profiles/{id}/export` / POST `/profiles/import`          | 导出（?include\_data=true 含数据目录）/ 导入                                                   |
+| GET/POST            | `/api/v1/system/backup` `/system/restore`                         | 整机备份 / 恢复                                                                           |
+| POST                | `/api/v1/browser/start` `start-batch` `stop` `stop-batch`         | 启停（含批量；fp-chromium 返回 ws\_endpoint）                                                 |
+| POST                | `/api/v1/browser/{id}/navigate` `screenshot` `evaluate`           | 页面控制（camoufox 直接）                                                                   |
+| POST                | `/api/v1/browser/{id}/click` `type` `press` `wait` `wait_for`     | 页面交互（所有内核通用，CDP 桥接）                                                                 |
+| POST                | `/api/v1/browser/{id}/scroll` `hover` `select` `extract`          | 页面交互（所有内核通用）                                                                        |
+| POST                | `/api/v1/browser/{id}/page_info` `get_html`                       | 页面信息（所有内核通用）                                                                        |
+| GET/POST/PUT/DELETE | `/api/v1/tasks`                                                   | RPA 任务 CRUD（21 类步骤 + webhook\_url）                                                  |
+| POST                | `/api/v1/tasks/{id}/run` / GET `/task-runs` / POST `/{id}/cancel` | 运行 / 记录 / 取消                                                                        |
+| GET/POST/PUT/DELETE | `/api/v1/schedules` / POST `/{id}/run-now`                        | 定时调度 CRUD 与立即运行                                                                     |
+| GET                 | `/api/v1/matrix/report` / POST `/matrix/regenerate`               | 矩阵风控扫描 / 风险指纹重生成                                                                    |
+| GET/POST/DELETE     | `/api/v1/members` / POST `/{id}/toggle`                           | 团队成员管理（admin）                                                                       |
+| GET/POST            | `/api/v1/settings`                                                | 认证 / 同步服务器 / 远端配置                                                                   |
+| POST                | `/api/v1/sync/push` `pull`                                        | 推送 / 拉取远端同步服务器                                                                      |
+| GET                 | `/api/v1/audit-logs`                                              | 审计日志                                                                                |
+| POST                | `/api/v1/proxy/test`                                              | 测试代理（body 的 proxy 为 null 时测直连）                                                      |
 
 创建并启动一个带代理的环境（curl）：
 
@@ -190,7 +228,9 @@ Camoufox 默认**每次启动**随机生成指纹与噪声种子（面向一次�
 
 - 指纹主体（BrowserForge 合成 或 真实设备预设；UA 版本对齐到已安装内核；
   预设的泛化 WebGL "Mozilla" 自动替换为该 OS 的真实 GPU 参数，否则启动失败）
+
 - Canvas / Audio / 字体间距噪声种子（camoufox 的 `set_into` 只在键缺失时生效，用户预置值优先）
+
 - 字体子集与语音列表（默认每次启动随机，会导致字体度量与 Canvas 跨重启漂移）
 
 已用 `scripts/restart_stability_test.py` 验证：同一环境多次启动，UA/平台/屏幕/字体度量/
@@ -218,7 +258,7 @@ Canvas 哈希完全一致。
 .venv\Scripts\python scripts\riskctrl_test.py           # 风控优化（预设/就绪度体检/人机化节奏/预热模板）
 .venv\Scripts\python scripts\playwright_bridge_test.py  # Playwright 对接（双内核真实连接+指纹一致性）
 .venv\Scripts\python scripts\fpchromium_verify.py       # fp-chromium 内核验证
-.venv\Scripts\python scripts\mcp_protocol_test.py        # MCP 协议独立测试（11 项检查）
+.venv\Scripts\python scripts\mcp_protocol_test.py       # MCP 协议独立测试（10 项检查）
 ```
 
 ## 风控环境优化（Cloudflare / Google 人机验证 / 极验 / 网易易盾）
@@ -228,32 +268,36 @@ Canvas 哈希完全一致。
 
 ### 1. 风控预设（环境创建时选择）
 
-| 预设 | 自动生效参数 | 适用 |
-|---|---|---|
-| `standard` | 默认参数 | 大多数站点 |
+| 预设           | 自动生效参数                                     | 适用              |
+| ------------ | ------------------------------------------ | --------------- |
+| `standard`   | 默认参数                                       | 大多数站点           |
 | `cloudflare` | 禁用 COOP（Turnstile 勾选框可交互）+ 类人鼠标轨迹增强（上限 2s） | Cloudflare 防护站点 |
-| `china` | locale=zh-CN + 时区=Asia/Shanghai + geoip 对齐 | 极验 / 网易易盾等国内风控 |
+| `china`      | locale=zh-CN + 时区=Asia/Shanghai + geoip 对齐 | 极验 / 网易易盾等国内风控  |
 
 ### 2. 环境就绪度体检（环境列表 →「体检」按钮）
 
 在真实浏览器内实测 8 项一致性并给出整改建议（每项标注关联的风控体系）：
 网络出口可达性、时区 vs IP 属地、语言 vs IP 国家、**WebRTC 公网 IP 泄露**、
 navigator.webdriver 自动化标记、Canvas 读取稳定性、WebGL 渲染器合理性、字体渲染。
-输出 0~100 评分与结论（就绪/建议优化/存在穿帮风险）。
+输出 0\~100 评分与结论（就绪/建议优化/存在穿帮风险）。
 
 ### 3. 行为质量
 
-- **人机化节奏**（RPA 运行时可勾选）：步骤间随机停顿 0.4~1.8s、逐字符随机间隔输入
+- **人机化节奏**（RPA 运行时可勾选）：步骤间随机停顿 0.4\~1.8s、逐字符随机间隔输入
+
 - **环境预热模板**（RPA 任务页一键创建）：访问中性高流量站点积累浏览历史与信誉
+
 - camoufox 内核自带类人鼠标轨迹（贝塞尔曲线移动）
 
 ### 各风控体系要点（经验总结）
 
 - **Cloudflare**：真浏览器内核天然通过 TLS/JA3 与 HTTP/2 指纹；重点在
-  ①住宅代理（机房 IP 几乎必被挑战）②有头模式优于无头 ③Turnstile 勾选需 `cloudflare` 预设的 disable_coop
+  ①住宅代理（机房 IP 几乎必被挑战）②有头模式优于无头 ③Turnstile 勾选需 `cloudflare` 预设的 disable\_coop
   ④时区/语言与 IP 属地一致（体检确认）
+
 - **Google reCAPTCHA**：重历史与信誉——同环境长期使用（本产品 Cookie/指纹跨重启稳定）、
   避免频繁清空数据、登录态一致、新环境先用预热模板养几天再干正事
+
 - **极验 / 网易易盾**：设备指纹连续性 + IP 质量为主——国内站点配国内住宅 IP + `china` 预设、
   Canvas/字体/Audio 指纹稳定（本产品按环境固定种子）、行为侧开启人机化节奏
 
@@ -262,25 +306,28 @@ navigator.webdriver 自动化标记、Canvas 读取稳定性、WebGL 渲染器�
 实测结论（`scripts/turnstile_diagnose.py` + 就绪度体检）：
 
 1. **语言与 IP 属地错配是最常见元凶**——camoufox 默认 locale 是 en-US，
-   若出口 IP 在国内，Turnstile 直接低分拒绝。**解法：国内直连用 `china` 预设
-   （zh-CN + Asia/Shanghai）；海外代理用 `cloudflare` 预设并开 geoip 自动对齐**
+   若出口 IP 在国内，Turnstile 直接低分拒绝。**解法：国内直连用** **`china`** **预设
+   （zh-CN + Asia/Shanghai）；海外代理用** **`cloudflare`** **预设并开 geoip 自动对齐**
 2. 广告拦截扩展（uBlock）可能阻断验证域——`cloudflare` 预设已默认排除 uBlock，
    也可在启动选项手动勾选「禁用广告拦截」
 3. **必须有头模式**（无头特征是重扣分项）；IP 质量差（机房/滥用段）时换住宅代理
 4. camoufox 仍被拒时可换 **fp-chromium 内核**（继承系统语言、作者实测通过 Turnstile）
-5. 环境列表「体检」按钮：locale_match 与 turnstile_reachable 两项可直接定位此类问题
+5. 环境列表「体检」按钮：locale\_match 与 turnstile\_reachable 两项可直接定位此类问题
 
 ## 已知限制
 
 - Camoufox 走 Playwright/Juggler 协议无 CDP 端口；需要 Selenium/Puppeteer 直连时选
   `fp-chromium` 内核（返回 `ws_endpoint`）——需自行下载安装 fingerprint-chromium
+
 - RPA 任务与页面控制仅支持 camoufox 内核（fp-chromium 走 CDP 直连自动化）
+
 - Cookie 等数据目录不参与同步（体积与安全考量）
-- 首次启动环境约 30~60 秒（字体库与指纹初始化）；后续启动明显加快
+
+- 首次启动环境约 30\~60 秒（字体库与指纹初始化）；后续启动明显加快
+
 - 默认端口 18080（50325 在部分 Windows 上被 Hyper-V 保留）
 
 ## 合规提示
 
 本项目仅用于合法用途：自有账号矩阵运营、广告验证、数据采集（遵守目标网站条款与当地法规）、
 自动化测试。禁止用于欺诈、规避司法封禁等违法行为。
-
