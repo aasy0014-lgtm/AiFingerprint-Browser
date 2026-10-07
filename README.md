@@ -165,7 +165,7 @@ app/
 ├── launcher.py           # 浏览器实例生命周期管理（三内核）
 ├── task_engine.py        # RPA 任务引擎（21 步骤/变量/重试/分支/iframe/多标签/CDP）
 ├── scheduler.py          # 定时调度循环（时区/周几/补跑/自动同步）
-├── mcp_server.py         # MCP Server（stdio JSON-RPC 2.0，19 工具）
+├── mcp_server.py         # MCP Server（stdio JSON-RPC 2.0，48 工具）
 ├── matrix.py             # 指纹矩阵风控（分布/查重/矩阵感知重生成）
 ├── sync.py               # 自托管同步（push/pull/LWW/删除传播）
 ├── transfer.py           # 导入导出 + 整机备份恢复

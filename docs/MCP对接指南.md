@@ -1,6 +1,6 @@
 # MCP 对接指南（Model Context Protocol）
 
-FPWorkbench 内置 MCP Server，将工作台全部 API 包装为 **48 个标准 MCP 工具**，
+FPWorkbench 内置 MCP Server，将工作台核心 API 包装为 **48 个标准 MCP 工具**，
 Claude Desktop / Cursor / 其他 MCP 客户端可通过 stdio 直接调用，实现 AI 驱动的
 环境管理、浏览器控制（点击/输入/滚动等页面交互）、RPA 任务、矩阵风控等全流程操作。
 
@@ -77,7 +77,7 @@ Cursor 的 MCP 配置在项目级 `.cursor/mcp.json` 或全局设置中：
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}
-→ {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"fpworkbench","version":"0.3.0","title":"FPWorkbench 指纹浏览器工作台"}}}
+→ {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"fpworkbench","version":"0.4.0","title":"FPWorkbench 指纹浏览器工作台"}}}
 ```
 
 ## 3. 可用工具列表（48 个）
@@ -92,7 +92,7 @@ Cursor 的 MCP 配置在项目级 `.cursor/mcp.json` 或全局设置中：
 
 | 工具名 | 说明 | 关键参数 |
 |---|---|---|
-| `list_profiles` | 环境列表 | `kernel`（可选，按内核过滤） |
+| `list_profiles` | 环境列表 | `group`（可选，按分组名过滤） |
 | `get_profile` | 查看单个环境详情（含完整指纹） | `profile_id` |
 | `create_profile` | 创建环境 | `name`, `kernel`, `fingerprint_mode`, `target_os`, `group`, `proxy_json`, `launch_json` |
 | `update_profile` | 修改环境配置（名称/分组/代理/指纹重生成等） | `profile_id`, `updates_json` |
@@ -347,7 +347,7 @@ Claude：[调用 click_element(profile_id="p_fp", selector="#login-btn")]
 3. **工作台需先运行**：MCP Server 通过 HTTP 请求工作台，工作台未启动时所有工具调用会报连接错误
 4. **结果截断**：单次工具返回的文本上限 12000 字符，超出会被截断
 5. **协议兼容**：支持 MCP 协议版本协商，自动回显客户端请求的版本号
-6. **页面交互所有内核通用**：click/type/scroll 等 13 个页面控制工具支持 camoufox、fp-chromium、chromium 三种内核。
+6. **页面交互所有内核通用**：click/type/scroll 等 15 个页面控制工具支持 camoufox、fp-chromium、chromium 三种内核。
    fp-chromium/chromium 通过 CDP 临时连接执行，每次请求自动连接/断开
 7. **CDP 连接开销**：非 camoufox 内核的页面交互每次请求会建立临时 CDP 连接，有约 1-2 秒的额外开销。
    频繁操作场景建议使用 RPA 任务或通过 `get_endpoint` 获取 CDP 端点后用 Playwright 直连
