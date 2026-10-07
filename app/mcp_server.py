@@ -86,8 +86,9 @@ def build_tools(client: WorkbenchClient) -> list[Tool]:
 
         # ======== 环境管理 ========
         Tool("list_profiles", "环境列表（名称/内核/系统/代理/健康分/运行状态）",
-             _obj({"kernel": _s("按内核过滤：camoufox/fp-chromium/chromium")}),
-             lambda a: client.call("GET", "/api/v1/profiles")),
+             _obj({"group": _s("按分组名过滤（可选）")}),
+             lambda a: client.call("GET", "/api/v1/profiles",
+                                   {"group": a["group"]} if a.get("group") else None)),
         Tool("get_profile", "查看单个环境详情（含完整指纹 JSON）",
              _obj({"profile_id": _s("环境 ID", minLength=1)}, ["profile_id"]),
              lambda a: client.call("GET", f"/api/v1/profiles/{a['profile_id']}")),
