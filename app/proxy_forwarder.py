@@ -258,8 +258,11 @@ class AuthProxyForwarder:
                 r = await client.request(method, target, headers=req_headers,
                                          content=body or None)
             status_line = f"HTTP/1.1 {r.status_code} {r.reason_phrase}\r\n"
+            # httpx 已解压 body，content-encoding 必须丢弃（否则客户端会二次解压失败）；
+            # content-length / transfer-encoding 由下面按实际 body 重写，避免重复或失真
+            _DROP = ("transfer-encoding", "content-encoding", "content-length")
             out_headers = "".join(f"{k}: {v}\r\n" for k, v in r.headers.items()
-                                  if k.lower() != "transfer-encoding")
+                                  if k.lower() not in _DROP)
             writer.write(status_line.encode() + out_headers.encode() +
                          b"content-length: " + str(len(r.content)).encode() +
                          b"\r\n\r\n" + r.content)

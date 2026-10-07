@@ -1,11 +1,15 @@
 """MCP Server 协议级测试：spawn 子进程，逐条发 JSON-RPC 验证响应。"""
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PY = ROOT / ".venv" / "Scripts" / "python"
+# venv 解释器路径跨平台不同（Windows: Scripts/python，POSIX: bin/python）；
+# 找不到时退回当前解释器，避免脚本在 macOS/Linux 上直接崩掉
+_VENV_PY = ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / "python"
+PY = _VENV_PY if _VENV_PY.exists() else Path(sys.executable)
 
 proc = subprocess.Popen(
     [str(PY), "-m", "app.mcp_server"],

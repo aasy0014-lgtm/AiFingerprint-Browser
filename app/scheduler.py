@@ -161,10 +161,11 @@ class Scheduler:
             p = db.get_profile(pid)
             if p:
                 profiles.append(p)
-        db.update_schedule(schedule_id, {"last_run_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
         if not profiles:
+            # 不推进 last_run_at：否则本周期被白白消耗，下个 tick 也不会重试
             log.warning("调度 %s 无可用环境", schedule_id)
             return 0
+        db.update_schedule(schedule_id, {"last_run_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
         run_ids = await self.engine.run(
             task, profiles, headless=s["headless"], auto_close=s["auto_close"]
         )
