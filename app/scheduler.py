@@ -95,9 +95,14 @@ class Scheduler:
         for s in db.list_schedules():
             if not s["enabled"]:
                 continue
-            if not self._is_due(s, now):
-                continue
-            await self.run_now(s["id"], reason="schedule")
+            # 单个计划计算/触发异常（如库里已存在脏 daily_time）不得阻断本 tick
+            # 的其余计划与自动同步，否则一个坏计划会让整个调度器静默停摆
+            try:
+                if not self._is_due(s, now):
+                    continue
+                await self.run_now(s["id"], reason="schedule")
+            except Exception:
+                log.exception("调度 %s 处理失败，已跳过", s.get("id"))
         # 自动同步（仅 push——拉取通常是用户手动触发或远端主动拉）
         await self._auto_sync_if_due(now)
 

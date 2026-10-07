@@ -923,9 +923,13 @@ async def start_playwright_server(request: Request, profile_id: str,
 @app.delete("/api/v1/browser/{profile_id}/playwright-server")
 async def stop_playwright_server(request: Request, profile_id: str) -> dict:
     member = member_of(request)
+    p = db.get_profile(profile_id)
+    if not p:
+        raise ApiError(404, "环境不存在")
+    require_profile_access(request, p)
     if not await pw_server.stop_server(profile_id):
         raise ApiError(404, "该环境没有运行中的 Playwright Server")
-    audit("pw_server.stop", profile_id, member=member)
+    audit("pw_server.stop", p["name"], member=member)
     return ok()
 
 
@@ -1053,7 +1057,12 @@ async def browser_press(request: Request, profile_id: str, body: PressRequest) -
 
 @app.post("/api/v1/browser/{profile_id}/wait")
 async def browser_wait(request: Request, profile_id: str, body: WaitRequest) -> dict:
-    import asyncio
+    # 与其它页面控制接口保持一致：即使只是等待也要校验环境归属，
+    # 否则 operator 可对任意 profile_id 发起调用（越权探测 + 无谓占用）
+    p = db.get_profile(profile_id)
+    if not p:
+        raise ApiError(404, "环境不存在")
+    require_profile_access(request, p)
     await asyncio.sleep(body.ms / 1000)
     return ok({"detail": f"等待 {body.ms}ms"})
 
@@ -1312,6 +1321,44 @@ async def create_task_from_template(request: Request, template_id: str) -> dict:
 
 # ---------------------------------------------------------------- 定时调度（管理员）
 
+def _validate_daily_time(value: Optional[str]) -> None:
+    """HH:MM 范围校验：models 的正则允许 25:70 这类越界值，须在入库前拦下，
+    否则调度器计算到期时刻时会抛 ValueError（已由 _tick 兜底，但数据本身应拒绝）。"""
+    if not value:
+        return
+    parts = value.split(":")
+    try:
+        hh, mm = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        raise ApiError(400, f"无效时间格式: {value}（需 HH:MM）")
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise ApiError(400, f"无效时间: {value}（小时 00-23、分钟 00-59）")
+
+
+def _validate_timezone(value: Optional[str]) -> None:
+    if not value:
+        return
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ApiError(400, f"无效时区: {value}（需 IANA 名，如 Asia/Shanghai）")
+
+
+def _validate_profile_ids(profile_ids: list[str]) -> None:
+    for pid in profile_ids:
+        if not db.get_profile(pid):
+            raise ApiError(404, f"环境不存在: {pid}")
+
+
+def _validate_schedule_shape(kind: str, daily_time: Optional[str],
+                             interval_minutes: Optional[int]) -> None:
+    if kind == "daily" and not daily_time:
+        raise ApiError(400, "每日调度必须提供 daily_time（HH:MM）")
+    if kind == "interval" and not interval_minutes:
+        raise ApiError(400, "间隔调度必须提供 interval_minutes")
+
+
 @app.get("/api/v1/schedules")
 async def list_schedules(request: Request) -> dict:
     require_admin(request)
@@ -1326,19 +1373,10 @@ async def create_schedule(request: Request, body: ScheduleCreate) -> dict:
     member = require_admin(request)
     if not db.get_task(body.task_id):
         raise ApiError(404, "任务不存在")
-    if body.kind == "daily" and not body.daily_time:
-        raise ApiError(400, "每日调度必须提供 daily_time（HH:MM）")
-    if body.kind == "interval" and not body.interval_minutes:
-        raise ApiError(400, "间隔调度必须提供 interval_minutes")
-    if body.timezone:
-        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-        try:
-            ZoneInfo(body.timezone)
-        except (ZoneInfoNotFoundError, ValueError):
-            raise ApiError(400, f"无效时区: {body.timezone}（需 IANA 名，如 Asia/Shanghai）")
-    for pid in body.profile_ids:
-        if not db.get_profile(pid):
-            raise ApiError(404, f"环境不存在: {pid}")
+    _validate_schedule_shape(body.kind, body.daily_time, body.interval_minutes)
+    _validate_daily_time(body.daily_time)
+    _validate_timezone(body.timezone)
+    _validate_profile_ids(body.profile_ids)
     s = db.create_schedule(
         name=body.name, task_id=body.task_id, kind=body.kind,
         interval_minutes=body.interval_minutes, daily_time=body.daily_time,
@@ -1351,13 +1389,28 @@ async def create_schedule(request: Request, body: ScheduleCreate) -> dict:
 
 @app.put("/api/v1/schedules/{schedule_id}")
 async def update_schedule(request: Request, schedule_id: str, body: ScheduleUpdate) -> dict:
-    require_admin(request)
+    member = require_admin(request)
+    existing = db.get_schedule(schedule_id)
+    if not existing:
+        raise ApiError(404, "调度不存在")
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if not updates:
-        return ok(db.get_schedule(schedule_id))
+        return ok(existing)
+    # 按合并后的结果校验：避免把计划改成"永不触发"的静默脏数据
+    # （如 kind 改 interval 却不给 interval_minutes、指向已删除的环境）
+    merged = {**existing, **updates}
+    _validate_schedule_shape(merged["kind"], merged.get("daily_time"),
+                             merged.get("interval_minutes"))
+    if "daily_time" in updates:
+        _validate_daily_time(merged.get("daily_time"))
+    if "timezone" in updates:
+        _validate_timezone(merged.get("timezone"))
+    if "profile_ids" in updates:
+        _validate_profile_ids(merged["profile_ids"])
     s = db.update_schedule(schedule_id, updates)
     if not s:
         raise ApiError(404, "调度不存在")
+    audit("schedule.update", s["name"], f"字段: {', '.join(updates)}", member=member)
     return ok(s)
 
 
