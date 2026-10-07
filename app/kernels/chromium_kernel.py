@@ -91,7 +91,9 @@ async def start(
 
     # 等待 CDP 端口就绪
     ws_endpoint: Optional[str] = None
-    async with httpx.AsyncClient() as client:
+    # 回环地址探测 CDP：忽略系统/环境代理，否则 HTTP_PROXY 会把 127.0.0.1 请求转发出去
+    # 导致「端口未就绪」误报并把已启动的浏览器杀掉
+    async with httpx.AsyncClient(trust_env=False) as client:
         for _ in range(40):
             await asyncio.sleep(0.5)
             if proc.poll() is not None:

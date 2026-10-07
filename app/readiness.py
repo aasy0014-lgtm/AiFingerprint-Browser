@@ -72,7 +72,8 @@ class _CdpPage:
         self._id = 0
 
     async def open(self) -> None:
-        async with httpx.AsyncClient() as c:
+        # 回环地址控制 CDP：忽略系统/环境代理，否则 HTTP_PROXY 会把 127.0.0.1 请求转发出去
+        async with httpx.AsyncClient(trust_env=False) as c:
             r = await c.put(f"http://127.0.0.1:{self.port}/json/new?about:blank", timeout=10)
             info = r.json()
         self.target_id = info["id"]
@@ -109,7 +110,7 @@ class _CdpPage:
                 pass
         if self.target_id:
             try:
-                async with httpx.AsyncClient() as c:
+                async with httpx.AsyncClient(trust_env=False) as c:
                     await c.get(f"http://127.0.0.1:{self.port}/json/close/{self.target_id}",
                                 timeout=5)
             except Exception:
