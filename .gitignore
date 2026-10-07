@@ -1,0 +1,11 @@
+# 运行态数据：含加密密钥 secret.key、代理凭据密文（settings.json / *.db）
+# 目录由 app/config.py 的 ensure_dirs() 在启动时自动创建，无需纳入版本控制
+data/
+
+# 环境用户数据（含浏览器 profile，可能存有登录态）
+profiles/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
