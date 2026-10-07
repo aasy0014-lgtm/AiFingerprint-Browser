@@ -71,7 +71,10 @@ async def test_proxy(proxy: Optional[ProxyConfig], timeout: float = 15) -> dict:
     for url, extract in _PROVIDERS:
         try:
             async with httpx.AsyncClient(
-                proxy=proxy.to_url() if proxy else None, timeout=timeout
+                proxy=proxy.to_url() if proxy else None, timeout=timeout,
+                # 直连模式必须忽略系统/环境代理：macOS 系统代理开着时 httpx 默认
+                # trust_env=True 会走系统代理，"直连"测出的出口 IP 其实是代理节点的
+                trust_env=bool(proxy),
             ) as client:
                 resp = await client.get(url)
             data = extract(resp.json())
