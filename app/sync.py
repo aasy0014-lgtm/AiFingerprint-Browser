@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from . import db, security
+from .proxy_dns import is_lan_target
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +83,8 @@ async def push_to_remote() -> dict[str, Any]:
         "profiles": [_profile_payload(p) for p in db.list_profiles()],
         "deletes": [d["sync_id"] for d in db.list_sync_deletes()],
     }
-    async with httpx.AsyncClient(timeout=SYNC_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=SYNC_TIMEOUT,
+                                 trust_env=not is_lan_target(url)) as client:
         r = await client.post(f"{url}/api/sync/upload", json=payload,
                               headers={"X-Sync-Token": token})
         r.raise_for_status()
@@ -101,7 +103,8 @@ async def pull_from_remote() -> dict[str, Any]:
     token = settings.get("sync_remote_token", "")
     if not url or not token:
         raise ValueError("请先在设置中配置同步服务器地址与令牌")
-    async with httpx.AsyncClient(timeout=SYNC_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=SYNC_TIMEOUT,
+                                 trust_env=not is_lan_target(url)) as client:
         r = await client.get(f"{url}/api/sync/download",
                              headers={"X-Sync-Token": token})
         r.raise_for_status()

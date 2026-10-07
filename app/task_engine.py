@@ -36,20 +36,19 @@
 Playwright Page API。
 """
 import asyncio
-import ipaddress
 import logging
 import random
 import re
 import time
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
 
 import httpx
 
 from . import db
 from .config import DATA_DIR
 from .launcher import LaunchManager
+from .proxy_dns import is_lan_target
 
 log = logging.getLogger(__name__)
 
@@ -101,23 +100,6 @@ class _RunContext:
     @property
     def page(self):
         return self.pages[self.current]
-
-
-def _is_lan_target(url: str) -> bool:
-    """目标是回环/内网地址（localhost、127.0.0.0/8、10/8、172.16/12、192.168/16 等）。
-
-    httpx 默认 trust_env=True，会读取 macOS 系统代理设置；若系统代理开着，
-    连发往 127.0.0.1 的 webhook 也会被送进代理，代理对 Host=127.0.0.1 返回 502，
-    导致本机/内网回调永远收不到。
-    """
-    host = (urlparse(url).hostname or "").lower()
-    if host in ("localhost", "127.0.0.1", "::1"):
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return ip.is_loopback or ip.is_private
 
 
 class TaskEngine:
@@ -300,7 +282,7 @@ class TaskEngine:
 
         async def _fire() -> None:
             try:
-                async with httpx.AsyncClient(timeout=15, trust_env=not _is_lan_target(url)) as client:
+                async with httpx.AsyncClient(timeout=15, trust_env=not is_lan_target(url)) as client:
                     await client.post(url, json=payload)
             except Exception as e:
                 log.warning("webhook 回调失败 %s: %s", url, e)

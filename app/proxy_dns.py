@@ -7,6 +7,7 @@
 import ipaddress
 import logging
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -27,6 +28,24 @@ def is_ip_address(host: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def is_lan_target(url: str) -> bool:
+    """目标是回环/内网地址（localhost、127.0.0.0/8、10/8、172.16/12、192.168/16 等）。
+
+    httpx 默认 trust_env=True，会读取 macOS 系统代理设置；若系统代理开着，
+    连发往 127.0.0.1 的请求也会被送进代理，代理对 Host=127.0.0.1 返回 502，
+    导致本机/内网服务（webhook、MCP、同步节点）永远连不上。
+    这类目标应设置 trust_env=False 直连。
+    """
+    host = (urlparse(url).hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private
 
 
 async def resolve_real_ip(host: str, timeout: float = 6) -> Optional[str]:

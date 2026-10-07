@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 from .config import DATA_DIR, VERSION
+from .proxy_dns import is_lan_target
 
 PROTOCOL_VERSION = "2025-03-26"
 SERVER_INFO = {"name": "fpworkbench", "version": VERSION, "title": "FPWorkbench 指纹浏览器工作台"}
@@ -30,7 +31,9 @@ class WorkbenchClient:
     def __init__(self, base_url: str, api_key: Optional[str]) -> None:
         self.base_url = base_url.rstrip("/")
         headers = {"X-API-Key": api_key} if api_key else {}
-        self.http = httpx.Client(base_url=self.base_url, headers=headers, timeout=120)
+        # 目标是本机/内网时忽略系统代理（macOS 系统代理会把 127.0.0.1 请求转发出去 → 502）
+        self.http = httpx.Client(base_url=self.base_url, headers=headers, timeout=120,
+                                 trust_env=not is_lan_target(self.base_url))
 
     def call(self, method: str, path: str, body: dict | None = None) -> Any:
         # GET 的 body 作为查询参数传递（task-runs 等过滤场景）
