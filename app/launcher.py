@@ -47,10 +47,42 @@ class LaunchManager:
         # 允许同时拉起多个实例（批量启动并行；限制并发防资源打满）
         self._launch_sem = asyncio.Semaphore(4)
         self._starting: set[str] = set()
+        # 后台资源释放任务的强引用（防止事件循环执行前被 GC）
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    async def _close_instances(self, insts: list["RunningInstance"]) -> None:
+        for inst in insts:
+            try:
+                await inst.stop()
+            except Exception as e:
+                log.warning("释放已退出环境 %s 的资源时出错: %s", inst.profile_id, e)
+
+    def _close_soon(self, insts: list["RunningInstance"]) -> None:
+        """同步调用点：把已退出实例的资源释放交给事件循环。
+
+        浏览器被用户手动关闭/崩溃时，实例只是从 _running 摘除并不够——
+        必须关闭 context 与 playwright，否则 node 驱动进程会一直残留。
+        """
+        if not insts:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._close_instances(insts))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     def is_running(self, profile_id: str) -> bool:
         inst = self._running.get(profile_id)
-        return bool(inst and inst.is_alive())
+        if inst is None:
+            return False
+        if inst.is_alive():
+            return True
+        # 浏览器已被手动关闭/崩溃：摘除实例并异步释放其驱动进程
+        self._running.pop(profile_id, None)
+        self._close_soon([inst])
+        return False
 
     async def start(
         self,
@@ -217,9 +249,9 @@ class LaunchManager:
             await self.stop(pid)
 
     def active(self) -> list[dict[str, Any]]:
-        # 清理已退出的实例（用户手动关掉浏览器窗口的情况）
-        for pid in [p for p, i in self._running.items() if not i.is_alive()]:
-            self._running.pop(pid, None)
+        # 清理已退出的实例（用户手动关掉浏览器窗口的情况），并释放其驱动进程
+        dead = [p for p, i in self._running.items() if not i.is_alive()]
+        self._close_soon([self._running.pop(p) for p in dead])
         return [
             {
                 "profile_id": i.profile_id,
