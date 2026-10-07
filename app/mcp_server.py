@@ -99,12 +99,17 @@ def build_tools(client: WorkbenchClient) -> list[Tool]:
                    "proxy_json": _s("代理配置 JSON 字符串，空=直连"),
                    "launch_json": _s("启动选项 JSON 字符串")},
                   ["name"]),
+             # 仅提交显式提供的字段：kernel/target_os 等为 Literal 非 Optional，
+             # 传 null 会触发 422 校验失败（应由后端默认值补齐）；分组字段名为 group_name
              lambda a: client.call("POST", "/api/v1/profiles", {
-                 "name": a["name"], "kernel": a.get("kernel"),
-                 "fingerprint_mode": a.get("fingerprint_mode"), "target_os": a.get("target_os"),
-                 "group": a.get("group"),
-                 "proxy": json.loads(a["proxy_json"]) if a.get("proxy_json") else None,
-                 "launch": json.loads(a["launch_json"]) if a.get("launch_json") else None,
+                 k: v for k, v in {
+                     "name": a["name"], "kernel": a.get("kernel"),
+                     "fingerprint_mode": a.get("fingerprint_mode"),
+                     "target_os": a.get("target_os"),
+                     "group_name": a.get("group"),
+                     "proxy": json.loads(a["proxy_json"]) if a.get("proxy_json") else None,
+                     "launch": json.loads(a["launch_json"]) if a.get("launch_json") else None,
+                 }.items() if v is not None
              })),
         Tool("update_profile", "修改环境配置（名称/分组/代理/指纹重生成等）。"
              "updates_json 如 {\"name\":\"新名\",\"group_name\":\"分组\",\"proxy\":{\"scheme\":\"socks5\",...},"
