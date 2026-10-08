@@ -865,11 +865,14 @@ async def browser_stop_batch(request: Request, body: IdsRequest) -> dict:
         if not manager.is_running(pid):
             results.append({"profile_id": pid, "ok": False, "error": "未在运行"})
             continue
-        try:
-            require_profile_access(request, p)
-        except ApiError as e:
-            results.append({"profile_id": pid, "ok": False, "error": e.msg})
-            continue
+        # 环境行可能已被同步删除但实例仍在运行：与单环境 /browser/stop 一致，
+        # 仅在能取到环境记录时校验归属，避免 None 触发 500
+        if p:
+            try:
+                require_profile_access(request, p)
+            except ApiError as e:
+                results.append({"profile_id": pid, "ok": False, "error": e.msg})
+                continue
         await manager.stop(pid)
         results.append({"profile_id": pid, "ok": True})
     stopped = sum(1 for r in results if r["ok"])
