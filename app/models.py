@@ -188,6 +188,8 @@ class SettingsUpdate(BaseModel):
     sync_remote_url: Optional[str] = Field(default=None, max_length=300)
     sync_remote_token: Optional[str] = Field(default=None, max_length=128)
     regenerate_sync_token: bool = False
+    # 自动同步：已配置远端后每 30 分钟自动推送（scheduler._auto_sync_if_due 读取）
+    auto_sync: Optional[bool] = None
     # 全局代理：新建环境默认继承、启动时兜底
     global_proxy: Optional[ProxyConfig] = None
     clear_global_proxy: bool = False

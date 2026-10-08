@@ -406,6 +406,7 @@ async def get_settings(request: Request) -> dict:
         "sync_token_masked": (settings.get("sync_token") or "")[:4] + "****",
         "sync_remote_url": settings.get("sync_remote_url", ""),
         "sync_remote_configured": bool(settings.get("sync_remote_token")),
+        "auto_sync": settings.get("auto_sync", False),
         "global_proxy": gp,
         "global_proxy_configured": bool(settings.get("global_proxy")),
     })
@@ -423,6 +424,8 @@ async def update_settings(request: Request, body: SettingsUpdate) -> dict:
         sync_cfg["sync_remote_token"] = body.sync_remote_token
     if body.regenerate_sync_token:
         sync_cfg["regenerate_sync_token"] = True
+    if body.auto_sync is not None:
+        sync_cfg["auto_sync"] = body.auto_sync
 
     # 全局敏感项统一要求管理员：认证开关、同步服务器（开启即暴露 /api/sync/*，
     # 且重新生成令牌会让其它节点的配置全部失效）、远端同步目标、全局代理
@@ -431,6 +434,7 @@ async def update_settings(request: Request, body: SettingsUpdate) -> dict:
     if (body.api_key_enabled is not None or body.regenerate_key
             or body.sync_server_enabled is not None or body.regenerate_sync_token
             or body.sync_remote_url is not None or body.sync_remote_token is not None
+            or body.auto_sync is not None
             or body.global_proxy is not None or body.clear_global_proxy):
         require_admin(request)
 

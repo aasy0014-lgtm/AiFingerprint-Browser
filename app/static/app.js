@@ -993,6 +993,7 @@ async function loadSettings() {
   $("#syncTokenHint").textContent = s.sync_server_enabled ? `令牌：${s.sync_token_masked}` : "";
   if (document.activeElement !== $("#syncRemoteUrl")) $("#syncRemoteUrl").value = s.sync_remote_url || "";
   if (!s.sync_remote_configured) $("#syncRemoteToken").value = "";
+  $("#autoSyncToggle").checked = !!s.auto_sync;
   renderGlobalProxy(s.global_proxy);
   await Promise.all([loadMembers(), loadIdentity()]);
 }
@@ -1110,6 +1111,17 @@ $("#btnSaveSyncRemote").addEventListener("click", async () => {
     toast("远端同步配置已保存");
     await loadSettings();
   } catch (e) { toast(e.message, "err"); }
+});
+
+$("#autoSyncToggle").addEventListener("change", async (e) => {
+  const enable = e.target.checked;
+  try {
+    await api("POST", "/settings", { auto_sync: enable });
+    toast(enable ? "已开启自动同步（每 30 分钟推送一次）" : "已关闭自动同步");
+  } catch (err) {
+    e.target.checked = !enable;
+    toast(`设置失败：${err.message}`, "err");
+  }
 });
 
 $("#btnSyncPush").addEventListener("click", async () => {
