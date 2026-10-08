@@ -879,6 +879,7 @@ function openRunModal(task) {
     || '<p class="muted">没有可选环境</p>';
   $("#runAutoClose").checked = true;
   $("#runVisible").checked = false;
+  $("#runHumanize").checked = false;
   $("#runModal").classList.remove("hidden");
 }
 
@@ -1160,7 +1161,6 @@ async function loadSchedules() {
     tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无调度计划，点击「新建调度」创建</td></tr>';
     return;
   }
-  const taskNames = Object.fromEntries(tasks.map((t) => [t.id, t.name]));
   if (!tasks.length) { try { tasks = await api("GET", "/tasks"); } catch (e) {} }
   tbody.innerHTML = list.map((s) => {
     const task = tasks.find((t) => t.id === s.task_id);
