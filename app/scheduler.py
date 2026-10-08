@@ -119,13 +119,15 @@ class Scheduler:
         last = _last_sync.get("push")
         if last and (now - last).total_seconds() < interval * 60:
             return
+        # 无论成败都记录本次尝试时刻：失败若不计时，会在每个 tick（20s）反复推送，
+        # 既违背「每 30 分钟一次」的语义，也会持续打扰可能已宕机/超时的远端
+        _last_sync["push"] = now
         try:
             from .sync import push_to_remote
             result = await push_to_remote()
-            _last_sync["push"] = now
             log.info("自动同步推送成功: %s", result)
         except Exception:
-            log.warning("自动同步推送失败", exc_info=True)
+            log.warning("自动同步推送失败（%d 分钟后重试）", interval, exc_info=True)
 
     @staticmethod
     def _is_due(s: dict, now: datetime) -> bool:
