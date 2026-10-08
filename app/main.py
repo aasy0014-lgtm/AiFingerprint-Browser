@@ -270,6 +270,8 @@ def _check_kernel_available(kernel: str) -> None:
         raise ApiError(400, "Camoufox 浏览器未安装，请先运行: python -m camoufox fetch")
     if kernel == "fp-chromium" and not fp_chromium_kernel.is_available()[0]:
         raise ApiError(400, fp_chromium_kernel.is_available()[1])
+    if kernel == "chromium" and not chromium_kernel.is_available()[0]:
+        raise ApiError(400, chromium_kernel.is_available()[1])
 
 
 # ---------------------------------------------------------------- 系统 / 认证 / 成员
