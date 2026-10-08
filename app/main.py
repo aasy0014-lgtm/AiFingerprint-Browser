@@ -1434,6 +1434,8 @@ async def delete_schedule(request: Request, schedule_id: str) -> dict:
 @app.post("/api/v1/schedules/{schedule_id}/run-now")
 async def run_schedule_now(request: Request, schedule_id: str) -> dict:
     member = require_admin(request)
+    if not db.get_schedule(schedule_id):
+        raise ApiError(404, "调度不存在")
     count = await scheduler.run_now(schedule_id, reason="manual")
     if count == 0:
         raise ApiError(409, "没有可运行的环境（任务或环境可能已被删除）")
