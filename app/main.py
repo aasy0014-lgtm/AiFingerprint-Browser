@@ -795,7 +795,8 @@ async def _start_one(request: Request, pid: str, headless: Optional[bool] = None
     try:
         require_profile_access(request, p)
     except ApiError as e:
-        return {"profile_id": pid, "ok": False, "error": e.msg}
+        # 带上原始状态码：单环境启动接口据此返回 403，而非误报 500
+        return {"profile_id": pid, "ok": False, "error": e.msg, "code": e.code}
     try:
         info = await manager.start(p, headless=headless, start_url=start_url)
         return {"profile_id": pid, "ok": True, "name": p["name"], **info}
@@ -810,6 +811,8 @@ async def browser_start(request: Request, body: BrowserStartRequest) -> dict:
     if not result["ok"]:
         if result["error"] == "环境不存在":
             raise ApiError(404, result["error"])
+        if result.get("code") == 403:
+            raise ApiError(403, result["error"])
         if "已在运行" in result["error"]:
             raise ApiError(409, result["error"])
         raise ApiError(500, result["error"])
