@@ -147,14 +147,16 @@ async def start_server(
             if ws_endpoint:
                 break
             await asyncio.sleep(0.3)
-    finally:
-        pass
-    if not ws_endpoint:
+        if not ws_endpoint:
+            raise RuntimeError(
+                f"90 秒内未获得 Playwright Server 端点: {''.join(output_lines)[-300:]}"
+            )
+    except BaseException:
+        # 超时、进程早退、调用被取消等所有异常路径都必须回收子进程与 stdout 读取任务，
+        # 否则 node 进程会成为孤儿（旧实现的 finally 是 pass，仅"超时"一条路径做了清理）
         _kill(proc)
         reader.cancel()
-        raise RuntimeError(
-            f"90 秒内未获得 Playwright Server 端点: {''.join(output_lines)[-300:]}"
-        )
+        raise
 
     _servers[profile_id] = {
         "process": proc,

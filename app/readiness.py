@@ -288,22 +288,24 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
         await manager.start(profile, headless=True)
         started_by_us = True
         inst = manager.get_instance(profile["id"])
-    if inst is None:
-        raise RuntimeError("浏览器实例不可用（启动失败）")
-
-    # 按内核选择检查通道：camoufox 用 playwright 上下文；chromium 系用 CDP 新目标页
-    if profile["kernel"] == "camoufox":
-        if inst.context is None:
-            raise RuntimeError("camoufox 实例缺少页面上下文")
-        page = _CamoufoxPage(inst.context)
-    else:
-        port = inst.info.get("debug_port")
-        if not port:
-            raise RuntimeError("chromium 系实例缺少 CDP 调试端口")
-        page = _CdpPage(port)
 
     checks: list[dict] = []
+    page = None
     try:
+        if inst is None:
+            raise RuntimeError("浏览器实例不可用（启动失败）")
+        # 按内核选择检查通道：camoufox 用 playwright 上下文；chromium 系用 CDP 新目标页
+        # 必须放在 try 内：实例可能是我们刚拉起的，此处报错也要在 finally 里关掉，否则浏览器泄漏
+        if profile["kernel"] == "camoufox":
+            if inst.context is None:
+                raise RuntimeError("camoufox 实例缺少页面上下文")
+            page = _CamoufoxPage(inst.context)
+        else:
+            port = inst.info.get("debug_port")
+            if not port:
+                raise RuntimeError("chromium 系实例缺少 CDP 调试端口")
+            page = _CdpPage(port)
+
         await page.open()
 
         # ---- 网络路径与出口 IP（浏览器网络栈内实测，天然走代理；多端点回退）
@@ -533,10 +535,11 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
 
         return _report(profile, checks)
     finally:
-        try:
-            await page.close()
-        except Exception:
-            pass
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
         if started_by_us:
             await manager.stop(profile["id"])
 
