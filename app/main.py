@@ -191,6 +191,20 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def static_cache_middleware(request: Request, call_next):
+    """面板静态资源禁用强缓存。
+
+    静态文件自带 ETag/Last-Modified；no-cache 让浏览器每次携带校验
+    （未变更返回 304，不额外传输），文件更新后立即生效，避免升级后
+    仍加载旧版 app.js / index.html（如新增的移动端机型品牌选择器）。
+    """
+    response = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 @app.exception_handler(ApiError)
 async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
     # 业务码为标准 HTTP 状态码区间时，同步设置 HTTP 状态（REST 客户端友好）
