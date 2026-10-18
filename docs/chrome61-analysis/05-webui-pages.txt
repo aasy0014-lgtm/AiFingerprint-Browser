@@ -1,0 +1,37 @@
+================================================================================
+WebUI 内部页面（chrome://）与 chrome://version 字段
+================================================================================
+证据来源: resources.pak 解包（574 个资源）+ en/zh locale.pak（各 1638 个字符串资源）
+
+[页面清单]
+chrome://version            版本页（字段见下）
+chrome://crashes            崩溃记录（Local Crash ID / 上报时间）
+chrome://safebrowsing       Safe Browsing 实验与首选项面板
+chrome://sync-internals     同步调试（about/data/events/types/search/log/…）
+chrome://signin-internals   登录调试
+chrome://gcm-internals      GCM 推送调试
+chrome://policy             策略面板（企业策略）
+chrome://net-internals      网络栈内部（含 net-export "Network Log Export"）
+chrome://net-export         网络日志导出
+chrome://omaha              更新器(Omaha)调试
+chrome://physical-web       BLE 信标(Physical Web)调试
+chrome://interstitials      安全插页合集预览
+chrome://flags              功能开关
+chrome://terms              服务条款
+chrome://credits            开源许可
+chrome://dino               离线小恐龙
+chrome://favicon            网站图标服务
+
+[chrome://version 页面字段]
+version / company / copyright / logo / useragent / command_line /
+executable_path / profile_path / flash_version / os_type / os_version /
+firmware_version / arc_version / variations(+variations-section) / customization_id
+
+[chrome://interstitials 覆盖的安全插页类型]
+ssl(证书错误) / captive(强制门户) / phishing(钓鱼警告) / malware(恶意软件警告) /
+blocked(阻止访问)
+
+[说明]
+- 这些页面使用 Polymer 1.0/iron-* 前端资源（WebUI 专用，不在普通网页出现）。
+- chrome://safebrowsing 面板证明 Safe Browsing 模块内置且可被实验控制。
+- f(?i18n) 模板: title=$i18n{…} 表明页面文案来自各 locale.pak（共 40 种语言）。

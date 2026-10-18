@@ -1,0 +1,65 @@
+================================================================================
+注入网页的用户脚本清单（stable.app/*.js）
+================================================================================
+共 16 个 .js 文件，全部位于 Payload/stable.app/ 根目录（非加密资源，可直接读取）。
+Chrome iOS 通过 WKUserScript 机制把其中多数注入到**页面世界(page world)**，
+因此网站 JS 可以直接看到它们留下的全局变量与改写痕迹。
+
+--------------------------------------------------------------------------------
+文件                 大小      暴露的全局/改写对象                        宿主命令/消息处理器
+--------------------------------------------------------------------------------
+web_bundle.js        10529B    window.__gCrWeb (common/message/console/   invokeOnHost 命令:
+                               stringify/getElementFromPoint/...),        console / document.submit /
+                               改写 window.scrollTo                       form.activity / window.error /
+                                                                          document.favicons /
+                                                                          addPluginPlaceholders
+window_id.js           82B      __gCrWeb.windowId = "$(WINDOW_ID)"         每窗口唯一 ID
+nav_bundle.js         1882B     改写 history.pushState/replaceState/       window.history.back/forward/go/
+                               back/forward/go；                          willChangeState/didPushState/
+                               __gCrWeb.dispatchPopstateEvent /           didReplaceState / window.hashchange
+                               dispatchHashchangeEvent /
+                               replaceWebViewURL
+chrome_bundle.js       169B     改写 window.print                          print.window.print
+post_request.js        656B     __crPostRequestWorkaround；                webkit.messageHandlers.
+                               内部用同步 XHR 回放 POST 表单               POSTSuccessHandler /
+                                                                          POSTErrorHandler
+payment_request.js   15438B    window.PaymentRequest /                    paymentRequest.createPaymentRequest /
+                               window.PaymentResponse (polyfill)          requestCanMakePayment / requestShow /
+                                                                          updatePaymentDetails /
+                                                                          responseComplete / requestAbort
+autofill_controller.js16884B   __gCrWeb.autofill.*                        (自动填充控制)
+password_controller.js 4299B   __gCrWeb.findPasswordForms /               (密码表单检索与填充)
+                               fillPasswordForm /
+                               fillPasswordFormWithGeneratedPassword /
+                               findMatchingPasswordForms /
+                               isAutofilled / setAutofilled /
+                               clearAutofilledPasswords /
+                               getPasswordForm(Data/DataList) /
+                               getElementByNameWithParent / selectText
+suggestion_controller.js2718B  __gCrWeb.suggestion.*                      (表单 Tab 顺序分析;
+                                                                          getNextElementInTabOrder 等)
+contextualsearch.js  15383B    __gCrWeb.contextualSearch.*                contextualSearch.mutationEvent /
+                                                                          contextualSearch.selectionChanged
+language_detection.js 2307B    __gCrWeb.languageDetection.*               languageDetection.textCaptured
+                               (getTextContent/…)                          (页面正文文本上报宿主)
+translate_ios.js      1167B    __gCrWeb.translate.*                       translate.ready / translate.status
+find_in_page.js      13296B    __gCrWeb.findInPage.*                      页内查找
+plugin_placeholder.js 3115B    __gCrWeb.plugin.*                          插件占位符(Flash 时代遗产)
+cast_sender_iframe.js98865B    chrome.cast.* (Cast SDK 注入)              cast.sender
+web_ui_bundle.js      8780B    window.chrome / chrome.send (仅 WebUI 页),  Mojo 桥: chrome.send
+                               Function.prototype.bind 改写
+
+--------------------------------------------------------------------------------
+关键结论
+--------------------------------------------------------------------------------
+1) 普通网页里存在 window.__gCrWeb（约 30 个成员）→ 网站一句
+   `'__gCrWeb' in window` 即可判定 Chrome iOS。
+2) history.*、window.print、window.scrollTo 均被改写；被改写函数 toString()
+   可见 "invokeOnHost" 字样 → 可用于二次确认。
+3) 普通网页中 window.chrome 不存在（只有 WebUI 页面通过 web_ui_bundle.js 注入）。
+   这是 Chrome iOS 与桌面 Chrome 的显著差异，可被风控当作指纹。
+4) 表单类脚本 (autofill/password/suggestion) 会读取表单结构与字段；
+   contextualsearch / language_detection 会读取选中文本和正文文本上报宿主进程。
+5) cast_sender_iframe.js 只在页面使用 Cast 时注入，注入后 chrome.cast 全局可见。
+6) post_request.js 只在发生 POST 导航时启用，暴露 __crPostRequestWorkaround
+   与两个 webkit.messageHandlers 通道名。

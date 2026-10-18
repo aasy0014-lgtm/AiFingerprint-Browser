@@ -1,0 +1,97 @@
+================================================================================
+样本身份与完整性证据
+================================================================================
+
+[文件]
+路径    : /Users/admin/Downloads/Chrome-v61-3163-73.ipa
+大小    : 67,814,248 字节
+SHA-256 : 5f9011796284092acfc271f6e429005daa19fb517ec4370663e68413a83a041c
+格式    : Zip archive (method=store)，内含 Payload/stable.app
+
+解包后体积: 85 MB（stable.app）
+
+[App 身份]  (来源: Payload/stable.app/Info.plist)
+CFBundleIdentifier        = com.google.chrome.ios
+CFBundleDisplayName       = Chrome
+CFBundleShortVersionString= 61.3163.73
+CFBundleVersion           = 61.0.3163.73
+SCMRevision               = 0cb96822e59630c82a826186a57b88d10d998e88-refs/branch-heads/3163@{#1020}
+MinimumOSVersion          = 9.0
+DTPlatformVersion         = iphoneos10.2
+DTSDKBuild                = 14C89
+DTXcode / DTXcodeBuild    = 0821 / 8C1002   (Xcode 8.2.1)
+BuildMachineOSBuild       = 16G29          (macOS 10.12.6)
+UIDeviceFamily            = [1, 2]         (iPhone + iPad)
+UIRequiresPersistentWiFi  = true
+NSAllowsArbitraryLoads    = true           (ATS 关闭)
+BreakpadProduct           = Chrome_iOS
+BreakpadURL               = https://clients2.google.com/cr/report
+BreakpadReportInterval    = 3600
+BreakpadSendAndExit       = YES
+GOOGLE_CLIENT_ID_MAIN     = 77185425430-b2b4gm566k352mn3ug9bhk7l425q76i1.apps.googleusercontent.com
+SSOAuthURLScheme          = com.google.sso.chrome.stable
+CFBundleURLSchemes        = [googlechrome, googlechromes, googlechrome-x-callback,
+                             googlechrome-stable, com.google.sso.chrome.stable]
+NSUserActivityTypes       = [com.google.chrome.handoff]
+LSApplicationQueriesSchemes = [chromium, chromiums, comgooglemaps, googleapp,
+                             googlechrome, googlechromes, googledevicepolicy,
+                             googledocs, googledrive, googlegmail, googlephotos,
+                             googleplaymusic, googlesheets, googleslides, gplus,
+                             vnd.google.calendar]
+
+[构建/落盘时间戳]
+大部分资源文件: 2017-09-01 / 2017-09-02
+SC_Info/Chrome.sinf: 2017-09-15   (购买并施加 FairPlay DRM 的时间)
+
+[App Store 购买元数据]  (来源: iTunesMetadata.plist)
+appleId                            = cards666911@gmail.com
+UserName                           = Artur Bondarenko
+purchaseDate                       = 2017-09-15T08:04:57Z
+AppleID (accountInfo)              = cards666911@gmail.com
+DSPersonID / PurchaserID           = 10339659454
+AccountStoreFront                  = 143492-2,32   (俄罗斯区)
+itemId                             = 535886823      (Google Chrome)
+bundleShortVersionString           = 61.3163.73
+softwareVersionExternalIdentifier  = 823513116
+releaseDate (商店)                 = 2012-06-28
+
+[代码签名]  (codesign -dvvv Payload/stable.app)
+Executable            = .../Payload/stable.app/Chrome
+Identifier            = com.google.chrome.ios
+Format                = app bundle with Mach-O universal (armv7 arm64)
+CodeDirectory v=20200 size=235605 flags=0x0(none) hashes=7355+5
+Hash type             = sha256 size=32
+CandidateCDHash sha256= 03561c09c75863058094152081e1fa6cbe73d555
+Authority             = Apple iPhone OS Application Signing
+Authority             = Apple iPhone Certification Authority
+Authority             = Apple Root CA
+TeamIdentifier        = EQHXZ8M8AV
+Sealed Resources      = version=2 rules=15 files=1282
+Signature size        = 4297
+说明: “Apple iPhone OS Application Signing” = App Store 商店分发签名（非开发/企业/重签名证书）。
+
+[FairPlay DRM]  (otool -l Payload/stable.app/Chrome)
+LC_ENCRYPTION_INFO    (armv7): cryptoff=16384  cryptsize=22085632  cryptid=1
+LC_ENCRYPTION_INFO_64 (arm64): cryptoff=16384  cryptsize=26755072  cryptid=1
+=> 两个架构的 __TEXT 段(含全部字符串/ObjC 元数据)整体加密。
+SC_Info/ 内容: Chrome.sinf (1056B), Chrome.supp (405732B), Chrome.supf (382496B),
+              Chrome.supx (80B), Manifest.plist (515B)
+
+[Fat 头]  (otool -f Payload/stable.app/Chrome)
+fat_magic 0xcafebabe, nfat_arch=2
+arch0: cputype 12      (armv7) offset 16384     size 25032016
+arch1: cputype 16777228(arm64) offset 25051136  size 30517296
+
+[篡改比对结论]
+1. 无可执行 dylib 注入: otool -L 仅列出系统框架/库，无第三方路径。
+2. 无 embedded.mobileprovision（App Store 原生包特征）。
+3. META-INF 保留 Apple 原始 zip 元数据（com.apple.ZipMetadata.plist /
+   com.apple.FixedZipMetadata.bin），非第三方重打包。
+4. 签名链为 Apple 商店签名 + Google TeamID，非任何第三方证书。
+5. 两个扩展 (share_extension / today_extension) 同样为 Apple 签名。
+=> 判定：官方原版 App Store 安装包，未被改装。
+
+[注意] codesign --verify 在现代 macOS 上对旧包会输出
+“resource envelope is obsolete (custom omit rules)” 并返回非零退出码，
+这是对 2017 年旧格式资源信封工具的兼容性提示，不代表签名被破坏；
+签名主体(CodeDirectory/CMSDigest/Apple CA 链)完整。

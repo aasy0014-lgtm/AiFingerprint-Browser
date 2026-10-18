@@ -1,0 +1,35 @@
+================================================================================
+Entitlements（codesign -d --entitlements -）
+================================================================================
+
+[主 App]  com.google.chrome.ios
+  application-identifier                = EQHXZ8M8AV.com.google.chrome.ios
+  aps-environment                       = production
+  com.apple.developer.associated-domains= [ applinks:goo.gl ]
+  com.apple.security.application-groups = [ group.com.google.chrome,
+                                            group.com.google.common ]
+  keychain-access-groups                = [ EQHXZ8M8AV.com.google.chrome.ios,
+                                            EQHXZ8M8AV.com.google.common.SSO ]
+
+[分享扩展]  com.google.chrome.ios.ShareExtension (PlugIns/share_extension.appex)
+  application-identifier                = EQHXZ8M8AV.com.google.chrome.ios.ShareExtension
+  com.apple.security.application-groups = [ group.com.google.chrome,
+                                            group.com.google.common ]
+  keychain-access-groups                = [ EQHXZ8M8AV.com.google.chrome.ios.ShareExtension,
+                                            EQHXZ8M8AV.com.google.common.SSO ]
+
+[Today 小组件]  com.google.chrome.ios.TodayExtension (PlugIns/today_extension.appex)
+  application-identifier                = EQHXZ8M8AV.com.google.chrome.ios.TodayExtension
+  com.apple.security.application-groups = [ group.com.google.chrome,
+                                            group.com.google.common ]
+  keychain-access-groups                = [ EQHXZ8M8AV.com.google.chrome.ios.TodayExtension,
+                                            EQHXZ8M8AV.com.google.common.SSO ]
+
+[解读]
+- aps-environment=production: 拥有真实 APNs 推送通道（Google 服务器可推送）。
+- keychain-access-groups 含 com.google.common.SSO:
+  Google 各 App 之间共享登录凭据（SSO），也意味着身份标识持久化在钥匙串。
+- application-groups: 主 App 与两个扩展共享容器（书签/历史/登录态等）。
+- associated-domains applinks:goo.gl: goo.gl 短链可直接进入 Chrome 打开。
+- 重签名会替换/失效以上能力：Google 登录取不到 SSO 钥匙串组、推送 token 失配、
+  App Group 变成新容器 —— 这是"解密重签版"典型坏点，而不是 App 主动检测。

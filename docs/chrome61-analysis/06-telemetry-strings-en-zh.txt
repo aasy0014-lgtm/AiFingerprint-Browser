@@ -1,0 +1,73 @@
+================================================================================
+遥测 / 崩溃 / 安全模式 字符串原文（中英文）
+================================================================================
+证据来源: *lproj/locale.pak（WebUI 字符串）、*lproj/Localizable.strings、
+          *lproj/InfoPlist.strings
+
+--------- 1. 崩溃与统计上报（locale.pak 资源号见左） ---------
+[15187] EN: Local Crash ID $1
+        ZH: 本地崩溃 ID：$1
+[15188] EN: Crash report uploaded on $1
+        ZH: 崩溃报告的上传时间：$1
+[15189] EN: Crash report captured on $1, uploaded on $2
+        ZH: 崩溃报告的获取时间：$1；上传时间：$2
+[15192] EN: Crash report captured on $1 (upload requested by user, not yet uploaded)
+        ZH: 崩溃报告获取时间：$1（用户已请求上传，但尚未上传）
+[15194] EN: You have no recently reported crashes. Crashes that occurred when crash
+             reporting was disabled will not appear here.
+        ZH: 您最近未收到崩溃报告。崩溃报告停用时发生的崩溃不会在此处显示。
+[15195] EN: Crash reporting is disabled.
+        ZH: 已停用崩溃报告。
+[15387] EN: Automatically send usage statistics and crash reports to Google
+        ZH: 将使用情况统计信息和崩溃报告自动发送给 Google
+[15312/01512] EN: Help make Chrome better by sending usage statistics and crash
+                  reports to Google.
+              ZH: 将使用情况统计信息和崩溃报告发送给 Google，帮助我们完善 Chrome。
+[02232] Do Not Track 说明:
+        EN: Enabling 'Do Not Track' means that a request will be included with your
+            browsing traffic. Any effect depends on whether a website responds …
+            网页仍会收集数据用于安全、内容、广告、统计等目的。
+        ZH: 如果您启用了"不跟踪"，您的浏览流量中将会包含一个请求……许多网站仍会
+            出于一些目的收集并使用您的浏览数据……
+
+--------- 2. Safe Mode（越狱注入模块检测）—— 全部 7 条 ---------
+键名与原文（en.lproj/Localizable.strings）:
+ IDS_IOS_SAFE_MODE_AW_SNAP
+    EN: "Aw, Snap!"                      ZH: "喔唷，崩溃啦！"
+ IDS_IOS_SAFE_MODE_SENDING_CRASH_REPORT
+    EN: "Sending crash report…"          ZH: "正在发送崩溃报告…"
+ IDS_IOS_SAFE_MODE_CRASH_REPORT_SENT
+    EN: "Crash report sent."             ZH: "已发送崩溃报告。"
+ IDS_IOS_SAFE_MODE_TWEAKS_FOUND
+    EN: "Some add-ons cause Chrome to crash. Please try uninstalling them."
+    ZH: "部分插件导致 Chrome 崩溃，请尝试卸载这些插件。"
+ IDS_IOS_SAFE_MODE_NAMED_TWEAKS_FOUND
+    EN: "Some add-ons cause Chrome to crash. Please uninstall:"
+    ZH: "部分插件导致 Chrome 崩溃，请卸载这些插件："
+ IDS_IOS_SAFE_MODE_RELOAD_CHROME
+    EN: "Try again"                      ZH: "重试"
+ IDS_IOS_SAFE_MODE_UNKNOWN_CAUSE
+    EN: "Something went really wrong. We'll work on that."
+    ZH: "出错了，我们马上处理。"
+
+其他语言旁证（de/ja/fr 的 NAMED_TWEAKS_FOUND）:
+ DE: "Einige Add-ons führen zum Ausfall von Chrome. Bitte deinstallieren Sie:"
+ JA: "アドオンが原因でChromeがクラッシュしました。次をアンインストールしてください:"
+ FR: "Certains modules complémentaires entraînent le plantage de Chrome…"
+
+同一文案在 WebUI 字符串中亦有（en_locale_dump/01538, 01539），说明 Safe Mode
+提示页由 WebUI 渲染。
+
+--------- 3. 权限用途说明（InfoPlist.strings, zh_CN 原文） ---------
+ NSBluetoothPeripheralUsageDescription: "这样可让您找到与目前周遭环境相关的网页。"
+ NSCameraUsageDescription:              "这样，您就可以拍摄并上传照片。"
+ NSLocationWhenInUseUsageDescription:   "要在Chrome中获得更好的使用体验，需要用到您的位置信息。"
+ NSMicrophoneUsageDescription:          "这样，您就可以使用语音更快速地进行搜索。"
+ NSPhotoLibraryUsageDescription:        "这样，您就可以保存并上传照片。"
+
+--------- 4. 其他与识别相关的字符串 ---------
+- "Automatically send usage statistics and crash reports to Google"
+- Activity controls / Google Location History（UserDataControls.bundle，跳 Google 网页）
+- "Only you can see your data" / "Only you can see your activity"
+- DeviceManagement.bundle: "To use Google apps on this device as %@, your organization
+  requires that you install a security profile to keep your data safe."

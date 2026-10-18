@@ -1,0 +1,58 @@
+================================================================================
+Safe Mode：Chrome iOS 的"已加载模块"检测机制（越狱注入检测）专项证据
+================================================================================
+
+[证据 1] 包内黑名单文件
+文件: Payload/stable.app/SafeModeCrashingModules.plist
+内容全文:
+{
+  "StartupCrashModules" => {
+    "/Library/MobileSubstrate/DynamicLibraries/CDM.dylib" => {
+      "ModuleFriendlyName" => "Chrome Download Manager"
+    }
+  }
+}
+解读:
+- 键名是 **MobileSubstrate 注入目录**（/Library/MobileSubstrate/DynamicLibraries/）
+  下的 dylib 绝对路径 —— 即越狱 tweak 的注入位置。
+- "CDM.dylib"（Chrome Download Manager）是一个面向 iOS 越狱的
+  Chrome 下载管理插件，Google 把它加入了"启动崩溃模块"名单。
+- 说明该机制不是理论：官方包内置了真实中文社群插件的路径黑名单。
+
+[证据 2] UI 文案（详见 06 号证据）
+IDS_IOS_SAFE_MODE_TWEAKS_FOUND       "部分插件导致 Chrome 崩溃，请尝试卸载这些插件。"
+IDS_IOS_SAFE_MODE_NAMED_TWEAKS_FOUND "部分插件导致 Chrome 崩溃，请卸载这些插件："
+IDS_IOS_SAFE_MODE_UNKNOWN_CAUSE / RELOAD_CHROME / SENDING_CRASH_REPORT / CRASH_REPORT_SENT
+=> 崩溃归因到"插件"(tweaks/add-ons) 后，列出模块名并提示卸载。
+
+[证据 3] dyld 镜像枚举符号（未加密 __LINKEDIT 导入符号）
+@_dyld_image_count
+@_dyld_get_image_name
+@_dyld_get_image_header
+@_dyld_get_image_vmaddr_slide
+@dyld_stub_binder
+=> 运行时枚举已加载的全部 Mach-O 镜像（含注入的 tweak dylib）。
+
+[证据 4] 从 Chromium 开源子项目可知的对应模块
+（登记在 ios/chrome 的 safe mode / third-party modules 相关代码路径）
+=> 功能名：Safe Mode / third-party modules / add-ons。
+
+[工作机制（据证据推断）]
+1. 启动前后通过 dyld API 枚举进程内加载的全部镜像；
+2. 过滤出非系统、非 App 自带的路径（典型即
+   /Library/MobileSubstrate/DynamicLibraries/*.dylib、/usr/lib/* 非常规路径）；
+3. 若上次为异常退出（启动崩溃），将崩溃归因到这些模块，
+   对照 SafeModeCrashingModules.plist 生成"插件列表"；
+4. 展示 Safe Mode 页面（WebUI 文案渲染）：
+   - 列出插件名 → 提示"请卸载这些插件"
+   - 选项：重试(Try again) / 发送崩溃报告
+5. 崩溃报告（Breakpad minidump）中通常包含已加载模块清单 →
+   一旦上报，模块(tweak)名单会随崩溃报告发往 Google。
+
+[对本项目的影响]
+- 该机制**不会阻止** tweak 注入/dylib hook；它只做"崩溃归因 + 用户提示"。
+- 但如果要在真机/云手机上静默做 WebKit hook，需要注意：
+  1) 进程内会枚举 dylib 路径 → 使用非常规注入方式（如 Frida、代码注入到既有
+     镜像、或直接改二进制）比 MobileSubstrate dylib 更不易出现在"插件列表"；
+  2) 崩溃报告会把模块清单带回 Google —— 对"无痕/防关联"属于侧信道风险；
+  3) 只要不引发启动崩溃，Chrome 不会禁用或拒绝运行。

@@ -1,0 +1,70 @@
+================================================================================
+设备信息类 API 的符号证据（来自未加密 __LINKEDIT 导入符号表 + ObjC 类引用）
+================================================================================
+
+[AdSupport / IDFA]
+  @_OBJC_CLASS_$_ASIdentifierManager
+  _OBJC_CLASS_$_ASIdentifierManager
+  @_OBJC_METACLASS_$_ASIdentifierManager
+  + 主二进制链接 AdSupport.framework
+  => 具备读取广告标识符(IDFA) 的能力（具体调用点在加密段，未证实用途）。
+  => 注：包内无 NSUserTrackingUsageDescription；iOS 14.5+ 下 ATT 未弹窗即拒绝，
+     IDFA 读出为全零。
+
+[网络接口 / Wi-Fi]
+  @_getifaddrs / _getifaddrs                (网卡接口枚举，历史用于 MAC)
+  @_CNCopyCurrentNetworkInfo                (当前 Wi-Fi SSID/BSSID)
+  @_CFNetworkCopySystemProxySettings        (读取系统代理设置)
+  @_CFNetworkExecuteProxyAutoConfigurationURL(PAC)
+
+[硬件 / 系统]
+  @_sysctl / _sysctlbyname / _sysctlnametomib  (hw.machine 硬件型号等)
+  @_OBJC_CLASS_$_UIDevice
+  @_CFUUIDCreate / @_CFUUIDCreateFromUUIDBytes / @_CFUUIDCreateString
+  @_OBJC_CLASS_$_NSUUID
+
+[定位]
+  @_OBJC_CLASS_$_CLLocation
+  @_OBJC_CLASS_$_CLLocationManager
+  @_OBJC_METACLASS_$_CLLocationManager
+  @_OBJC_CLASS_$_CLCircularRegion
+  @_kCLLocationAccuracyBest / HundredMeters
+
+[蓝牙 / 信标 (Physical Web / Cast)]
+  @_OBJC_CLASS_$_CBCentralManager
+  @_OBJC_CLASS_$_CBUUID
+  @_CBAdvertisementDataServiceDataKey
+
+[Spotlight 索引]
+  @_OBJC_CLASS_$_CSSearchableIndex
+  @_OBJC_CLASS_$_CSSearchableItem
+  @_OBJC_CLASS_$_CSSearchableItemAttributeSet
+  @_OBJC_CLASS_$_CSSearchQuery
+  @_OBJC_CLASS_$_CSCustomAttributeKey
+
+[生物识别]
+  @_OBJC_CLASS_$_LAContext
+
+[WebView / 注入]
+  @_OBJC_CLASS_$_WKWebView / WKWebViewConfiguration / WKUserContentController /
+  WKUserScript / WKWebsiteDataStore / WKProcessPool
+  @_OBJC_CLASS_$_UIWebView                 (历史遗留引用)
+
+[GoogleCast SDK（静态编译进主二进制）]
+  GCKApplicationMetadata / GCKCastChannel / GCKCastContext / GCKColor /
+  GCKDevice / GCKDeviceManager / GCKDeviceScanner / GCKError / GCKFilterCriteria /
+  GCKFrameworkResources / GCKGenericChannel / GCKImage / GCKJSONUtils /
+  GCKJoinOptions / GCKLaunchOptions / GCKLogger / GCKMediaControlChannel /
+  GCKMediaInformation / GCKMediaMetadata / GCKMediaQueueItem / GCKMediaStatus /
+  GCKMediaTextTrackStyle / GCKMediaTrack / GCKSenderApplicationInfo …
+  (GCKDeviceScanner / GCKDeviceManager = 局域网发现与连接)
+
+[相机/扫码]
+  AVCaptureDevice / AVCaptureDeviceInput / AVCaptureMetadataOutput /
+  AVCaptureSession / AVCaptureVideoPreviewLayer / AVMetadataMachineReadableCodeObject
+  (QR 码扫描 — 3D Touch 快捷菜单"扫描 QR 码")
+
+[总计]
+  主二进制引用的 ObjC 类共 260 个（去重）；
+  导入符号约 1181 个（含系统库点名的全部导入）。
+  未发现 jailbreak/cydia/substrate/ptrace 等"主动反越狱检测"符号。

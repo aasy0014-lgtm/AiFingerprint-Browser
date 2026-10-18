@@ -1,0 +1,42 @@
+================================================================================
+主二进制链接的框架（otool -L Chrome，去重后）
+================================================================================
+
+UIKit, CoreFoundation, CoreGraphics, CoreText, Foundation, CFNetwork, Security,
+SystemConfiguration, AssetsLibrary, AudioToolbox, AVFoundation, CoreMedia,
+MediaAccessibility, MediaPlayer, QuartzCore, CoreSpotlight, ImageIO,
+MobileCoreServices, libresolv.9.dylib, libsqlite3.dylib,
+WebKit, CoreBluetooth, CoreLocation, Accelerate, LocalAuthentication,
+AdSupport, SafariServices, MessageUI, PassKit, Photos, StoreKit,
+libc++.1.dylib, libSystem.B.dylib, libobjc.A.dylib
+
+说明: 全部为 iOS 系统框架/库 —— 无任何第三方动态库（未注入、未捆绑 dylib）。
+
+[能力对照表：为什么链接了这个框架]
+WebKit              -> 渲染引擎 = WKWebView（Chrome iOS 是系统 WebKit 壳）
+AdSupport           -> 广告标识符 IDFA（ASIdentifierManager）
+CoreBluetooth       -> BLE 扫描（Physical Web 信标 / Cast 辅助发现）
+CoreLocation        -> 定位（网页地理定位、Omnibox 本地化）
+CoreSpotlight       -> 浏览内容索引进 iOS Spotlight（CSSearchableIndex）
+LocalAuthentication -> Touch ID（密码/信用卡确认）
+PassKit             -> Apple Pay（web payments）
+Photos / AssetsLibrary -> 相册访问（上传/保存）
+MessageUI / SafariServices -> 邮件分享 / SFSafariViewController（打开帮助页）
+StoreKit            -> 商店相关（跳转 App Store 页面等）
+AVFoundation / AudioToolbox / MediaPlayer -> 音视频播放与麦克风（语音搜索）
+CoreMedia/MediaAccessibility -> 字幕/媒体辅助
+Accelerate          -> 高性能计算（图像处理）
+Security / SystemConfiguration / CFNetwork -> 网络与密钥链
+libsqlite3          -> 本地数据库（历史、书签）
+
+[扩展的链接]
+share_extension.appex/share_extension:
+  Foundation, Social, CoreGraphics, MobileCoreServices, UIKit, CoreFoundation,
+  CoreText, libc++, libSystem.B, libobjc  (Social = 社交媒体分享入口)
+today_extension.appex/today_extension:
+  CoreGraphics, QuartzCore, Foundation, NotificationCenter, UIKit,
+  MobileCoreServices, CoreFoundation, CoreText, Security, CFNetwork,
+  SystemConfiguration  (Today 小组件)
+
+[注入的用户脚本资源（非链接库，但同样影响网页）]
+见 04-user-scripts-injection.txt —— 16 个 *.js 文件，位于 stable.app 根目录。

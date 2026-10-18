@@ -1,0 +1,80 @@
+================================================================================
+stable.app 顶层文件清单（ls -la，单位字节）
+================================================================================
+Chrome                                    55,568,432   # 通用二进制 armv7+arm64 (加密)
+..                                              224
+.                                              4896
+AccountSettingsCommonResources.bundle            96
+AccountSettingsResources.bundle                  96
+Assets.car                                  4,078,770
+DeviceManagement.bundle                          96
+DownloadManagerController.nib                 9,002
+FeedbackKitFeedbackPrompt.bundle                 96
+FeedbackKitUserFeedback.bundle                   96
+GIDAvatarUpload.bundle                           96
+GSKResources.bundle                             160
+GoogleCastResources.bundle                     1248
+GoogleKitContentViews.bundle                    192
+GoogleKitCore.bundle                           1344
+GoogleKitDialogs.bundle                         960
+GoogleKitPanel.bundle                           480
+GoogleKitProgressBar.bundle                     192
+GoogleKitSwitch.bundle                          224
+GoogleKitUINavigation.bundle                    800
+GoogleKitWeb.bundle                             160
+GoogleS3KitVoiceSearch.bundle                   224
+Icon-120/152/167/180/29/40/58/76/80/87.png    列印图标
+Info.plist                                     8,795
+LaunchScreen.nib                               3,417
+MaterialCollectionCells.bundle                   96
+MaterialCollections.bundle                       96
+MaterialIcons_*.bundle                       (9 个 Material 图标)
+MaterialRobotoFontLoader.bundle                 448
+PkgInfo                                            8
+PlugIns                                          128
+QuantumCollections.bundle                        96
+SC_Info                                          224   # FairPlay DRM
+SSOAuth.bundle                                   576
+SafeModeCrashingModules.plist                    413   # ★ 启动崩溃模块黑名单
+UserDataControls.bundle                           96
+_CodeSignature                                    96
+*lproj                                         (40 个语言目录，各含 locale.pak)
+autofill_controller.js                        16,884
+cast_sender_iframe.js                         98,865
+chrome_bundle.js                                 169
+chrome_100_percent.pak                       115,500
+chrome_200_percent.pak                       188,722
+chrome_300_percent.pak                       178,437
+contextualsearch.js                           15,383
+find_in_page.js                               13,296
+gm-config                                         96   # ★ 目录: ANY/OmniboxGeolocation.plist,
+                                                         ANY/SpeechInputLocaleMatches.plist
+icudtl.dat                                 6,623,888   # ICU Unicode/语言数据
+language_detection.js                          2,307
+nav_bundle.js                                  1,882
+password_controller.js                         4,299
+payment_request.js                            15,438
+plugin_placeholder.js                          3,115
+post_request.js                                  656
+resources.pak                              3,238,885   # WebUI 资源
+suggestion_controller.js                       2,718
+terms_*.html                                (40 种语言的服务条款页)
+translate_ios.js                               1,167
+web_bundle.js                                 10,529
+web_ui_bundle.js                               8,780
+window_id.js                                      82
+
+[PlugIns]
+share_extension.appex                        (分享扩展)
+today_extension.appex                        (Today 小组件扩展)
+
+[文档类资源]
+terms_en.html / terms_zh-CN.html / …         共 40 个语言版本(各 ~10-110KB)
+
+[关键小文件]
+SafeModeCrashingModules.plist  -> 见 08 号证据
+gm-config/ANY/OmniboxGeolocation.plist
+    EligibleDomains: google.com / google.cn / google.co.jp … (49 个 Google 域)
+gm-config/ANY/SpeechInputLocaleMatches.plist
+    Locale 映射: ar-AE / en-AU / en-US / es-419 / es-AR / es-ES / es-MX /
+                 fr-FR / zh-Hans-CN / zh-Hant-TW / zh-Hans-HK
