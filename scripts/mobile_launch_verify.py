@@ -291,6 +291,19 @@ FRAME_LIVE_JS = """(() => ({
   uaP: navigator.userAgentData ? navigator.userAgentData.platform : null,
 }))()"""
 
+# Accept-CH 高熵头回送探针：/accept-ch 的响应声明高熵提示，页面同源 fetch
+# 触发第二次请求；服务器端记录两次请求实际收到的头（真机 Chrome 在声明后
+# 对同源后续请求附上高熵 Sec-CH-UA-*，Safari 则始终没有 UA-CH 头）
+ACCEPT_CH_VALUE = (
+    "Sec-CH-UA-Model, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, "
+    "Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List, Sec-CH-UA-Full-Version, "
+    "Sec-CH-UA-WoW64"
+)
+
+ACCEPT_CH_HTML = """<!doctype html><html><head><script>
+fetch('/accept-ch-second').catch(function () {});
+</script></head><body>accept-ch</body></html>"""
+
 
 async def race_test(ws_endpoint: str) -> dict:
     """模拟用户新开标签页：目标被本会话门控 → 首个文档必须在补丁生效后执行。
@@ -457,6 +470,7 @@ async def main() -> int:
 
     frame_state: dict = {}
     worker_state: dict = {}
+    accept_ch_state: dict = {}
 
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
@@ -498,14 +512,26 @@ async def main() -> int:
 
         class _OopifHandler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
+                extra_headers: dict = {}
                 if self.path.startswith("/oopif-probe"):
                     _time.sleep(0.25)
                     body = OOPIF_PROBE_HTML
+                elif self.path.startswith("/accept-ch-second"):
+                    oopif_state.setdefault("accept_ch", {})["second"] = {
+                        k.lower(): v for k, v in self.headers.items()}
+                    body = "<html>ok</html>"
+                elif self.path.startswith("/accept-ch"):
+                    oopif_state.setdefault("accept_ch", {})["first"] = {
+                        k.lower(): v for k, v in self.headers.items()}
+                    body = ACCEPT_CH_HTML
+                    extra_headers["Accept-CH"] = ACCEPT_CH_VALUE
                 else:
                     body = OOPIF_MAIN_HTML
                 data = body.replace("__PORT__", str(oopif_state["port"])).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                for hname, hvalue in extra_headers.items():
+                    self.send_header(hname, hvalue)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -557,6 +583,14 @@ async def main() -> int:
             print(json.dumps(frame_state.get("worker") or {}, ensure_ascii=False))
             print("\n== 页面 Worker（文档起点）==")
             print(json.dumps(worker_state, ensure_ascii=False))
+
+            # ---- Accept-CH 高熵头回送：声明后同源请求应带高熵头（真机行为）----
+            await page.goto(f"http://127.0.0.1:{oopif_state['port']}/accept-ch",
+                            wait_until="domcontentloaded")
+            await asyncio.sleep(1.0)
+            accept_ch_state = dict(oopif_state.get("accept_ch") or {})
+            print("\n== Accept-CH 高熵头回送（两次请求实收头）==")
+            print(json.dumps(accept_ch_state, ensure_ascii=False, indent=1))
         finally:
             oopif_server.shutdown()
     finally:
@@ -620,6 +654,9 @@ async def main() -> int:
     fr_live = fr.get("live") if isinstance(fr.get("live"), dict) else {}
     fr_worker = fr.get("worker") if isinstance(fr.get("worker"), dict) else {}
     wk_main = worker_state if isinstance(worker_state, dict) else {}
+    # ---- Accept-CH：声明后同源请求实际收到的头（真机 Chrome 补高熵）----
+    ac_first = (accept_ch_state or {}).get("first") or {}
+    ac_second = (accept_ch_state or {}).get("second") or {}
     checks.update({
         "跨域 iframe：platform 一致（文档起点）": fr.get("platform") == nav.get("platform"),
         "跨域 iframe：colorDepth == 24（文档起点）": fr.get("cd") == 24,
@@ -685,6 +722,25 @@ async def main() -> int:
                 wk_main.get("devMem") == state.get("deviceMemory")),
             "Worker（跨域 iframe）：UA-CH platform == Android": (
                 fr_worker.get("uaP") == (ua_ch or {}).get("platform")),
+            # ---- Accept-CH：站点声明后回送高熵头（真机 Chrome 行为）----
+            "Accept-CH：首个文档仅低熵三头（无高熵）": (
+                "sec-ch-ua" in ac_first and "sec-ch-ua-model" not in ac_first),
+            "Accept-CH：声明后同源请求补齐高熵头": (
+                ac_second.get("sec-ch-ua-model") == f'"{ua_ch.get("model") or ""}"'
+                and ac_second.get("sec-ch-ua-platform-version") == f'"{ua_ch.get("platformVersion") or ""}"'
+                and ac_second.get("sec-ch-ua-arch") == '""'
+                and ac_second.get("sec-ch-ua-bitness") == '""'
+                and ac_second.get("sec-ch-ua-wow64") == "?0"),
+            "Accept-CH：fullVersion/全版本列表 == 指纹": (
+                ac_second.get("sec-ch-ua-full-version") == f'"{ua_ch.get("fullVersion") or ""}"'
+                and ac_second.get("sec-ch-ua-full-version-list") == ", ".join(
+                    f'"{b["brand"]}";v="{b["version"]}"'
+                    for b in (ua_ch.get("fullVersionList") or []))),
+            "Accept-CH：低熵三头与 UA 在回送中保持": (
+                ac_second.get("sec-ch-ua") == sec_ch_headers(ua_ch or {}).get("Sec-CH-UA")
+                and ac_second.get("sec-ch-ua-mobile") == "?1"
+                and ac_second.get("sec-ch-ua-platform") == f'"{ua_ch.get("platform") or "Android"}"'
+                and ac_second.get("user-agent") == nav["userAgent"]),
         })
     else:
         checks.update({
@@ -702,6 +758,10 @@ async def main() -> int:
             "Worker（页面）：UA-CH 不存在（Safari 行为）": wk_main.get("uaP") is None,
             "Worker（页面）：deviceMemory 不暴露（Safari 行为）": wk_main.get("devMem") is None,
             "Worker（跨域 iframe）：UA-CH 不存在（Safari 行为）": fr_worker.get("uaP") is None,
+            # ---- Accept-CH：Safari 无 UA-CH，声明后也没有任何 Sec-CH-UA* 头 ----
+            "Accept-CH：Safari 声明前后均无 UA-CH 头": (
+                not any(k.startswith("sec-ch") for k in ac_first)
+                and not any(k.startswith("sec-ch") for k in ac_second)),
         })
 
     print("\n== 检查项 ==")

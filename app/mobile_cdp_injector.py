@@ -43,6 +43,7 @@ import itertools
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
 
@@ -156,6 +157,48 @@ def sec_ch_headers(ua_ch: Dict[str, Any]) -> Dict[str, str]:
         "Sec-CH-UA-Mobile": "?1" if ua_ch.get("mobile") else "?0",
         "Sec-CH-UA-Platform": f'"{ua_ch.get("platform") or "Android"}"',
     }
+
+
+# 高熵提示：仅当站点在响应里回 Accept-CH 声明后才发送（真机 Chrome 行为）。
+# 内核既不发送低熵头也不处理 Accept-CH，本层在 Fetch 域里按「源」精确回送。
+_HIGH_ENTROPY_HINTS = frozenset({
+    "sec-ch-ua-model", "sec-ch-ua-platform-version", "sec-ch-ua-arch",
+    "sec-ch-ua-bitness", "sec-ch-ua-full-version", "sec-ch-ua-full-version-list",
+    "sec-ch-ua-wow64",
+})
+
+
+def high_entropy_headers(ua_ch: Dict[str, Any], hints: set) -> Dict[str, str]:
+    """按站点声明的高熵提示构造头值（与 JS UA-CH 同一数据源，保证头/JS 一致）。"""
+    out: Dict[str, str] = {}
+    if "sec-ch-ua-model" in hints:
+        out["Sec-CH-UA-Model"] = f'"{ua_ch.get("model") or ""}"'
+    if "sec-ch-ua-platform-version" in hints:
+        out["Sec-CH-UA-Platform-Version"] = f'"{ua_ch.get("platformVersion") or ""}"'
+    if "sec-ch-ua-arch" in hints:
+        out["Sec-CH-UA-Arch"] = f'"{ua_ch.get("architecture") or ""}"'
+    if "sec-ch-ua-bitness" in hints:
+        out["Sec-CH-UA-Bitness"] = f'"{ua_ch.get("bitness") or ""}"'
+    if "sec-ch-ua-full-version" in hints:
+        out["Sec-CH-UA-Full-Version"] = f'"{ua_ch.get("fullVersion") or ""}"'
+    if "sec-ch-ua-full-version-list" in hints:
+        parts = [f'"{b.get("brand")}";v="{b.get("version")}"'
+                 for b in (ua_ch.get("fullVersionList") or [])]
+        out["Sec-CH-UA-Full-Version-List"] = ", ".join(parts)
+    if "sec-ch-ua-wow64" in hints:
+        out["Sec-CH-UA-WoW64"] = "?1" if ua_ch.get("wow64") else "?0"
+    return out
+
+
+def url_origin(url: str) -> str:
+    """URL 的 scheme://host:port（Accept-CH 的存储粒度是 origin）。"""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ""
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return ""
 
 
 # ------------------------------------------------------------------ JS 补丁
@@ -680,6 +723,8 @@ class MobileEmulationSession:
         self._applied_targets: set[str] = set()
         self._attach_tasks: dict[str, asyncio.Task] = {}
         self._first_page_session: Optional[str] = None
+        # Accept-CH：CDP session → {源: 该源已声明的高熵提示}（Fetch 域回送）
+        self._accept_ch: dict[str, dict[str, set]] = {}
         self._closed = False
 
     # ---------------- 生命周期 ----------------
@@ -810,6 +855,9 @@ class MobileEmulationSession:
                     info = (msg.get("params") or {}).get("targetInfo") or {}
                     if info.get("type") == "iframe" and info.get("targetId"):
                         asyncio.create_task(self._attach_frame(info.get("targetId", "")))
+                elif msg.get("method") == "Fetch.requestPaused":
+                    # Accept-CH：Document 响应解析声明；已声明源的请求回送高熵头
+                    asyncio.create_task(self._on_fetch_paused(msg))
         except Exception:
             pass  # 连接关闭/取消
         finally:
@@ -1006,6 +1054,106 @@ class MobileEmulationSession:
                 await self._send("Runtime.evaluate", {"expression": patch},
                                  session_id=session_id, timeout=3.0)
 
+    # ---------------- Accept-CH 高熵头回送 ----------------
+
+    def _accept_ch_patterns(self, sid: str) -> list[dict]:
+        """Fetch 拦截规则：所有 Document 响应（解析 Accept-CH）+ 已声明源的请求。"""
+        patterns = [{
+            "urlPattern": "*",
+            "requestStage": "Response",
+            "resourceType": "Document",
+        }]
+        for origin in self._accept_ch.get(sid, {}):
+            patterns.append({"urlPattern": origin + "/*", "requestStage": "Request"})
+        return patterns
+
+    async def _enable_accept_ch(self, sid: str) -> None:
+        """启用 Accept-CH 高熵头回送（仅页面级会话）。
+
+        内核不处理 Accept-CH：站点声明高熵提示后，真机 Chrome 会对该源的后续
+        请求附上 Sec-CH-UA-Model 等头，本层用 Fetch 域按源精确补齐。跨源 iframe
+        不启用——高熵头受 Permissions-Policy（默认为 self）约束，真机在第三方
+        上下文同样不回送。
+        """
+        if self.spec.get("ios") or not self.spec.get("uaCh"):
+            return
+        self._accept_ch.setdefault(sid, {})
+        with contextlib.suppress(CDPError):
+            await self._send("Fetch.enable", {"patterns": self._accept_ch_patterns(sid)},
+                             session_id=sid)
+
+    async def _on_fetch_paused(self, msg: Dict[str, Any]) -> None:
+        """Fetch 域事件：Document 响应解析 Accept-CH；命中源注入高熵头。"""
+        sid = msg.get("sessionId") or ""
+        params = msg.get("params") or {}
+        rid = params.get("requestId") or ""
+        if not sid or not rid:
+            return
+        is_response = ("responseStatusCode" in params
+                       or "responseErrorReason" in params)
+        request = params.get("request") or {}
+        if is_response:
+            hints: set = set()
+            for h in params.get("responseHeaders") or []:
+                if (h.get("name") or "").lower() == "accept-ch":
+                    for token in (h.get("value") or "").split(","):
+                        name = token.split(";")[0].strip().lower()
+                        if name in _HIGH_ENTROPY_HINTS:
+                            hints.add(name)
+            origin = url_origin(request.get("url") or "")
+            known = self._accept_ch.setdefault(sid, {})
+            if origin and hints and known.get(origin) != hints:
+                # 新声明或集合变化：更新该源的提示并刷新拦截规则
+                known[origin] = hints
+                with contextlib.suppress(CDPError):
+                    await self._send("Fetch.enable",
+                                     {"patterns": self._accept_ch_patterns(sid)},
+                                     session_id=sid)
+            await self._continue_paused(sid, rid, is_response=True)
+            return
+        # Request 阶段：只有已声明源的请求会走到这里
+        origin = url_origin(request.get("url") or "")
+        hints = (self._accept_ch.get(sid) or {}).get(origin)
+        if not hints:
+            await self._continue_paused(sid, rid)
+            return
+        ua_ch = self.spec.get("uaCh") or {}
+        headers = dict(request.get("headers") or {})
+        # 拦截层看到的请求头未必包含 CDP extra-headers/UA 覆盖注入的项：
+        # 缺失时补齐（已有值保持——浏览器视角的最终值优先）
+        for name, value in sec_ch_headers(ua_ch).items():
+            headers.setdefault(name, value)
+        if self.ua:
+            headers.setdefault("User-Agent", self.ua)
+        headers.update(high_entropy_headers(ua_ch, hints))
+        await self._continue_paused(sid, rid, headers=headers)
+
+    async def _continue_paused(self, sid: str, rid: str, *,
+                               headers: Optional[Dict[str, str]] = None,
+                               is_response: bool = False) -> None:
+        """放行 Fetch 暂停的请求（响应阶段优先 continueResponse，回退旧方法）。"""
+        if is_response:
+            try:
+                await self._send("Fetch.continueResponse", {"requestId": rid},
+                                 session_id=sid)
+                return
+            except CDPError:
+                with contextlib.suppress(CDPError):
+                    await self._send("Fetch.continueRequest", {"requestId": rid},
+                                     session_id=sid)
+                return
+        params: Dict[str, Any] = {"requestId": rid}
+        if headers is not None:
+            params["headers"] = [{"name": k, "value": v}
+                                 for k, v in headers.items()]
+        try:
+            await self._send("Fetch.continueRequest", params, session_id=sid)
+        except CDPError:
+            # 参数被拒（如头格式）时至少保证请求被放行，避免卡死页面
+            with contextlib.suppress(CDPError):
+                await self._send("Fetch.continueRequest", {"requestId": rid},
+                                 session_id=sid)
+
     async def _apply_device_emulation(self, sid: str) -> None:
         # 0. 启用 Page 域：未启用时 addScriptToEvaluateOnNewDocument 虽然返回
         #    identifier，但 init 脚本不会真正挂载到后续文档（导航后的新文档
@@ -1083,6 +1231,10 @@ class MobileEmulationSession:
             with contextlib.suppress(CDPError):
                 await self._send("Emulation.setTimezoneOverride",
                                  {"timezoneId": self.timezone}, session_id=sid)
+
+        # 6. Accept-CH：站点声明高熵提示后，对其后续请求回送 Sec-CH-UA-* 高熵头
+        #    （内核完全不处理 Accept-CH；真机 Chrome 全量支持，缺回送是明显破绽）
+        await self._enable_accept_ch(sid)
 
     async def _apply_patch_now(self, sid: str) -> None:
         """对已存在的当前文档立即执行一次 JS 补丁。
