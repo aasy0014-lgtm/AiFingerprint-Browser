@@ -42,6 +42,7 @@ import contextlib
 import itertools
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
@@ -100,6 +101,16 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
     renderer = str(vc.get("renderer") or "")
     webgl = {"vendor": str(vc.get("vendor") or ""), "renderer": renderer} if renderer else None
 
+    # WebGPU（GPUAdapterInfo）真机 Android Chrome 口径（Dawn/Vulkan）：
+    # vendor "qualcomm"、architecture "adreno-<型号>"。宿主是 Apple GPU
+    # （vendor "apple" / "metal-*"），与 WebGL 已声明的 Qualcomm 直接矛盾，
+    # 跨 API 一致性检查可命中；型号取自 WebGL 渲染器，两 API 口径互相印证。
+    webgpu = None
+    if target_os == "android":
+        m = re.search(r"Adreno\s*(?:\(TM\))?\s*(\d{3,4})", renderer)
+        if m:
+            webgpu = {"vendor": "qualcomm", "architecture": "adreno-" + m.group(1)}
+
     ua_ch = extra.get("uaCh") or None
     if target_os == "android" and ua_ch:
         # Chromium 源码事实：Android 手机端 UA-CH 的 architecture/bitness 恒为空字符串
@@ -142,6 +153,7 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
         "emptyPlugins": empty_plugins,
         "ios": target_os == "ios",
         "webgl": webgl,
+        "webgpu": webgpu,
         "cssWidth": css_w,
         "cssHeight": css_h,
         "viewportHeight": vp_h,
@@ -474,6 +486,19 @@ _PATCH_TEMPLATE = r"""
                 patchGL(window.WebGL2RenderingContext);
             } catch (e) {}
         }
+
+        // ---- WebGPU：适配器信息（GPUAdapterInfo）必须与移动 GPU 口径一致 ----
+        // 宿主是 Apple GPU（vendor "apple" / architecture "metal-*"），而 WebGL
+        // 已声明 Qualcomm Adreno；真机 Android Chrome（Dawn/Vulkan）报告
+        // vendor "qualcomm" / architecture "adreno-<型号>"，跨 API 对照可直接
+        // 命中（GPUAdapterInfo 属性在原型上，实例无 own property；device/
+        // description 宿主本就为空串，与真机相同，无需处理）。
+        if (D.webgpu && typeof GPUAdapterInfo !== 'undefined' && GPUAdapterInfo.prototype) {
+            try {
+                defineGet(GPUAdapterInfo.prototype, 'vendor', D.webgpu.vendor);
+                defineGet(GPUAdapterInfo.prototype, 'architecture', D.webgpu.architecture);
+            } catch (e) {}
+        }
     } catch (e) {}
 })();
 """
@@ -494,6 +519,7 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "emptyPlugins": bool(spec.get("emptyPlugins")),
         "ios": bool(spec.get("ios")),
         "webgl": spec.get("webgl"),
+        "webgpu": spec.get("webgpu"),
         # 跨域 iframe（OOPIF）无页面级 CDP 度量仿真：screen/DPR/outer 镜像主文档
         "cssWidth": int(spec.get("cssWidth") or 0),
         "cssHeight": int(spec.get("cssHeight") or 0),
@@ -635,6 +661,14 @@ _WORKER_PATCH_TEMPLATE = r"""
             }
             defineGet(N, 'userAgentData', uaData);
         }
+
+        // ---- WebGPU：Worker 内 GPUAdapterInfo 与主文档同口径 ----
+        // （Dedicated Worker 可用 navigator.gpu；宿主 Apple 适配器信息在这里
+        //   同样泄漏，真机 Android Worker 报告 Qualcomm Adreno）
+        if (D.webgpu && typeof GPUAdapterInfo !== 'undefined' && GPUAdapterInfo.prototype) {
+            defineGet(GPUAdapterInfo.prototype, 'vendor', D.webgpu.vendor);
+            defineGet(GPUAdapterInfo.prototype, 'architecture', D.webgpu.architecture);
+        }
     } catch (e) {}
 })();
 """
@@ -649,6 +683,7 @@ def build_worker_patch(spec: Dict[str, Any]) -> str:
         "uaCh": spec.get("uaCh"),
         "removeProps": list(spec.get("removeProps") or []),
         "ios": bool(spec.get("ios")),
+        "webgpu": spec.get("webgpu"),
     }
     return _WORKER_PATCH_TEMPLATE.replace("__SPEC__", json.dumps(payload, ensure_ascii=False))
 
@@ -702,7 +737,7 @@ class MobileEmulationSession:
                 "maxTouchPoints": int(max_touch_points or 5),
                 "deviceMemory": None, "colorDepth": None, "uaCh": None,
                 "battery": None, "removeProps": [], "emptyPlugins": False,
-                "ios": target_os == "ios", "webgl": None,
+                "ios": target_os == "ios", "webgl": None, "webgpu": None,
                 "cssWidth": css_w, "cssHeight": css_h,
                 "viewportHeight": css_h, "dpr": scale,
             }

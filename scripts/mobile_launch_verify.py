@@ -36,6 +36,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -304,6 +305,25 @@ ACCEPT_CH_HTML = """<!doctype html><html><head><script>
 fetch('/accept-ch-second').catch(function () {});
 </script></head><body>accept-ch</body></html>"""
 
+# WebGPU 适配器信息：安全上下文（localhost/127.0.0.1）下读取 GPUAdapterInfo；
+# 真机 Android Chrome 为 vendor "qualcomm" / architecture "adreno-<型号>"，
+# 宿主 Apple GPU（vendor "apple"/"metal-*"）会在跨 API 对照下暴露。
+WEBGPU_JS = """(async () => {
+  const out = { hasGpu: !!navigator.gpu };
+  if (!navigator.gpu) { return out; }
+  try {
+    const a = await navigator.gpu.requestAdapter();
+    if (!a) { out.adapter = null; return out; }
+    const i = a.info || {};
+    out.vendor = i.vendor;
+    out.architecture = i.architecture;
+    out.device = i.device;
+    out.description = i.description;
+    out.protoOk = Object.getPrototypeOf(i) === GPUAdapterInfo.prototype;
+  } catch (e) { out.err = String(e); }
+  return out;
+})()"""
+
 
 async def race_test(ws_endpoint: str) -> dict:
     """模拟用户新开标签页：目标被本会话门控 → 首个文档必须在补丁生效后执行。
@@ -471,6 +491,7 @@ async def main() -> int:
     frame_state: dict = {}
     worker_state: dict = {}
     accept_ch_state: dict = {}
+    webgpu_state: dict = {}
 
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
@@ -591,6 +612,11 @@ async def main() -> int:
             accept_ch_state = dict(oopif_state.get("accept_ch") or {})
             print("\n== Accept-CH 高熵头回送（两次请求实收头）==")
             print(json.dumps(accept_ch_state, ensure_ascii=False, indent=1))
+
+            # ---- WebGPU 适配器信息（安全上下文；Android 应为 Qualcomm Adreno）----
+            webgpu_state = await page.evaluate(WEBGPU_JS) or {}
+            print("\n== WebGPU 适配器信息 ==")
+            print(json.dumps(webgpu_state, ensure_ascii=False))
         finally:
             oopif_server.shutdown()
     finally:
@@ -657,6 +683,10 @@ async def main() -> int:
     # ---- Accept-CH：声明后同源请求实际收到的头（真机 Chrome 补高熵）----
     ac_first = (accept_ch_state or {}).get("first") or {}
     ac_second = (accept_ch_state or {}).get("second") or {}
+    # ---- WebGPU：适配器信息（安全上下文实测；真机 Android 为 Qualcomm Adreno）----
+    wg = webgpu_state if isinstance(webgpu_state, dict) else {}
+    _wg_m = re.search(r"Adreno\s*(?:\(TM\))?\s*(\d{3,4})", str(vc.get("renderer") or ""))
+    wg_arch = ("adreno-" + _wg_m.group(1)) if _wg_m else None
     checks.update({
         "跨域 iframe：platform 一致（文档起点）": fr.get("platform") == nav.get("platform"),
         "跨域 iframe：colorDepth == 24（文档起点）": fr.get("cd") == 24,
@@ -741,6 +771,14 @@ async def main() -> int:
                 and ac_second.get("sec-ch-ua-mobile") == "?1"
                 and ac_second.get("sec-ch-ua-platform") == f'"{ua_ch.get("platform") or "Android"}"'
                 and ac_second.get("user-agent") == nav["userAgent"]),
+            # ---- WebGPU：适配器信息（真机 Android Chrome 为 Qualcomm Adreno）----
+            "WebGPU：适配器 vendor == qualcomm（非宿主 apple）": (
+                wg.get("hasGpu") is True and wg.get("vendor") == "qualcomm"),
+            "WebGPU：architecture == adreno-<WebGL 型号>（跨 API 一致）": (
+                bool(wg_arch) and wg.get("architecture") == wg_arch),
+            "WebGPU：GPUAdapterInfo 原型链/空 device/description 保持原生形态": (
+                wg.get("protoOk") is True and wg.get("device") == ""
+                and wg.get("description") == ""),
         })
     else:
         checks.update({
@@ -762,6 +800,9 @@ async def main() -> int:
             "Accept-CH：Safari 声明前后均无 UA-CH 头": (
                 not any(k.startswith("sec-ch") for k in ac_first)
                 and not any(k.startswith("sec-ch") for k in ac_second)),
+            # ---- WebGPU：iOS 保持宿主 Apple 适配器（真机 iPhone 同为 Apple GPU）----
+            "WebGPU：iOS 适配器 vendor == apple（真机一致）": (
+                wg.get("hasGpu") is True and wg.get("vendor") == "apple"),
         })
 
     print("\n== 检查项 ==")
