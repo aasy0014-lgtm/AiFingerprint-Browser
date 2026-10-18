@@ -324,6 +324,22 @@ WEBGPU_JS = """(async () => {
   return out;
 })()"""
 
+# 媒体设备枚举：真机 Android Chrome 枚举前后两个摄像头（videoinput ×2）；
+# 未授权时 label/deviceId/groupId 全为空串（Chromium 语义）。
+MEDIA_JS = """(async () => {
+  const out = {};
+  try {
+    const ds = await navigator.mediaDevices.enumerateDevices();
+    const counts = {};
+    ds.forEach(d => { counts[d.kind] = (counts[d.kind] || 0) + 1; });
+    out.counts = counts;
+    out.total = ds.length;
+    out.allMasked = ds.every(d => d.deviceId === '' && d.label === '' && d.groupId === '');
+    out.protoOk = ds.every(d => d instanceof MediaDeviceInfo);
+  } catch (e) { out.err = String(e); }
+  return out;
+})()"""
+
 
 async def race_test(ws_endpoint: str) -> dict:
     """模拟用户新开标签页：目标被本会话门控 → 首个文档必须在补丁生效后执行。
@@ -492,6 +508,7 @@ async def main() -> int:
     worker_state: dict = {}
     accept_ch_state: dict = {}
     webgpu_state: dict = {}
+    media_state: dict = {}
 
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
@@ -617,6 +634,11 @@ async def main() -> int:
             webgpu_state = await page.evaluate(WEBGPU_JS) or {}
             print("\n== WebGPU 适配器信息 ==")
             print(json.dumps(webgpu_state, ensure_ascii=False))
+
+            # ---- 媒体设备枚举（真机 Android 前后双摄形态）----
+            media_state = await page.evaluate(MEDIA_JS) or {}
+            print("\n== 媒体设备枚举 ==")
+            print(json.dumps(media_state, ensure_ascii=False))
         finally:
             oopif_server.shutdown()
     finally:
@@ -687,6 +709,8 @@ async def main() -> int:
     wg = webgpu_state if isinstance(webgpu_state, dict) else {}
     _wg_m = re.search(r"Adreno\s*(?:\(TM\))?\s*(\d{3,4})", str(vc.get("renderer") or ""))
     wg_arch = ("adreno-" + _wg_m.group(1)) if _wg_m else None
+    # ---- 媒体设备枚举（类型计数）----
+    media_counts = (media_state or {}).get("counts") or {}
     checks.update({
         "跨域 iframe：platform 一致（文档起点）": fr.get("platform") == nav.get("platform"),
         "跨域 iframe：colorDepth == 24（文档起点）": fr.get("cd") == 24,
@@ -779,6 +803,14 @@ async def main() -> int:
             "WebGPU：GPUAdapterInfo 原型链/空 device/description 保持原生形态": (
                 wg.get("protoOk") is True and wg.get("device") == ""
                 and wg.get("description") == ""),
+            # ---- 媒体设备枚举（真机 Android Chrome 前后双摄）----
+            "媒体设备：videoinput == 2（前后摄）、audioinput/audiooutput 各 1": (
+                media_counts.get("videoinput") == 2
+                and media_counts.get("audioinput") == 1
+                and media_counts.get("audiooutput") == 1),
+            "媒体设备：未授权时 label/deviceId/groupId 全空 + instanceof 成立": (
+                (media_state or {}).get("allMasked") is True
+                and (media_state or {}).get("protoOk") is True),
         })
     else:
         checks.update({

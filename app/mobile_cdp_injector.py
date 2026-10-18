@@ -111,6 +111,11 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
         if m:
             webgpu = {"vendor": "qualcomm", "architecture": "adreno-" + m.group(1)}
 
+    # 媒体设备枚举（enumerateDevices）：真机 Android Chrome 至少枚举前后两个
+    # 摄像头（videoinput ×2）；宿主 Mac 是单摄像头（×1），数量偏差可直接被
+    # 设备枚举型检测捕获。audioinput/audiooutput 真机各 1，与宿主相同。
+    media_video_inputs = 2 if target_os == "android" else 0
+
     ua_ch = extra.get("uaCh") or None
     if target_os == "android" and ua_ch:
         # Chromium 源码事实：Android 手机端 UA-CH 的 architecture/bitness 恒为空字符串
@@ -154,6 +159,7 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
         "ios": target_os == "ios",
         "webgl": webgl,
         "webgpu": webgpu,
+        "mediaVideoInputs": media_video_inputs,
         "cssWidth": css_w,
         "cssHeight": css_h,
         "viewportHeight": vp_h,
@@ -419,6 +425,46 @@ _PATCH_TEMPLATE = r"""
             } catch (e) {}
         }
 
+        // ---- 媒体设备枚举：真机 Android Chrome 枚举前后两个摄像头 ----
+        // 宿主 Mac 单摄像头 → videoinput ×1；真机为 ×2（前/后），未授权时
+        // label/deviceId/groupId 全为空串（Chromium 语义，宿主亦然）。只调整
+        // 类别分组与 videoinput 数量；合成条目走 MediaDeviceInfo 原型链
+        // （instanceof 成立、自身无 own property，字段 getter 在中间原型上）。
+        if (D.mediaVideoInputs && typeof MediaDevices !== 'undefined'
+                && typeof MediaDeviceInfo !== 'undefined' && MediaDevices.prototype
+                && MediaDevices.prototype.enumerateDevices) {
+            try {
+                var mdProto = MediaDevices.prototype;
+                var origEnum = mdProto.enumerateDevices;
+                var makeDevice = function (kind) {
+                    var proto = Object.create(MediaDeviceInfo.prototype);
+                    defineGet(proto, 'kind', kind);
+                    defineGet(proto, 'deviceId', '');
+                    defineGet(proto, 'groupId', '');
+                    defineGet(proto, 'label', '');
+                    return Object.create(proto);
+                };
+                defineFn(mdProto, 'enumerateDevices', function () {
+                    return origEnum.apply(this, arguments).then(function (list) {
+                        var ai = [], vi = [], ao = [], other = [];
+                        for (var i = 0; i < (list ? list.length : 0); i++) {
+                            var d = list[i];
+                            if (d.kind === 'audioinput') { ai.push(d); }
+                            else if (d.kind === 'videoinput') { vi.push(d); }
+                            else if (d.kind === 'audiooutput') { ao.push(d); }
+                            else { other.push(d); }
+                        }
+                        var out = ai.length ? [ai[0]] : [makeDevice('audioinput')];
+                        var vs = vi.length ? [vi[0]] : [];
+                        while (vs.length < D.mediaVideoInputs) { vs.push(makeDevice('videoinput')); }
+                        out = out.concat(vs);
+                        out = out.concat(ao.length ? [ao[0]] : [makeDevice('audiooutput')]);
+                        return out.concat(other);
+                    });
+                });
+            } catch (e) {}
+        }
+
         // ---- 色深：真机移动端 24 位（宿主 macOS 报告 30 位）----
         if (D.colorDepth && typeof Screen !== 'undefined' && Screen.prototype) {
             defineGet(Screen.prototype, 'colorDepth', D.colorDepth);
@@ -520,6 +566,7 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "ios": bool(spec.get("ios")),
         "webgl": spec.get("webgl"),
         "webgpu": spec.get("webgpu"),
+        "mediaVideoInputs": int(spec.get("mediaVideoInputs") or 0),
         # 跨域 iframe（OOPIF）无页面级 CDP 度量仿真：screen/DPR/outer 镜像主文档
         "cssWidth": int(spec.get("cssWidth") or 0),
         "cssHeight": int(spec.get("cssHeight") or 0),
@@ -738,6 +785,7 @@ class MobileEmulationSession:
                 "deviceMemory": None, "colorDepth": None, "uaCh": None,
                 "battery": None, "removeProps": [], "emptyPlugins": False,
                 "ios": target_os == "ios", "webgl": None, "webgpu": None,
+                "mediaVideoInputs": 0,
                 "cssWidth": css_w, "cssHeight": css_h,
                 "viewportHeight": css_h, "dpr": scale,
             }
