@@ -66,6 +66,11 @@ _VAR_PATTERN = re.compile(r"\{\{\s*([A-Za-z_][\w-]*)\s*\}\}")
 _SUBST_FIELDS = ("url", "selector", "text", "key", "expression", "value",
                  "label", "attr", "frame", "path", "name")
 
+# 单次 run 的步骤执行次数上限：label/goto/if 构成死循环（如 label a; goto a）时
+# while 循环永不退出，且循环体是纯同步的（不让出事件循环），会持续占满 CPU，
+# 连取消都难以生效。超过上限即判定为疑似死循环并终止本次运行。
+_MAX_STEP_EXECUTIONS = 5000
+
 
 def _subst(value: Any, variables: dict) -> Any:
     """把 {{var}} 替换为变量值（列表取首项）；非字符串原样返回。"""
@@ -222,8 +227,20 @@ class TaskEngine:
         results: list[dict] = []
         failed = False
         i = 0
+        executed = 0
         jump: Optional[int] = None
         while i < len(steps):
+            executed += 1
+            if executed > _MAX_STEP_EXECUTIONS:
+                # 疑似 goto/if 死循环：终止运行并给出可定位的错误
+                step = steps[i] if 0 <= i < len(steps) else {}
+                results.append({
+                    "index": i, "action": step.get("action", "?"), "status": "failed",
+                    "detail": f"步骤执行次数超过上限 {_MAX_STEP_EXECUTIONS}，"
+                              "疑似 goto/if 死循环，已终止运行",
+                })
+                failed = True
+                break
             step = dict(steps[i])
             # 变量替换（跳转类字段在分支动作内部处理）
             for field in _SUBST_FIELDS:
