@@ -1,7 +1,7 @@
 """启动管理器：维护「环境 → 运行中的浏览器实例」的生命周期。
 
-三内核：camoufox/fp-chromium/chromium（仅桌面端）
-移动端仿真：Android/iOS（通过 camoufox 的 context fingerprint 注入实现）
+三内核：camoufox/fp-chromium/chromium
+移动端仿真：Android/iOS 仅 fp-chromium（CDP 设备仿真，见 mobile_cdp_injector）
 """
 import asyncio
 import contextlib
@@ -17,6 +17,7 @@ from . import db, security
 from .models import LaunchConfig, ProxyConfig
 from .proxy_dns import is_ip_address, resolve_real_ip
 from .proxy_forwarder import AuthProxyForwarder, needs_forwarder
+from .proxy_test import resolve_exit_timezone
 from .risk_presets import apply_preset
 from .mobile_cdp_injector import MobileEmulationSession
 
@@ -127,6 +128,18 @@ class LaunchManager:
                     log.info("代理域名 %s 经 DoH 解析为真实 IP %s", proxy.host, real_ip)
                     proxy = proxy.model_copy(update={"host": real_ip})
 
+            # geoip：出口时区对齐（fp-chromium 无原生 geoip）。
+            # 显式 timezone 优先；探测结果同时用于内核 --timezone 参数与
+            # 移动端 CDP 的 Emulation.setTimezoneOverride。
+            if (launch.geoip and not launch.timezone and proxy is not None
+                    and profile["kernel"] == fp_chromium_kernel.KERNEL_NAME):
+                tz = await resolve_exit_timezone(proxy)
+                if tz:
+                    launch = launch.model_copy(update={"timezone": tz})
+                    log.info("geoip：出口时区对齐为 %s", tz)
+                else:
+                    log.info("geoip：出口时区探测失败，保持系统时区")
+
             # Chromium 系内核不支持带账密代理命令行：本地起认证转发器桥接
             kernel_proxy = proxy
             if (profile["kernel"] in (fp_chromium_kernel.KERNEL_NAME,
@@ -205,6 +218,7 @@ class LaunchManager:
                             fingerprint=fp_section,
                             target_os=target_os,
                             locale=launch.locale or "",
+                            timezone=launch.timezone or "",
                             start_url=start_url_final,
                         )
                     elif viewport or ua:
@@ -213,6 +227,7 @@ class LaunchManager:
                             viewport=viewport, dpr=dpr, ua=ua, platform=platform,
                             max_touch_points=max_touch,
                             locale=launch.locale or "",
+                            timezone=launch.timezone or "",
                             start_url=start_url_final,
                         )
 

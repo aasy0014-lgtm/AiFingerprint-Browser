@@ -98,7 +98,29 @@ def _pick_os_version(device: Dict[str, Any], mode: str) -> str:
     return _weighted_choice(versions)
 
 
+def _kernel_browser() -> Optional[Dict[str, Any]]:
+    """内核实测的 Chromium 版本（首选）。
+
+    UA / UA-CH 声称的 Chrome 版本必须与内核引擎一致：检测站会做
+    feature 探测（引擎实际版本）与 UA 版本比对，声称 156 而引擎是 148
+    会直接命中「浏览器版本不同」。内核版本随安装包变化，这里动态读取，
+    未安装内核时回退到库内版本池（仅用于无内核环境生成指纹）。
+    """
+    try:
+        from .kernels import fp_chromium_kernel
+        full = fp_chromium_kernel.chrome_version()
+    except Exception:
+        full = None
+    if not full:
+        return None
+    return {"major": full.split(".")[0], "full": full, "weight": 1.0,
+            "source": "kernel"}
+
+
 def _pick_android_browser(mode: str) -> Dict[str, Any]:
+    kernel = _kernel_browser()
+    if kernel:
+        return kernel
     if not _ANDROID_BROWSERS:
         return {"major": "156", "full": "156.0.8078.35", "weight": 1}
     if mode == "preset":

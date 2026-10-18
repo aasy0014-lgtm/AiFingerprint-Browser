@@ -42,6 +42,8 @@ from app.mobile_cdp_injector import sec_ch_headers
 
 STATE_JS = """async () => {
     const nav = navigator;
+    const nativeStr = (fn) => { try { return /\\[native code\\]/.test(Function.prototype.toString.call(fn)); } catch (e) { return false; } };
+    const descOf = (proto, name) => { try { return Object.getOwnPropertyDescriptor(proto, name); } catch (e) { return null; } };
     const out = {
         url: location.href,
         userAgent: nav.userAgent,
@@ -54,6 +56,7 @@ STATE_JS = """async () => {
         hardwareConcurrency: nav.hardwareConcurrency,
         language: nav.language,
         languages: nav.languages,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         uaData: 'ABSENT',
         uaDataHigh: null,
         battery: null,
@@ -72,6 +75,17 @@ STATE_JS = """async () => {
         ownProps: Object.getOwnPropertyNames(nav).filter((n) =>
             ['platform','userAgent','maxTouchPoints','mobile','deviceMemory',
              'userAgentData','vendor','getBattery','standalone','connection'].includes(n)),
+        integrity: {
+            webglGetParameterNative: nativeStr(WebGLRenderingContext.prototype.getParameter),
+            webgl2GetParameterNative: nativeStr(WebGL2RenderingContext.prototype.getParameter),
+            fnToStringNative: nativeStr(Function.prototype.toString),
+            canvasToDataUrlNative: nativeStr(HTMLCanvasElement.prototype.toDataURL),
+            canvasGetImageDataNative: nativeStr(CanvasRenderingContext2D.prototype.getImageData),
+            colorDepthGetterNative: (() => { const d = descOf(Screen.prototype, 'colorDepth'); return d && d.get ? nativeStr(d.get) : null; })(),
+            deviceMemoryGetterNative: (() => { const d = descOf(Navigator.prototype, 'deviceMemory'); return d && d.get ? nativeStr(d.get) : null; })(),
+            colorDepthEnumerable: (() => { const d = descOf(Screen.prototype, 'colorDepth'); return d ? d.enumerable : null; })(),
+            uaDataOwnProps: nav.userAgentData ? Object.getOwnPropertyNames(nav.userAgentData) : null,
+        },
     };
     if (nav.userAgentData) {
         out.uaData = {
@@ -106,6 +120,117 @@ STATE_JS = """async () => {
     out.webgl = gl;
     return out;
 }"""
+
+# 竞态测试探针页：内联脚本在「文档起点」抓取指纹值（早于任何网络加载），
+# 若首个文档在补丁生效前执行，这里抓到的就是原生的宿主值。
+RACE_PROBE_HTML = """<!doctype html><html><head><script>
+window.__probe = {
+  uaMobile: /Android|iPhone/.test(navigator.userAgent),
+  touch: navigator.maxTouchPoints,
+  colorDepth: screen.colorDepth,
+  memory: navigator.deviceMemory,
+  hasUaData: !!navigator.userAgentData,
+  webgl: (function () { try { var g = document.createElement('canvas').getContext('webgl');
+    var e = g.getExtension('WEBGL_debug_renderer_info');
+    return e ? g.getParameter(e.UNMASKED_RENDERER_WEBGL) : null; } catch (err) { return 'err'; } })(),
+  tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  id: navigator.userAgent.indexOf('PJZ110') >= 0 ? 1 : 0
+};
+</script></head><body>probe</body></html>"""
+
+
+async def race_test(ws_endpoint: str) -> dict:
+    """模拟用户新开标签页：目标被本会话门控 → 首个文档必须在补丁生效后执行。
+
+    使用原始 CDP 且不引入 Playwright 客户端（Playwright 自身也使用
+    waitForDebuggerOnStart 门控并会抢先 resume，会掩盖真实竞态）。
+    """
+    import itertools
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import websockets
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = RACE_PROBE_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):  # noqa: A003
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    http_port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    probe: dict = {}
+    try:
+        async with websockets.connect(ws_endpoint, max_size=64 * 1024 * 1024,
+                                      ping_interval=None) as ws:
+            ids = itertools.count(1)
+            pending: dict = {}
+
+            async def reader():
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    mid = msg.get("id")
+                    if mid is None:
+                        continue
+                    fut = pending.pop(mid, None)
+                    if fut and not fut.done():
+                        fut.set_result(msg)
+
+            rt = asyncio.create_task(reader())
+
+            async def send(method: str, params: dict | None = None,
+                           sid: str | None = None, timeout: float = 6.0) -> dict:
+                mid = next(ids)
+                msg: dict = {"id": mid, "method": method}
+                if params:
+                    msg["params"] = params
+                if sid:
+                    msg["sessionId"] = sid
+                fut = asyncio.get_running_loop().create_future()
+                pending[mid] = fut
+                await ws.send(json.dumps(msg))
+                try:
+                    return await asyncio.wait_for(fut, timeout)
+                except asyncio.TimeoutError:
+                    return {"__timeout__": True}
+
+            try:
+                # 用户开新标签页（此时页面 target 被会话以 waitForDebuggerOnStart 暂停）
+                res = await send("Target.createTarget", {"url": "about:blank"})
+                target_id = (res.get("result") or {}).get("targetId")
+                if not target_id:
+                    return {}
+                at = await send("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+                sid = (at.get("result") or {}).get("sessionId")
+                if not sid:
+                    return {}
+                await send("Page.enable", {}, sid=sid)
+                # 门控下该命令的响应会在会话 resume 后才返回（超时可忽略）
+                await send("Page.navigate", {"url": f"http://127.0.0.1:{http_port}/"},
+                           sid=sid, timeout=3.0)
+                for _ in range(40):
+                    await asyncio.sleep(0.2)
+                    r = await send("Runtime.evaluate",
+                                   {"expression": "window.__probe || null",
+                                    "returnByValue": True}, sid=sid, timeout=3.0)
+                    val = (((r.get("result") or {}).get("result")) or {}).get("value")
+                    if isinstance(val, dict):
+                        probe = val
+                        break
+                await send("Target.closeTarget", {"targetId": target_id})
+            finally:
+                rt.cancel()
+    finally:
+        server.shutdown()
+    return probe
 
 
 async def main() -> int:
@@ -157,7 +282,8 @@ async def main() -> int:
         "fingerprint": fp,
         "launch": {
             "headless": True, "geoip": False, "humanize": False,
-            "locale": "zh-CN", "start_url": "https://example.com",
+            "locale": "zh-CN", "timezone": "America/Los_Angeles",
+            "start_url": "https://example.com",
         },
         "proxy": None,
     }
@@ -170,6 +296,11 @@ async def main() -> int:
         print(f"  {key}: {res.get(key)}")
 
     await asyncio.sleep(6)  # 等仿真会话建立 + start_url 导航完成
+
+    # ---- 新标签页竞态测试（原始 CDP；Playwright 尚未连接，仅本会话门控）----
+    print("\n== 竞态测试：新标签页首个文档（原始 CDP，文档起点抓取）==")
+    probe = await race_test(res["ws_endpoint"])
+    print(json.dumps(probe, ensure_ascii=False))
 
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
@@ -226,6 +357,24 @@ async def main() -> int:
             else gl.get("renderer") == "Apple GPU"
         ),
         "languages 以 zh-CN 开头": bool(state["languages"]) and state["languages"][0] == "zh-CN",
+        "时区覆盖生效（launch.timezone）": state.get("timezone") == "America/Los_Angeles",
+        # ---- 竞态：新标签页首个文档（含内联脚本）必须已是补丁值 ----
+        "竞态：首文档 UA 为移动端": probe.get("uaMobile") is True,
+        "竞态：首文档色深 24": probe.get("colorDepth") == 24,
+        "竞态：首文档触控已启用": int(probe.get("touch") or 0) >= 5,
+        "竞态：首文档时区已对齐": probe.get("tz") == "America/Los_Angeles",
+        "竞态：首文档 GPU 已替换": (probe.get("webgl") or "") == vc.get("renderer"),
+        # ---- 补丁函数原生性（BrowserScan「Canvas Tampering」的触发点）----
+        "补丁函数 toString 呈原生": all([
+            (state.get("integrity") or {}).get("webglGetParameterNative") is True,
+            (state.get("integrity") or {}).get("webgl2GetParameterNative") is True,
+            (state.get("integrity") or {}).get("fnToStringNative") is True,
+            (state.get("integrity") or {}).get("canvasToDataUrlNative") is True,
+            (state.get("integrity") or {}).get("canvasGetImageDataNative") is True,
+        ]),
+        "colorDepth getter 原生且 enumerable": (
+            (state.get("integrity") or {}).get("colorDepthGetterNative") is True
+            and (state.get("integrity") or {}).get("colorDepthEnumerable") is True),
     }
 
     if is_android:
@@ -257,6 +406,12 @@ async def main() -> int:
             "plugins 非空（Chrome Android 有内置插件）": state["pluginsLen"] > 0,
             "connection 存在（Chrome Android 特性）": state["hasConnection"] is True,
             "standalone 不存在（iOS 专有属性）": state["hasStandalone"] is False,
+            "竞态：首文档 UA-CH/内存已注入": bool(probe.get("hasUaData"))
+                and probe.get("memory") == mem_class,
+            "userAgentData 无 own property": (
+                (state.get("integrity") or {}).get("uaDataOwnProps")) == [],
+            "deviceMemory getter 原生": (
+                (state.get("integrity") or {}).get("deviceMemoryGetterNative")) is True,
         })
     else:
         checks.update({
@@ -269,6 +424,7 @@ async def main() -> int:
             "plugins/mimeTypes 为空（Safari 行为）": state["pluginsLen"] == 0 and state["mimeTypesLen"] == 0,
             "无 Sec-CH-UA 请求头（Safari 不发）": not any(k.startswith("sec-ch") for k in seen_headers),
             "请求头 User-Agent == 指纹 UA": seen_headers.get("user-agent") == nav["userAgent"],
+            "竞态：首文档无 UA-CH（Safari 行为）": probe.get("hasUaData") is False,
         })
 
     print("\n== 检查项 ==")

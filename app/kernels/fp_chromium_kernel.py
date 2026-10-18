@@ -19,6 +19,7 @@
   --lang / --accept-lang / --timezone 语言与时区
 """
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -92,6 +93,34 @@ def is_available() -> tuple[bool, str]:
         "未安装。从 github.com/adryfish/fingerprint-chromium/releases 下载解压后，"
         "设置环境变量 FPWB_FPCHROMIUM 指向 chrome 可执行文件，或放入 tools/fp-chromium/ 目录",
     )
+
+
+_CHROME_VERSION_CACHE: str = ""
+
+
+def chrome_version() -> Optional[str]:
+    """探测内核实测的 Chromium 完整版本号（如 148.0.7778.215，进程内缓存）。
+
+    移动端指纹的 UA / UA-CH 声称版本必须与引擎一致：真实浏览器不可能出现
+    「UA 是 156 而引擎特性停留在 148」的组合，指纹检测会直接命中
+    （BrowserScan 的「浏览器版本不同」即来源于此）。
+    """
+    global _CHROME_VERSION_CACHE
+    if not _CHROME_VERSION_CACHE:
+        version = ""
+        try:
+            exe = find_executable()
+            if exe:
+                out = subprocess.run(  # nosec B603 参数来自本地受控配置
+                    [exe, "--version"], capture_output=True, text=True, timeout=10,
+                ).stdout
+                m = re.search(r"Chromium\s+(\d+\.\d+\.\d+\.\d+)", out)
+                if m:
+                    version = m.group(1)
+        except Exception:
+            version = ""
+        _CHROME_VERSION_CACHE = version or "-"
+    return _CHROME_VERSION_CACHE if _CHROME_VERSION_CACHE != "-" else None
 
 
 def _free_port() -> int:

@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.fingerprint_engine import create_fingerprint, summarize
 from app.mobile_cdp_injector import derive_spec
 from app.mobile_fingerprints import (
+    _kernel_browser,
     create_mobile_fingerprint,
     library_info,
     list_brands,
@@ -221,8 +222,10 @@ def test_preset_determinism() -> None:
         os_versions.add(extra["osVersion"])
     print(f"  Chrome 构建: {versions}")
     print(f"  Android 版本: {os_versions}")
-    check("preset 的 Chrome 构建固定（当前主流 156.0.8078.35）",
-          versions == {"156.0.8078.35"}, str(versions))
+    kernel_ver = (_kernel_browser() or {}).get("full")
+    expected = {kernel_ver} if kernel_ver else {"156.0.8078.35"}
+    check(f"preset 的 Chrome 构建固定（{'跟随内核真实版本 ' + kernel_ver if kernel_ver else '无内核回退库内主流 156.0.8078.35'}）",
+          versions == expected, str(versions))
 
     # 每个机型的 preset 系统版本应为其档案中权重最高的版本
     lib = json.loads((Path(__file__).parent.parent / "app" / "data" / "mobile_devices.json")

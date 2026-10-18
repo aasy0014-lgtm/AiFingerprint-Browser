@@ -1,7 +1,7 @@
 {
   "version": "2026.10",
   "updated": "2026-10-18",
-  "notes": "移动端真实机型指纹库。屏幕/DPR/CSS 视口取自 Chrome DevTools 设备库实测值（Playwright deviceDescriptors）与厂商公开规格；GPU 字符串为对应 SoC 在 Chrome(ANGLE) / Safari 下的真实 WebGL 上报格式；系统版本分布为 2026-10 各机型的在网份额近似值。新增机型时按同结构追加即可。",
+  "notes": "移动端真实机型指纹库。屏幕/DPR/CSS 视口取自 Chrome DevTools 设备库实测值（Playwright deviceDescriptors）与厂商公开规格；GPU 字符串为对应 SoC 在 Chrome(ANGLE) / Safari 下的真实 WebGL 上报格式；系统版本分布为 2026-10 各机型的在网份额近似值。新增机型时按同结构追加即可。android_browsers 仅是没有安装 fp-chromium 内核时的回退版本池；已安装内核时 Android Chrome 版本自动跟随内核真实引擎版本（UA 与引擎 feature 必须一致）。",
   "android_browsers": [
     {"major": "156", "full": "156.0.8078.35", "weight": 40},
     {"major": "156", "full": "156.0.8078.36", "weight": 10},

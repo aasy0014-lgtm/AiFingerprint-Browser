@@ -97,3 +97,44 @@ async def test_proxy(proxy: Optional[ProxyConfig], timeout: float = 15) -> dict:
         "error": f"全部探测端点失败（{'; '.join(errors)}）",
         "latency_ms": int((time.perf_counter() - t0) * 1000),
     }
+
+
+# 出口时区缓存：geoip 对齐在每次启动环境时都可能调用，避免频繁探测（TTL 30 分钟）
+_TZ_CACHE: dict[tuple, tuple[float, Optional[str]]] = {}
+_TZ_CACHE_TTL = 30 * 60
+
+
+async def resolve_exit_timezone(proxy: Optional[ProxyConfig],
+                                timeout: float = 8) -> Optional[str]:
+    """经代理探测出口 IP 的时区（geoip 时区对齐用），结果带 TTL 缓存。
+
+    与 test_proxy 走同一组端点，只取时区字段；探测失败返回 None
+    （调用方保持系统时区，不阻断环境启动）。
+    """
+    if proxy is None:
+        return None
+    if not is_ip_address(proxy.host):
+        real_ip = await resolve_real_ip(proxy.host)
+        if real_ip and real_ip != proxy.host:
+            proxy = proxy.model_copy(update={"host": real_ip})
+    key = (proxy.scheme, proxy.host, proxy.port, proxy.username or "")
+    now = time.time()
+    cached = _TZ_CACHE.get(key)
+    if cached and now - cached[0] < _TZ_CACHE_TTL:
+        return cached[1]
+    tz: Optional[str] = None
+    for url, extract in _PROVIDERS:
+        try:
+            async with httpx.AsyncClient(
+                proxy=proxy.to_url(), timeout=timeout, trust_env=True,
+            ) as client:
+                resp = await client.get(url)
+            data = extract(resp.json())
+            if data and data.get("timezone"):
+                tz = data["timezone"]
+                break
+        except Exception:
+            continue
+    _TZ_CACHE[key] = (now, tz)
+    return tz
+

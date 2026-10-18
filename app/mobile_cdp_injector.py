@@ -9,8 +9,11 @@
   是移动端仿真最常见的穿帮点）
 - Touch Emulation（多点触控，maxTouchPoints）
 - User-Agent / navigator.platform 覆盖
+- 时区（Emulation.setTimezoneOverride，与内核 --timezone 参数对齐 geoip 出口时区）
 - WebGL 非遮蔽渲染器/厂商（内核原生 GPU 伪装不支持 Android/iOS 平台，
   不覆盖会直接暴露宿主机的 GPU 字符串）
+- 补丁函数原生伪装：Function.prototype.toString 对补丁函数返回
+  "[native code]" 外观（否则检测站按「函数被篡改」直接扣分）
 - Android：navigator.userAgentData（UA-CH，含机型/系统版本等高熵值）、
   navigator.deviceMemory、Battery API、Sec-CH-UA* 请求头
 - iOS：抹掉 Safari 不存在的属性（navigator.connection、pdfViewerEnabled、
@@ -22,7 +25,10 @@
 连接（不引入 Playwright/Node 进程），并把仿真应用到：
 
 1. 连接时已存在的页面 target；
-2. 监听 Target 自动挂载事件，后续新开的标签页同样应用仿真。
+2. 监听 Target 自动挂载事件，后续新开的标签页同样应用仿真——新目标以
+   waitForDebuggerOnStart 暂停，等补丁就绪后再 runIfWaitingForDebugger
+   放行，杜绝「首个文档在补丁生效前执行页面脚本」的竞态（UA 是移动端、
+   屏幕/GPU/触控全泄露宿主值的典型穿帮）。
 
 环境停止时调用 close() 显式断开。
 
@@ -144,14 +150,50 @@ def sec_ch_headers(ua_ch: Dict[str, Any]) -> Dict[str, str]:
 
 
 # ------------------------------------------------------------------ JS 补丁
+# 检测站点（如 BrowserScan）会做函数完整性检查：被 JS 包装过的函数
+# Function.prototype.toString() 不再是 "[native code]" → 直接标记
+# "Canvas related functions have been artificially modified"。
+# __maskNative 把补丁函数登记进注册表，并接管 Function.prototype.toString
+# 使其对补丁函数返回原生样式的字符串（含函数名）。
 _PATCH_TEMPLATE = r"""
 (function () {
     var D;
     try { D = __SPEC__; } catch (e) { return; }
+
+    // ---- 原生函数伪装：toString() 一律返回 [native code] 外观 ----
+    var __maskNative = (function () {
+        try {
+            var origToString = Function.prototype.toString;
+            if (typeof WeakMap === 'undefined') { return function (fn) { return fn; }; }
+            var registry = new WeakMap();
+            var faked = function toString() {
+                var v = registry.get(this);
+                return v !== undefined ? v : origToString.call(this);
+            };
+            var mask = function (fn, name) {
+                try {
+                    if (typeof fn === 'function') {
+                        registry.set(fn, 'function ' + name + '() { [native code] }');
+                        try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e2) {}
+                    }
+                } catch (e) {}
+                return fn;
+            };
+            mask(faked, 'toString');
+            Object.defineProperty(Function.prototype, 'toString', {
+                value: faked, writable: true, configurable: true,
+            });
+            return mask;
+        } catch (e) {
+            return function (fn) { return fn; };
+        }
+    })();
+
     var defineGet = function (proto, name, value) {
         try {
             Object.defineProperty(proto, name, {
-                get: function () { return value; },
+                get: __maskNative(function () { return value; }, 'get ' + name),
+                enumerable: true,
                 configurable: true,
             });
             return true;
@@ -160,7 +202,8 @@ _PATCH_TEMPLATE = r"""
     var defineFn = function (proto, name, fn) {
         try {
             Object.defineProperty(proto, name, {
-                value: fn, writable: true, configurable: true,
+                value: __maskNative(fn, name),
+                writable: true, enumerable: true, configurable: true,
             });
             return true;
         } catch (e) { return false; }
@@ -199,17 +242,17 @@ _PATCH_TEMPLATE = r"""
             try {
                 var emptyPlugins = Object.create(PluginArray.prototype);
                 Object.defineProperty(emptyPlugins, 'length', { value: 0 });
-                Object.defineProperty(emptyPlugins, 'item', { value: function () { return null; } });
-                Object.defineProperty(emptyPlugins, 'namedItem', { value: function () { return null; } });
-                Object.defineProperty(emptyPlugins, 'refresh', { value: function () {} });
+                defineFn(emptyPlugins, 'item', function () { return null; });
+                defineFn(emptyPlugins, 'namedItem', function () { return null; });
+                defineFn(emptyPlugins, 'refresh', function () {});
                 defineGet(N, 'plugins', emptyPlugins);
             } catch (e) {}
             try {
                 if (typeof MimeTypeArray !== 'undefined') {
                     var emptyMimes = Object.create(MimeTypeArray.prototype);
                     Object.defineProperty(emptyMimes, 'length', { value: 0 });
-                    Object.defineProperty(emptyMimes, 'item', { value: function () { return null; } });
-                    Object.defineProperty(emptyMimes, 'namedItem', { value: function () { return null; } });
+                    defineFn(emptyMimes, 'item', function () { return null; });
+                    defineFn(emptyMimes, 'namedItem', function () { return null; });
                     defineGet(N, 'mimeTypes', emptyMimes);
                 }
             } catch (e) {}
@@ -229,23 +272,35 @@ _PATCH_TEMPLATE = r"""
                     wow64: ch.wow64
                 };
                 var base = { brands: ch.brands, mobile: ch.mobile, platform: ch.platform };
-                var proto = (typeof NavigatorUAData !== 'undefined') ? NavigatorUAData.prototype : null;
-                var uaData = proto ? Object.create(proto) : {};
-                Object.defineProperty(uaData, 'brands', { get: function () { return base.brands; } });
-                Object.defineProperty(uaData, 'mobile', { get: function () { return base.mobile; } });
-                Object.defineProperty(uaData, 'platform', { get: function () { return base.platform; } });
-                Object.defineProperty(uaData, 'getHighEntropyValues', {
-                    value: function (hints) {
-                        var out = { brands: base.brands, mobile: base.mobile, platform: base.platform };
-                        (hints || []).forEach(function (h) {
-                            if (Object.prototype.hasOwnProperty.call(he, h)) { out[h] = he[h]; }
-                        });
-                        return Promise.resolve(out);
-                    }
-                });
-                Object.defineProperty(uaData, 'toJSON', {
-                    value: function () { return { brands: base.brands, mobile: base.mobile, platform: base.platform }; }
-                });
+                var baseOut = function () {
+                    return { brands: base.brands, mobile: base.mobile, platform: base.platform };
+                };
+                var hev = function (hints) {
+                    var out = baseOut();
+                    (hints || []).forEach(function (h) {
+                        if (Object.prototype.hasOwnProperty.call(he, h)) { out[h] = he[h]; }
+                    });
+                    return Promise.resolve(out);
+                };
+                var uaProto = (typeof NavigatorUAData !== 'undefined') ? NavigatorUAData.prototype : null;
+                var uaData;
+                if (uaProto) {
+                    // 属性挂到原生原型上：实例自身无 own property（与真机一致）
+                    defineGet(uaProto, 'brands', base.brands);
+                    defineGet(uaProto, 'mobile', base.mobile);
+                    defineGet(uaProto, 'platform', base.platform);
+                    defineFn(uaProto, 'getHighEntropyValues', hev);
+                    defineFn(uaProto, 'toJSON', baseOut);
+                    uaData = Object.create(uaProto);
+                } else {
+                    // 兜底：内核不暴露 NavigatorUAData 接口时退回实例属性
+                    uaData = {};
+                    Object.defineProperty(uaData, 'brands', { get: __maskNative(function () { return base.brands; }, 'get brands') });
+                    Object.defineProperty(uaData, 'mobile', { get: __maskNative(function () { return base.mobile; }, 'get mobile') });
+                    Object.defineProperty(uaData, 'platform', { get: __maskNative(function () { return base.platform; }, 'get platform') });
+                    Object.defineProperty(uaData, 'getHighEntropyValues', { value: __maskNative(hev, 'getHighEntropyValues') });
+                    Object.defineProperty(uaData, 'toJSON', { value: __maskNative(baseOut, 'toJSON') });
+                }
                 defineGet(N, 'userAgentData', uaData);
             } catch (e) {}
         }
@@ -254,24 +309,21 @@ _PATCH_TEMPLATE = r"""
         if (D.battery) {
             try {
                 var B = D.battery;
-                var bProto = (typeof BatteryManager !== 'undefined') ? BatteryManager.prototype : EventTarget.prototype;
-                var bm = Object.create(bProto);
-                var bdef = function (name, value) {
-                    try { Object.defineProperty(bm, name, { get: function () { return value; }, configurable: true }); } catch (e) {}
-                };
-                bdef('charging', !!B.charging);
-                bdef('chargingTime', B.chargingTime);
-                bdef('dischargingTime', B.dischargingTime);
-                bdef('level', B.level);
-                var noop = function () {};
-                Object.defineProperty(bm, 'addEventListener', { value: noop, writable: true, configurable: true });
-                Object.defineProperty(bm, 'removeEventListener', { value: noop, writable: true, configurable: true });
-                Object.defineProperty(bm, 'dispatchEvent', { value: function () { return true; }, writable: true, configurable: true });
-                Object.defineProperty(bm, 'onchargingchange', { value: null, writable: true });
-                Object.defineProperty(bm, 'onchargingtimechange', { value: null, writable: true });
-                Object.defineProperty(bm, 'ondischargingtimechange', { value: null, writable: true });
-                Object.defineProperty(bm, 'onlevelchange', { value: null, writable: true });
-                defineFn(N, 'getBattery', function () { return Promise.resolve(bm); });
+                if (typeof BatteryManager !== 'undefined') {
+                    // 属性/方法整体挂原生原型：实例自身无 own property（与真机一致）
+                    var bProto = BatteryManager.prototype;
+                    defineGet(bProto, 'charging', !!B.charging);
+                    defineGet(bProto, 'chargingTime', B.chargingTime);
+                    defineGet(bProto, 'dischargingTime', B.dischargingTime);
+                    defineGet(bProto, 'level', B.level);
+                    // 真实 EventTarget 方法要求内部槽位，直接调用会 Illegal invocation；
+                    // 覆盖为无副作用实现（电量取值路径不依赖事件）
+                    defineFn(bProto, 'addEventListener', function () {});
+                    defineFn(bProto, 'removeEventListener', function () {});
+                    defineFn(bProto, 'dispatchEvent', function () { return true; });
+                    var bm = Object.create(bProto);
+                    defineFn(N, 'getBattery', function () { return Promise.resolve(bm); });
+                }
             } catch (e) {}
         }
 
@@ -287,13 +339,13 @@ _PATCH_TEMPLATE = r"""
                 var patchGL = function (Ctor) {
                     if (!Ctor || !Ctor.prototype || !Ctor.prototype.getParameter) { return; }
                     var orig = Ctor.prototype.getParameter;
-                    var wrapped = function (p) {
+                    var wrapped = __maskNative(function (p) {
                         if (p === 37445) { return D.webgl.vendor; }
                         if (p === 37446) { return D.webgl.renderer; }
                         return orig.apply(this, arguments);
-                    };
+                    }, 'getParameter');
                     Object.defineProperty(Ctor.prototype, 'getParameter', {
-                        value: wrapped, writable: true, configurable: true,
+                        value: wrapped, writable: true, enumerable: true, configurable: true,
                     });
                 };
                 patchGL(window.WebGLRenderingContext);
@@ -342,6 +394,7 @@ class MobileEmulationSession:
         fingerprint: Optional[dict] = None,
         target_os: str = "android",
         locale: str = "",
+        timezone: str = "",
         start_url: str = "",
         # 兼容旧调用方式（直接传标量；优先级低于 fingerprint）
         viewport: Optional[dict] = None,
@@ -353,6 +406,7 @@ class MobileEmulationSession:
         self.ws_endpoint = ws_endpoint
         self.target_os = target_os
         self.locale = locale
+        self.timezone = (timezone or "").strip()
         self.start_url = start_url or ""
 
         if fingerprint:
@@ -404,10 +458,14 @@ class MobileEmulationSession:
         )
         self._reader = asyncio.create_task(self._read_loop())
 
-        # 监听后续新开的标签页 / 页面
+        # 监听后续新开的标签页 / 页面。
+        # waitForDebuggerOnStart：新目标先在调试器处暂停，等本会话把
+        # 设备仿真与 JS 补丁挂上后再放行（Runtime.runIfWaitingForDebugger）。
+        # 否则「新标签页打开检测站」会出现首个文档在补丁生效前就执行页面
+        # 脚本的竞态：UA 是移动端、其余全泄露宿主值。
         await self._send("Target.setAutoAttach", {
             "autoAttach": True,
-            "waitForDebuggerOnStart": False,
+            "waitForDebuggerOnStart": True,
             "flatten": True,
         })
 
@@ -483,12 +541,16 @@ class MobileEmulationSession:
                     sid = params.get("sessionId")
                     if not sid:
                         continue
-                    if info.get("type") == "page":
+                    ttype = info.get("type")
+                    if ttype == "page":
                         asyncio.create_task(self._attach_page(
-                            info.get("targetId", ""), session_id=sid))
-                    elif info.get("type") == "tab":
-                        # 新标签页（page 的父 target）：递归挂载其下的页面
-                        asyncio.create_task(self._autoattach_tab(sid))
+                            info.get("targetId", ""), session_id=sid, paused=True))
+                    elif ttype == "tab":
+                        # 新标签页（page 的父 target）：递归设定其子页面挂载策略
+                        asyncio.create_task(self._attach_tab(sid))
+                    else:
+                        # 其他被暂停的目标（worker/iframe 等）：本层不处理，直接放行
+                        asyncio.create_task(self._resume(sid))
         except Exception:
             pass  # 连接关闭/取消
         finally:
@@ -499,15 +561,24 @@ class MobileEmulationSession:
 
     # ---------------- 仿真应用 ----------------
 
-    async def _autoattach_tab(self, tab_session_id: str) -> None:
+    async def _resume(self, sid: str) -> None:
+        """放行被 waitForDebuggerOnStart 暂停的目标（非暂停目标上是无害空操作）。"""
+        with contextlib.suppress(CDPError):
+            await self._send("Runtime.runIfWaitingForDebugger", {}, session_id=sid,
+                             timeout=5.0)
+
+    async def _attach_tab(self, tab_session_id: str) -> None:
+        """新标签页（page 的父 target）：设定其子页面自动挂载策略并放行自身。"""
         with contextlib.suppress(Exception):
             await self._send("Target.setAutoAttach", {
                 "autoAttach": True,
-                "waitForDebuggerOnStart": False,
+                "waitForDebuggerOnStart": True,
                 "flatten": True,
             }, session_id=tab_session_id)
+        await self._resume(tab_session_id)
 
-    async def _attach_page(self, target_id: str, session_id: Optional[str] = None) -> None:
+    async def _attach_page(self, target_id: str, session_id: Optional[str] = None,
+                           *, paused: bool = False) -> None:
         if not target_id:
             return
         # 同一页面可能被并发挂载（自动挂载事件 vs start() 的初始遍历）：
@@ -520,6 +591,9 @@ class MobileEmulationSession:
                 await existing
             return
         if target_id in self._applied_targets:
+            # 极端场景（同 target 重复挂载且处于暂停态）：确保不会卡死
+            if paused and session_id:
+                await self._resume(session_id)
             return
         current = asyncio.current_task()
         self._attach_tasks[target_id] = current
@@ -539,6 +613,13 @@ class MobileEmulationSession:
             log.debug("移动端仿真挂载页面失败: %s", e)
             self._applied_targets.discard(target_id)
         finally:
+            # 先放行再补丁当前文档：Runtime 命令在暂停态下可能不受理，
+            # 而 addScriptToEvaluateOnNewDocument 已在暂停期间挂好，
+            # 恢复后的首个真实文档必定带补丁。
+            if paused and session_id:
+                await self._resume(session_id)
+            if session_id and target_id in self._applied_targets:
+                await self._apply_patch_now(session_id)
             if current is not None and self._attach_tasks.get(target_id) is current:
                 self._attach_tasks.pop(target_id, None)
 
@@ -548,6 +629,14 @@ class MobileEmulationSession:
         #    丢失 JS 补丁：platform/userAgentData 等字段仍是内核原生值）
         with contextlib.suppress(CDPError):
             await self._send("Page.enable", {}, session_id=sid)
+
+        # 0.5 JS 补丁 init 脚本：紧跟 Page.enable 挂载（关键路径最短化）。
+        #     新目标被 waitForDebuggerOnStart 门控时，本脚本必须在放行前
+        #     到达，否则首个文档仍会以原生指纹执行页面脚本。
+        patch = build_mobile_patch(self.spec)
+        with contextlib.suppress(CDPError):
+            await self._send("Page.addScriptToEvaluateOnNewDocument",
+                             {"source": patch}, session_id=sid)
 
         # 1. 设备度量：视口 + 屏幕 + DPR + 移动布局（CSS 逻辑像素）
         #    真机首屏 innerHeight < screen.height（浏览器 UI 占位），
@@ -605,14 +694,23 @@ class MobileEmulationSession:
                 await self._send("Network.setExtraHTTPHeaders",
                                  {"headers": sec_ch_headers(ua_ch)}, session_id=sid)
 
-        # 5. JS 层字段：init 脚本对后续导航生效；当前文档立即执行一次
+        # 5. 时区：geoip 解析的出口时区（与内核 --timezone 参数同时生效，
+        #    覆盖 JS Intl/Date；内核参数覆盖不到的场景由此兜底）
+        if self.timezone:
+            with contextlib.suppress(CDPError):
+                await self._send("Emulation.setTimezoneOverride",
+                                 {"timezoneId": self.timezone}, session_id=sid)
+
+    async def _apply_patch_now(self, sid: str) -> None:
+        """对已存在的当前文档立即执行一次 JS 补丁。
+
+        新挂载的页面（waitForDebuggerOnStart 释放前）当前文档通常是空白页；
+        需要立即补丁的主要是「会话连接前就存在的页面」与自检场景。
+        """
         patch = build_mobile_patch(self.spec)
         with contextlib.suppress(CDPError):
-            await self._send("Page.addScriptToEvaluateOnNewDocument",
-                             {"source": patch}, session_id=sid)
-        with contextlib.suppress(CDPError):
             await self._send("Runtime.evaluate", {"expression": patch},
-                             session_id=sid)
+                             session_id=sid, timeout=5.0)
 
     async def _navigate_start_url(self) -> None:
         sid = self._first_page_session
