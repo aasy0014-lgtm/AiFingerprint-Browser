@@ -23,6 +23,10 @@
  12. WebGL getParameter(UNMASKED_RENDERER) 调用吞吐与原生同量级
      （复刻 BrowserScan E() 计时器，Z<=100；纯 JS 缓存返回会被判
      "WebGL exception"）
+  13. 跨域 iframe（OOPIF）：platform/screen/DPR/GPU/触控/UA-CH 与主文档
+      一致，且首个文档在脚本执行前即带补丁（文档起点取值校验）
+  14. Dedicated Worker（页面内 + 跨域 iframe 内）：WorkerNavigator 的
+      platform / deviceMemory / userAgentData 与主文档一致
 
 用独立临时数据目录运行，不污染正式数据。
 
@@ -214,6 +218,79 @@ window.__probe = {
 };
 </script></head><body>probe</body></html>"""
 
+# ---- 跨域 iframe（OOPIF）/ Worker 探针 ----
+# 父页 127.0.0.1 与子帧 localhost 属不同 site（站点隔离下必为 OOPIF）；
+# 两侧都指向本脚本内置服务器，全程无外部网络依赖。
+# 子帧首个文档的内联脚本在「文档起点」读取全部信号并回传父页：
+# 任何字段仍是宿主值（macOS 1440x900/DPR2/横向/Linux x86_64）都会被断言捕获。
+OOPIF_MAIN_HTML = """<!doctype html><html><head><script>
+window.msgs = [];
+window.addEventListener('message', function (e) { window.msgs.push(e.data); });
+// 页面文档起点的 Worker：early 为脚本首行读取（验证注入先于首行），
+// late 为 300ms 后读取（多客户端场景下 resume 竞争不影响最终一致性断言）
+try {
+  var code = 'postMessage({early: navigator.platform, uaP: navigator.userAgentData ? navigator.userAgentData.platform : null});'
+    + 'setTimeout(function () { postMessage({late: navigator.platform, devMem: navigator.deviceMemory,'
+    + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null}); }, 300);';
+  var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
+  window.workerData = {};
+  w.onmessage = function (ev) { for (var k in ev.data) { window.workerData[k] = ev.data[k]; } };
+} catch (e) { window.workerErr = String(e); }
+// 跨域 iframe（不同 site → OOPIF）
+var f = document.createElement('iframe');
+f.src = 'http://localhost:__PORT__/oopif-probe';
+f.width = 320; f.height = 240;
+document.documentElement.appendChild(f);
+</script></head><body>main</body></html>"""
+
+OOPIF_PROBE_HTML = """<!doctype html><html><head><script>
+window.__early = {
+  platform: navigator.platform,
+  cd: screen.colorDepth,
+  sw: screen.width, sh: screen.height,
+  availW: screen.availWidth, availH: screen.availHeight,
+  dpr: devicePixelRatio,
+  maxTouch: navigator.maxTouchPoints,
+  coarse: matchMedia('(pointer: coarse)').matches,
+  orientation: screen.orientation ? screen.orientation.type : null,
+  uaP: navigator.userAgentData ? navigator.userAgentData.platform : null,
+  uaMobile: navigator.userAgentData ? navigator.userAgentData.mobile : null,
+  gl: 'ERR'
+};
+try {
+  var g = document.createElement('canvas').getContext('webgl');
+  var ext = g && g.getExtension('WEBGL_debug_renderer_info');
+  window.__early.gl = ext ? g.getParameter(ext.UNMASKED_RENDERER_WEBGL) : null;
+} catch (e) {}
+try {
+  var code = 'postMessage({early: navigator.platform});'
+    + 'setTimeout(function () { postMessage({late: navigator.platform, devMem: navigator.deviceMemory,'
+    + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null}); }, 300);';
+  var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
+  window.__workerData = {};
+  w.onmessage = function (ev) { for (var k in ev.data) { window.__workerData[k] = ev.data[k]; } };
+} catch (e) { window.__workerErr = String(e); }
+setTimeout(function () {
+  var out = {};
+  for (var k in window.__early) { out[k] = window.__early[k]; }
+  out.worker = window.__workerData || null;
+  out.workerErr = window.__workerErr || null;
+  parent.postMessage(out, '*');
+}, 1300);
+</script></head><body>probe</body></html>"""
+
+# 二次客户端（Playwright 自身会话）读取跨域 frame 的即时值：
+# 验证 OOPIF 补丁对任意客户端口径均一致
+FRAME_LIVE_JS = """(() => ({
+  platform: navigator.platform,
+  cd: screen.colorDepth,
+  sw: screen.width, sh: screen.height,
+  dpr: devicePixelRatio,
+  maxTouch: navigator.maxTouchPoints,
+  coarse: matchMedia('(pointer: coarse)').matches,
+  uaP: navigator.userAgentData ? navigator.userAgentData.platform : null,
+}))()"""
+
 
 async def race_test(ws_endpoint: str) -> dict:
     """模拟用户新开标签页：目标被本会话门控 → 首个文档必须在补丁生效后执行。
@@ -378,6 +455,9 @@ async def main() -> int:
     probe = await race_test(res["ws_endpoint"])
     print(json.dumps(probe, ensure_ascii=False))
 
+    frame_state: dict = {}
+    worker_state: dict = {}
+
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
     try:
@@ -404,6 +484,81 @@ async def main() -> int:
         print(json.dumps(state, ensure_ascii=False, indent=1))
         print("\n== 实际请求头（ua-ch 相关）==")
         print(json.dumps(seen_headers, ensure_ascii=False, indent=1))
+
+        # ---- 跨域 iframe（OOPIF）+ Worker：与主文档同一套信号 ----
+        # 本地服务器双栈监听：127.0.0.1（父页）与 localhost（子帧）分属不同
+        # site；/oopif-probe 刻意延迟 0.25s —— 本地 iframe 的加载快于 CDP
+        # 往返，延迟模拟真实跨域加载时序，使「文档起点注入」可以确定性验证。
+        import socket as _socket
+        import threading as _threading
+        import time as _time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        oopif_state: dict = {"port": 0}
+
+        class _OopifHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                if self.path.startswith("/oopif-probe"):
+                    _time.sleep(0.25)
+                    body = OOPIF_PROBE_HTML
+                else:
+                    body = OOPIF_MAIN_HTML
+                data = body.replace("__PORT__", str(oopif_state["port"])).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):  # noqa: A003
+                pass
+
+        class _DualStackServer(ThreadingHTTPServer):
+            address_family = _socket.AF_INET6
+
+            def server_bind(self):
+                self.socket.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 0)
+                super().server_bind()
+
+        oopif_server = _DualStackServer(("::", 0), _OopifHandler)
+        oopif_state["port"] = oopif_server.server_address[1]
+        _threading.Thread(target=oopif_server.serve_forever, daemon=True).start()
+        try:
+            await page.goto(f"http://127.0.0.1:{oopif_state['port']}/oopif-main",
+                            wait_until="domcontentloaded")
+            bundle: dict = {}
+            for _ in range(60):
+                bundle = await page.evaluate(
+                    "() => ({msgs: window.msgs || [],"
+                    " worker: window.workerData || null,"
+                    " workerErr: window.workerErr || null})")
+                wk = bundle.get("worker") or {}
+                if bundle.get("msgs") and "late" in wk:
+                    break
+                await asyncio.sleep(0.25)
+            worker_state = bundle.get("worker") or {}
+            msgs = bundle.get("msgs") or []
+            if msgs:
+                frame_state = msgs[0]
+            # 二次客户端读取跨域 frame 即时值（Playwright 自建 OOPIF 会话）
+            frame_live: dict = {}
+            frames = [fr for fr in page.frames if "localhost" in (fr.url or "")]
+            if frames:
+                try:
+                    frame_live = await frames[0].evaluate(FRAME_LIVE_JS)
+                except Exception as exc:  # noqa: BLE001
+                    frame_live = {"err": str(exc)[:100]}
+            frame_state["live"] = frame_live
+
+            print("\n== 跨域 iframe（OOPIF，文档起点取值）==")
+            print(json.dumps({k: v for k, v in frame_state.items() if k != "worker"},
+                             ensure_ascii=False))
+            print("\n== 跨域 iframe 内 Worker ==")
+            print(json.dumps(frame_state.get("worker") or {}, ensure_ascii=False))
+            print("\n== 页面 Worker（文档起点）==")
+            print(json.dumps(worker_state, ensure_ascii=False))
+        finally:
+            oopif_server.shutdown()
     finally:
         await pw.stop()
         await manager.stop(profile["id"])
@@ -460,6 +615,30 @@ async def main() -> int:
             isinstance(state.get("glPerfZ"), int) and 0 <= state.get("glPerfZ") <= 100),
     }
 
+    # ---- 跨域 iframe（OOPIF）：reCAPTCHA 等三方沙箱内与主文档同源 ----
+    fr = frame_state if isinstance(frame_state, dict) else {}
+    fr_live = fr.get("live") if isinstance(fr.get("live"), dict) else {}
+    fr_worker = fr.get("worker") if isinstance(fr.get("worker"), dict) else {}
+    wk_main = worker_state if isinstance(worker_state, dict) else {}
+    checks.update({
+        "跨域 iframe：platform 一致（文档起点）": fr.get("platform") == nav.get("platform"),
+        "跨域 iframe：colorDepth == 24（文档起点）": fr.get("cd") == 24,
+        "跨域 iframe：screen/avail == 主文档": (
+            fr.get("sw") == state["screenW"] and fr.get("sh") == state["screenH"]
+            and fr.get("availW") == state["screenW"] and fr.get("availH") == state["screenH"]),
+        "跨域 iframe：DPR 一致（文档起点）": abs((fr.get("dpr") or 0) - dpr) < 0.02,
+        "跨域 iframe：GPU == 指纹（文档起点）": (fr.get("gl") or "") == vc.get("renderer"),
+        "跨域 iframe：maxTouchPoints 一致": fr.get("maxTouch") == nav.get("maxTouchPoints"),
+        "跨域 iframe：粗指针（coarse）": fr.get("coarse") is True,
+        "跨域 iframe：朝向 portrait-primary": fr.get("orientation") == "portrait-primary",
+        "跨域 iframe：二次客户端读取一致": (
+            fr_live.get("platform") == nav.get("platform")
+            and fr_live.get("cd") == 24
+            and fr_live.get("coarse") is True),
+        "Worker（页面）：platform 一致": wk_main.get("late") == nav.get("platform"),
+        "Worker（跨域 iframe）：platform 一致": fr_worker.get("late") == nav.get("platform"),
+    })
+
     if is_android:
         ua_data = state.get("uaData") if isinstance(state.get("uaData"), dict) else None
         high = state.get("uaDataHigh") if isinstance(state.get("uaDataHigh"), dict) else None
@@ -497,6 +676,15 @@ async def main() -> int:
                 (state.get("integrity") or {}).get("uaDataOwnProps")) == [],
             "deviceMemory getter 原生": (
                 (state.get("integrity") or {}).get("deviceMemoryGetterNative")) is True,
+            "跨域 iframe：UA-CH platform/mobile == 指纹": (
+                fr.get("uaP") == (ua_ch or {}).get("platform")
+                and fr.get("uaMobile") is True),
+            "Worker（页面）：UA-CH platform == Android": (
+                wk_main.get("uaP") == (ua_ch or {}).get("platform")),
+            "Worker（页面）：deviceMemory == 内存桶": (
+                wk_main.get("devMem") == state.get("deviceMemory")),
+            "Worker（跨域 iframe）：UA-CH platform == Android": (
+                fr_worker.get("uaP") == (ua_ch or {}).get("platform")),
         })
     else:
         checks.update({
@@ -510,6 +698,10 @@ async def main() -> int:
             "无 Sec-CH-UA 请求头（Safari 不发）": not any(k.startswith("sec-ch") for k in seen_headers),
             "请求头 User-Agent == 指纹 UA": seen_headers.get("user-agent") == nav["userAgent"],
             "竞态：首文档无 UA-CH（Safari 行为）": probe.get("hasUaData") is False,
+            "跨域 iframe：UA-CH 不存在（Safari 行为）": fr.get("uaP") is None,
+            "Worker（页面）：UA-CH 不存在（Safari 行为）": wk_main.get("uaP") is None,
+            "Worker（页面）：deviceMemory 不暴露（Safari 行为）": wk_main.get("devMem") is None,
+            "Worker（跨域 iframe）：UA-CH 不存在（Safari 行为）": fr_worker.get("uaP") is None,
         })
 
     print("\n== 检查项 ==")

@@ -217,6 +217,25 @@ _PATCH_TEMPLATE = r"""
             return true;
         } catch (e) { return false; }
     };
+    // window 上的 [Replaceable] 属性（devicePixelRatio/outerWidth 等）：
+    // 原生是「get/set 均存在、赋值时自我替换为数据属性」，保持同样形态。
+    var replaceable = function (obj, name, value) {
+        if (!obj) { return false; }
+        try {
+            var getter = __maskNative(function () { return value; }, 'get ' + name);
+            var setter = __maskNative(function (v) {
+                try {
+                    Object.defineProperty(obj, name, {
+                        value: v, writable: true, enumerable: true, configurable: true,
+                    });
+                } catch (e) {}
+            }, 'set ' + name);
+            Object.defineProperty(obj, name, {
+                get: getter, set: setter, enumerable: true, configurable: true,
+            });
+            return true;
+        } catch (e) { return false; }
+    };
     var removeProp = function (name) {
         try { delete Navigator.prototype[name]; } catch (e) {}
         try { delete navigator[name]; } catch (e) {}
@@ -232,6 +251,15 @@ _PATCH_TEMPLATE = r"""
         defineGet(N, 'maxTouchPoints', D.maxTouchPoints);
         if (D.platform) { defineGet(N, 'platform', D.platform); }
         if (D.vendor) { defineGet(N, 'vendor', D.vendor); }
+        // ---- UA 文档起点覆盖 ----
+        // CDP Emulation.setUserAgentOverride 是渲染器侧命令：新标签页首文档
+        // 偶发在其落达前已提交（竞态实测），此时 UA 会漏成宿主桌面值。
+        // 文档起点脚本先于一切页面脚本，这里兜底保证 UA/appVersion 恒为移动端；
+        // 与 CDP 覆盖同值，不冲突（appVersion = UA 去掉 "Mozilla/" 前缀）。
+        if (D.ua) {
+            defineGet(N, 'userAgent', D.ua);
+            defineGet(N, 'appVersion', D.ua.replace(/^Mozilla\//, ''));
+        }
         if (D.deviceMemory !== null && D.deviceMemory !== undefined) {
             defineGet(N, 'deviceMemory', D.deviceMemory);
         }
@@ -342,6 +370,25 @@ _PATCH_TEMPLATE = r"""
             defineGet(Screen.prototype, 'pixelDepth', D.colorDepth);
         }
 
+        // ---- 屏幕尺寸 / DPR / outer / 朝向：跨域 iframe（OOPIF）没有页面级
+        //      CDP 度量仿真，这些字段全是宿主值（macOS 1440x900/DPR2/横向）；
+        //      真机上 iframe 内与主文档完全相同 → 镜像主文档保持一致 ----
+        if (D.cssWidth && D.cssHeight && typeof Screen !== 'undefined' && Screen.prototype) {
+            defineGet(Screen.prototype, 'width', D.cssWidth);
+            defineGet(Screen.prototype, 'height', D.cssHeight);
+            defineGet(Screen.prototype, 'availWidth', D.cssWidth);
+            defineGet(Screen.prototype, 'availHeight', D.cssHeight);
+        }
+        if (D.dpr) {
+            replaceable(window, 'devicePixelRatio', D.dpr);
+            if (D.viewportHeight) { replaceable(window, 'outerHeight', D.viewportHeight); }
+            replaceable(window, 'outerWidth', D.cssWidth);
+        }
+        if (typeof ScreenOrientation !== 'undefined' && ScreenOrientation.prototype) {
+            defineGet(ScreenOrientation.prototype, 'type', 'portrait-primary');
+            defineGet(ScreenOrientation.prototype, 'angle', 0);
+        }
+
         // ---- SpeechSynthesis：移动端语音列表必须为空 ----
         // Android Chrome 不提供语音枚举（getVoices() 恒为 []）；宿主 macOS 会
         // 暴露上百个语音（婷婷/Albert/Samantha…），检测站点把这个数量直接作为
@@ -392,6 +439,7 @@ _PATCH_TEMPLATE = r"""
 def build_mobile_patch(spec: Dict[str, Any]) -> str:
     """把仿真规格编译成 init 脚本（页面脚本运行前生效）。"""
     payload = {
+        "ua": str(spec.get("ua") or ""),
         "platform": spec.get("platform") or "",
         "maxTouchPoints": int(spec.get("maxTouchPoints") or 5),
         "vendor": spec.get("vendor") or "",
@@ -403,8 +451,163 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "emptyPlugins": bool(spec.get("emptyPlugins")),
         "ios": bool(spec.get("ios")),
         "webgl": spec.get("webgl"),
+        # 跨域 iframe（OOPIF）无页面级 CDP 度量仿真：screen/DPR/outer 镜像主文档
+        "cssWidth": int(spec.get("cssWidth") or 0),
+        "cssHeight": int(spec.get("cssHeight") or 0),
+        "viewportHeight": int(spec.get("viewportHeight") or 0),
+        "dpr": float(spec.get("dpr") or 0),
     }
     return _PATCH_TEMPLATE.replace("__SPEC__", json.dumps(payload, ensure_ascii=False))
+
+
+# ------------------------------------------------------------------ Worker 补丁
+# Dedicated/Shared/Service Worker 是独立 JS 全局，不继承页面的 init 脚本：
+# WorkerNavigator 的 platform / deviceMemory / userAgentData（安全上下文下
+# 内核会给出一份桌面 Linux 元数据）都会暴露宿主值。Worker 无法使用
+# Page.addScriptToEvaluateOnNewDocument，由 _attach_worker 在目标被门控
+# 暂停时 Runtime.evaluate 注入（实测暂停态 1-2ms 响应，先于首行代码）。
+_WORKER_PATCH_TEMPLATE = r"""
+(function () {
+    var D;
+    try { D = __SPEC__; } catch (e) { return; }
+
+    // ---- 原生函数伪装（与页面补丁同一实现）----
+    var __maskNative = (function () {
+        try {
+            var origToString = Function.prototype.toString;
+            if (typeof WeakMap === 'undefined') { return function (fn) { return fn; }; }
+            var registry = new WeakMap();
+            var faked = function toString() {
+                var v = registry.get(this);
+                return v !== undefined ? v : origToString.call(this);
+            };
+            var mask = function (fn, name) {
+                try {
+                    if (typeof fn === 'function') {
+                        registry.set(fn, 'function ' + name + '() { [native code] }');
+                        try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e2) {}
+                    }
+                } catch (e) {}
+                return fn;
+            };
+            mask(faked, 'toString');
+            Object.defineProperty(Function.prototype, 'toString', {
+                value: faked, writable: true, configurable: true,
+            });
+            return mask;
+        } catch (e) {
+            return function (fn) { return fn; };
+        }
+    })();
+    var defineGet = function (proto, name, value) {
+        try {
+            Object.defineProperty(proto, name, {
+                get: __maskNative(function () { return value; }, 'get ' + name),
+                enumerable: true,
+                configurable: true,
+            });
+            return true;
+        } catch (e) { return false; }
+    };
+    var defineFn = function (proto, name, fn) {
+        try {
+            Object.defineProperty(proto, name, {
+                value: __maskNative(fn, name),
+                writable: true, enumerable: true, configurable: true,
+            });
+            return true;
+        } catch (e) { return false; }
+    };
+
+    try {
+        var N = null;
+        try { N = (typeof WorkerNavigator !== 'undefined') ? WorkerNavigator.prototype : null; } catch (e) {}
+        if (!N && typeof navigator !== 'undefined') {
+            N = Object.getPrototypeOf(navigator);
+        }
+        if (!N) { return; }
+
+        // ---- 抹掉该平台不存在的属性（iOS 的 deviceMemory / userAgentData 等）----
+        var drops = D.removeProps || [];
+        for (var i = 0; i < drops.length; i++) {
+            try { delete N[drops[i]]; } catch (e) {}
+            try { delete navigator[drops[i]]; } catch (e) {}
+            if (drops[i] in navigator) { defineGet(N, drops[i], undefined); }
+        }
+
+        if (D.platform) { defineGet(N, 'platform', D.platform); }
+        if (D.ua) {
+            defineGet(N, 'userAgent', D.ua);
+            defineGet(N, 'appVersion', D.ua.replace(/^Mozilla\//, ''));
+        }
+        if (D.deviceMemory !== null && D.deviceMemory !== undefined) {
+            defineGet(N, 'deviceMemory', D.deviceMemory);
+        }
+
+        // ---- UA-CH：Worker 内 navigator.userAgentData 与主文档一致 ----
+        // （安全上下文下内核原生提供一份桌面 Linux 元数据：platform "Linux"、
+        //   mobile false；真机 Android Worker 的 UA-CH 与主文档相同）
+        if (D.uaCh) {
+            var ch = D.uaCh;
+            var he = {
+                architecture: ch.architecture,
+                bitness: ch.bitness,
+                fullVersionList: ch.fullVersionList,
+                model: ch.model,
+                platformVersion: ch.platformVersion,
+                uaFullVersion: ch.fullVersion,
+                wow64: ch.wow64
+            };
+            var base = { brands: ch.brands, mobile: ch.mobile, platform: ch.platform };
+            var baseOut = function () {
+                return { brands: base.brands, mobile: base.mobile, platform: base.platform };
+            };
+            var hev = function (hints) {
+                var out = baseOut();
+                (hints || []).forEach(function (h) {
+                    if (Object.prototype.hasOwnProperty.call(he, h)) { out[h] = he[h]; }
+                });
+                return Promise.resolve(out);
+            };
+            var uaProto = null;
+            try { uaProto = (typeof NavigatorUAData !== 'undefined') ? NavigatorUAData.prototype : null; } catch (e) {}
+            if (!uaProto && navigator.userAgentData) {
+                try { uaProto = Object.getPrototypeOf(navigator.userAgentData); } catch (e) {}
+            }
+            var uaData;
+            if (uaProto) {
+                defineGet(uaProto, 'brands', base.brands);
+                defineGet(uaProto, 'mobile', base.mobile);
+                defineGet(uaProto, 'platform', base.platform);
+                defineFn(uaProto, 'getHighEntropyValues', hev);
+                defineFn(uaProto, 'toJSON', baseOut);
+                uaData = Object.create(uaProto);
+            } else {
+                uaData = {};
+                Object.defineProperty(uaData, 'brands', { get: __maskNative(function () { return base.brands; }, 'get brands') });
+                Object.defineProperty(uaData, 'mobile', { get: __maskNative(function () { return base.mobile; }, 'get mobile') });
+                Object.defineProperty(uaData, 'platform', { get: __maskNative(function () { return base.platform; }, 'get platform') });
+                Object.defineProperty(uaData, 'getHighEntropyValues', { value: __maskNative(hev, 'getHighEntropyValues') });
+                Object.defineProperty(uaData, 'toJSON', { value: __maskNative(baseOut, 'toJSON') });
+            }
+            defineGet(N, 'userAgentData', uaData);
+        }
+    } catch (e) {}
+})();
+"""
+
+
+def build_worker_patch(spec: Dict[str, Any]) -> str:
+    """Worker 目标补丁：WorkerNavigator 与主文档同源（platform/UA-CH/属性抹除）。"""
+    payload = {
+        "ua": str(spec.get("ua") or ""),
+        "platform": spec.get("platform") or "",
+        "deviceMemory": spec.get("deviceMemory"),
+        "uaCh": spec.get("uaCh"),
+        "removeProps": list(spec.get("removeProps") or []),
+        "ios": bool(spec.get("ios")),
+    }
+    return _WORKER_PATCH_TEMPLATE.replace("__SPEC__", json.dumps(payload, ensure_ascii=False))
 
 
 class MobileEmulationSession:
@@ -501,11 +704,20 @@ class MobileEmulationSession:
             "flatten": True,
         })
 
+        # 目标发现：跨域 iframe（OOPIF）的 auto-attach 只会投递给单个客户端
+        # （实测：多客户端时仅先配置者收到），Playwright 等工具同时连接会抢走
+        # 投递。开启发现后用显式 attachToTarget 兜底，保证 OOPIF 覆盖率与
+        # 客户端数量无关。
+        with contextlib.suppress(CDPError):
+            await self._send("Target.setDiscoverTargets", {"discover": True})
+
         # 已存在的页面
         targets = (await self._send("Target.getTargets")).get("targetInfos", [])
         for info in targets:
             if info.get("type") == "page":
                 await self._attach_page(info.get("targetId", ""))
+            elif info.get("type") == "iframe":
+                asyncio.create_task(self._attach_frame(info.get("targetId", "")))
 
         # 应用完成后导航到目标页（首个真实页面加载前指纹已生效）
         if self.start_url and self.start_url != "about:blank":
@@ -580,9 +792,24 @@ class MobileEmulationSession:
                     elif ttype == "tab":
                         # 新标签页（page 的父 target）：递归设定其子页面挂载策略
                         asyncio.create_task(self._attach_tab(sid))
+                    elif ttype == "iframe":
+                        # 跨域 iframe（OOPIF）：独立进程/目标，需与主文档同一套信号
+                        asyncio.create_task(self._attach_frame(
+                            info.get("targetId", ""), session_id=sid,
+                            paused=bool(params.get("waitingForDebugger"))))
+                    elif ttype in ("worker", "shared_worker", "service_worker"):
+                        # 独立 JS 全局：WorkerNavigator 补丁后放行
+                        asyncio.create_task(self._attach_worker(
+                            info.get("targetId", ""), session_id=sid))
                     else:
-                        # 其他被暂停的目标（worker/iframe 等）：本层不处理，直接放行
+                        # 其他被暂停的目标（auction worklet 等）：本层不处理，直接放行
                         asyncio.create_task(self._resume(sid))
+                elif msg.get("method") == "Target.targetCreated":
+                    # 目标发现兜底：OOPIF 的 auto-attach 投递存在客户端竞争，
+                    # 这里对任何新出现的 iframe 显式挂载补丁（去重后无副作用）
+                    info = (msg.get("params") or {}).get("targetInfo") or {}
+                    if info.get("type") == "iframe" and info.get("targetId"):
+                        asyncio.create_task(self._attach_frame(info.get("targetId", "")))
         except Exception:
             pass  # 连接关闭/取消
         finally:
@@ -641,6 +868,16 @@ class MobileEmulationSession:
             if self._first_page_session is None:
                 self._first_page_session = session_id
             await self._apply_device_emulation(session_id)
+            # 子目标（Worker / 跨域 iframe）自动挂载：两者被门控暂停后先注入
+            # 补丁再放行。OOPIF 在 Chromium 中同样受 waitForDebuggerOnStart
+            # 门控（暂停于上下文创建前，故暂停态不能 evaluate、只需 addScript）；
+            # 若该投递被其他客户端抢占，Target.targetCreated 兜底路径仍会覆盖。
+            with contextlib.suppress(CDPError):
+                await self._send("Target.setAutoAttach", {
+                    "autoAttach": True,
+                    "waitForDebuggerOnStart": True,
+                    "flatten": True,
+                }, session_id=session_id)
         except Exception as e:
             log.debug("移动端仿真挂载页面失败: %s", e)
             self._applied_targets.discard(target_id)
@@ -654,6 +891,120 @@ class MobileEmulationSession:
                 await self._apply_patch_now(session_id)
             if current is not None and self._attach_tasks.get(target_id) is current:
                 self._attach_tasks.pop(target_id, None)
+
+    async def _attach_frame(self, target_id: str, session_id: Optional[str] = None,
+                            *, paused: bool = False) -> None:
+        """跨域 iframe（OOPIF）补丁：与主文档保持同一套移动端信号。
+
+        OOPIF 是独立进程/目标，不继承页面的 CDP 仿真与 JS 补丁：platform、
+        screen/DPR（宿主 1440x900/2/横向）、触控、WebGL、UA-CH 全部穿帮。
+        两条挂载路径共用本方法：
+          1. 页面级 auto-attach 投递（waitForDebuggerOnStart 暂停于上下文
+             创建前 → addScript 挂好后放行，首个文档即带补丁，无竞态）；
+          2. Target.targetCreated 发现兜底 + 显式 attachToTarget（auto-attach
+             投递被其他客户端抢占时仍生效；目标已在运行，则对当前文档
+             立即补丁一次，尽力而为）。
+        """
+        if not target_id:
+            return
+        existing = self._attach_tasks.get(target_id)
+        if existing is not None and existing is not asyncio.current_task():
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await existing
+            # 门控暂停是会话级的：其他会话的 runIfWaitingForDebugger 不解
+            # 本会话的暂停（实测）。等待先到者完成补丁注册后，必须由本会话放行。
+            if paused and session_id:
+                await self._resume(session_id)
+            return
+        if target_id in self._applied_targets:
+            if paused and session_id:
+                await self._resume(session_id)
+            return
+        current = asyncio.current_task()
+        self._attach_tasks[target_id] = current
+        self._applied_targets.add(target_id)
+        try:
+            if not session_id:
+                res = await self._send("Target.attachToTarget",
+                                       {"targetId": target_id, "flatten": True})
+                session_id = res.get("sessionId")
+            if not session_id:
+                self._applied_targets.discard(target_id)
+                return
+            # 嵌套跨域 iframe / iframe 内 Worker：继续覆盖其子目标
+            with contextlib.suppress(CDPError):
+                await self._send("Target.setAutoAttach", {
+                    "autoAttach": True,
+                    "waitForDebuggerOnStart": True,
+                    "flatten": True,
+                }, session_id=session_id)
+            # 关键路径：先挂 init 脚本（暂停态下执行；被门控的目标放行后的
+            # 首个真实文档因此必定带补丁）
+            patch = build_mobile_patch(self.spec)
+            with contextlib.suppress(CDPError):
+                await self._send("Page.enable", {}, session_id=session_id)
+            with contextlib.suppress(CDPError):
+                await self._send("Page.addScriptToEvaluateOnNewDocument",
+                                 {"source": patch}, session_id=session_id)
+            # 触控仿真：pointer/hover 媒体查询与触控事件（JS 补丁只覆盖
+            # maxTouchPoints 数值，媒体查询来自目标的触控开关）
+            with contextlib.suppress(CDPError):
+                await self._send("Emulation.setTouchEmulationEnabled", {
+                    "enabled": True,
+                    "maxTouchPoints": self.max_touch_points,
+                }, session_id=session_id)
+            # UA-CH 低熵请求头：iframe 发出的请求与主文档一致
+            # （真机 Chrome 对全站发送；内核不发送任何 Sec-CH-UA* 头）
+            ua_ch = self.spec.get("uaCh")
+            if ua_ch:
+                with contextlib.suppress(CDPError):
+                    await self._send("Network.enable", {}, session_id=session_id)
+                with contextlib.suppress(CDPError):
+                    await self._send("Network.setExtraHTTPHeaders",
+                                     {"headers": sec_ch_headers(ua_ch)},
+                                     session_id=session_id)
+        except Exception as e:
+            log.debug("移动端仿真挂载 iframe 失败: %s", e)
+            self._applied_targets.discard(target_id)
+        finally:
+            # 与页面路径同一顺序：先放行（创建执行上下文），再补丁当前文档。
+            # 目标未被门控时两步都是无害的空操作/仅覆盖当前文档。
+            if session_id:
+                await self._resume(session_id)
+                await self._apply_patch_now(session_id)
+            if current is not None and self._attach_tasks.get(target_id) is current:
+                self._attach_tasks.pop(target_id, None)
+
+    async def _attach_worker(self, target_id: str, session_id: str) -> None:
+        """Dedicated/Shared/Service Worker 补丁：WorkerNavigator 与主文档同源。
+
+        Worker 是独立 JS 全局：platform（Linux x86_64）、deviceMemory（宿主
+        内存桶）、userAgentData（桌面 Linux 元数据）全部穿帮。Worker 无法
+        使用 Page.addScriptToEvaluateOnNewDocument；目标正被门控暂停时，
+        Runtime.evaluate 即为「首行代码执行前」的注入点（实测 1-2ms）。
+        """
+        if not target_id or not session_id:
+            return
+        if target_id in self._applied_targets:
+            await self._resume(session_id)
+            return
+        self._applied_targets.add(target_id)
+        patch = build_worker_patch(self.spec)
+        injected = False
+        try:
+            await self._send("Runtime.evaluate", {"expression": patch},
+                             session_id=session_id, timeout=3.0)
+            injected = True
+        except (CDPError, asyncio.TimeoutError):
+            pass
+        finally:
+            await self._resume(session_id)
+        if not injected:
+            # 暂停态不受理 Runtime 命令时（理论上不会）：放行后补一次，
+            # 极小竞态窗口（Worker 首行可能已读取原生值）
+            with contextlib.suppress(CDPError, asyncio.TimeoutError):
+                await self._send("Runtime.evaluate", {"expression": patch},
+                                 session_id=session_id, timeout=3.0)
 
     async def _apply_device_emulation(self, sid: str) -> None:
         # 0. 启用 Page 域：未启用时 addScriptToEvaluateOnNewDocument 虽然返回
