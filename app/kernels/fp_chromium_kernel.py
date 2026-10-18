@@ -37,6 +37,19 @@ _PLATFORM_VERSIONS = {
     "windows": ["10.0.0", "13.0.0", "14.0.0", "15.0.0", "15.0.0", "10.0.0"],
     "macos": ["13.5.0", "14.4.1", "14.7.0", "14.7.0", "15.1.0", "15.3.0"],
     "linux": ["5.15.0", "6.1.0", "6.1.0", "6.5.0", "6.8.0", "6.8.0"],
+    "android": ["13.0.0", "14.0.0", "13.0.0", "15.0.0", "14.0.0", "14.0.0"],
+    "ios": ["16.6.0", "17.0.0", "17.0.0", "17.5.1", "18.0.0", "17.5.1"],
+}
+
+# 内核原生 --fingerprint-platform 仅支持桌面三系统；
+# 移动端（android/ios）退化到对应底层平台，移动端 UA/触控/视口由 CDP 注入层补齐
+# （app/mobile_cdp_injector.py），避免启动直接 KeyError。
+_PLATFORM_ARG = {
+    "windows": "windows",
+    "macos": "macos",
+    "linux": "linux",
+    "android": "linux",
+    "ios": "macos",
 }
 
 
@@ -45,7 +58,7 @@ def _stable_platform_version(target_os: str, seed: int) -> str:
     pool = _PLATFORM_VERSIONS.get(target_os)
     return pool[seed % len(pool)] if pool else "10.0.0"
 
-# Chrome 大版本 → 对应 fingerprint-chromium release 存在（132~148）
+# Chrome 大版本 → 对应 fingerprint-chromium release 存在（132~150）
 _EXE_NAMES = ("chrome.exe", "chrome")
 
 
@@ -55,10 +68,20 @@ def find_executable() -> Optional[str]:
         return env
     tools = BASE_DIR / "tools" / "fp-chromium"
     if tools.is_dir():
+        # Windows/Linux：直接命名的可执行文件
         for name in _EXE_NAMES:
             for candidate in [tools / name, *tools.rglob(name)]:
                 if candidate.exists():
                     return str(candidate)
+        # macOS：Release 只有 .dmg，解压后为 Chromium.app，
+        # 真实二进制在 Contents/MacOS/ 下（必须用真实路径启动，
+        # 经符号链接启动会让 dyld 按链接路径解析框架而失败）
+        for app_dir in [*tools.glob("*.app"), *tools.rglob("*.app")]:
+            macos_dir = app_dir / "Contents" / "MacOS"
+            if macos_dir.is_dir():
+                for binary in sorted(macos_dir.iterdir()):
+                    if binary.is_file():
+                        return str(binary)
     return None
 
 
@@ -89,6 +112,8 @@ async def start(
     launch: LaunchConfig,
     headless: Optional[bool] = None,
     start_url: Optional[str] = None,
+    mobile_mode: bool = False,        # 新增：移动端仿真模式
+    mobile_target_os: Optional[str] = None,  # 新增：android/ios
 ) -> dict[str, Any]:
     import asyncio
 
@@ -111,7 +136,7 @@ async def start(
     args = [
         exe,
         f"--fingerprint={seed}",
-        f"--fingerprint-platform={ {'windows': 'windows', 'macos': 'macos', 'linux': 'linux'}[target_os] }",
+        f"--fingerprint-platform={_PLATFORM_ARG.get(target_os, 'windows')}",
         f"--fingerprint-platform-version={launch.fp_platform_version or _stable_platform_version(target_os, seed)}",
         "--fingerprint-brand=Chrome",
         f"--remote-debugging-port={port}",
@@ -144,11 +169,49 @@ async def start(
     if proxy is not None:
         # 该内核命令行代理不支持账号密码（Chromium 限制）
         args.append(f"--proxy-server={proxy.scheme}://{proxy.host}:{proxy.port}")
+    
     effective_headless = headless if headless is not None else launch.headless
     if effective_headless:
         # 不加 --disable-gpu：软件渲染是风控特征（SwiftShader 渲染器）
         args.append("--headless=new")
-    args.append(start_url or launch.start_url or "about:blank")
+    
+    # --- 移动端仿真模式特殊处理 ---
+    mobile_viewport = None
+    mobile_dpr = 1.0
+    mobile_ua = ua
+    mobile_platform = nav.get("platform", "")
+    mobile_max_touch = int(nav.get("maxTouchPoints") or 10)
+    mobile_start_url = start_url or launch.start_url or ""
+    if mobile_mode or mobile_target_os in ("android", "ios"):
+        # 从指纹数据读取移动端屏幕信息（物理分辨率）
+        screen = (fingerprint_data.get("fingerprint") or {}).get("screen", {})
+        if screen.get("width") and screen.get("height"):
+            mobile_viewport = {
+                "width": screen["width"],
+                "height": screen["height"],
+            }
+            mobile_dpr = screen.get("devicePixelRatio", 2.5)
+        
+        # 确保 UA 正确
+        if not mobile_ua:
+            mobile_ua = nav.get("userAgent", "")
+        
+        # 桌面内核上的移动仿真：窗口尺寸按 CSS 逻辑像素（物理 / DPR）预留，
+        # UA / navigator.mobile / 屏幕尺寸等由 CDP 注入层补齐（mobile_cdp_injector）
+        if mobile_viewport:
+            css_w = round(mobile_viewport["width"] / (mobile_dpr or 1.0))
+            css_h = round(mobile_viewport["height"] / (mobile_dpr or 1.0))
+            args.append(f"--window-size={css_w},{css_h + 130}")
+        args.append("--touch-events=enabled")
+        if mobile_ua:
+            args.append(f"--user-agent={mobile_ua}")
+
+    # 移动端：先 about:blank 静默启动，等 CDP 注入完成后再导航到 start_url，
+    # 避免首个页面在注入生效前以桌面指纹加载
+    if mobile_mode or mobile_target_os in ("android", "ios"):
+        args.append("about:blank")
+    else:
+        args.append(start_url or launch.start_url or "about:blank")
 
     proc = subprocess.Popen(  # nosec B603 参数来自本地受控配置
         args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -174,18 +237,28 @@ async def start(
         _kill(proc)
         raise RuntimeError("CDP 调试端口在 20 秒内未就绪")
 
-    return {
+    # 返回额外信息供 launcher 层使用（用于 Playwright 上下文配置）
+    result = {
         "process": proc,
         "debug_port": port,
+        "ws_endpoint": ws_endpoint,
         "info": {
             "kernel": KERNEL_NAME,
             "debug_port": port,
             "ws_endpoint": ws_endpoint,
             "fingerprint_seed": seed,
+            "mobile_viewport": mobile_viewport,
+            "mobile_dpr": mobile_dpr,
+            "mobile_ua": mobile_ua,
+            "mobile_platform": mobile_platform,
+            "mobile_max_touch": mobile_max_touch,
+            "mobile_start_url": mobile_start_url,
             "note": "fingerprint-chromium 内核：内核层指纹伪装 + 标准 CDP 端点，"
                     "Selenium/Puppeteer/Playwright 可直连 ws_endpoint。",
         },
     }
+    
+    return result
 
 
 def _kill(proc: subprocess.Popen) -> None:

@@ -1,5 +1,10 @@
-"""启动管理器：维护「环境 → 运行中的浏览器实例」的生命周期。"""
+"""启动管理器：维护「环境 → 运行中的浏览器实例」的生命周期。
+
+三内核：camoufox/fp-chromium/chromium（仅桌面端）
+移动端仿真：Android/iOS（通过 camoufox 的 context fingerprint 注入实现）
+"""
 import asyncio
+import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -13,6 +18,7 @@ from .models import LaunchConfig, ProxyConfig
 from .proxy_dns import is_ip_address, resolve_real_ip
 from .proxy_forwarder import AuthProxyForwarder, needs_forwarder
 from .risk_presets import apply_preset
+from .mobile_cdp_injector import MobileEmulationSession
 
 log = logging.getLogger(__name__)
 
@@ -155,19 +161,80 @@ class LaunchManager:
                         context=result["context"],
                     )
                 elif profile["kernel"] == fp_chromium_kernel.KERNEL_NAME:
+                    # 检测是否为移动端环境
+                    target_os = profile.get("target_os", "windows")
+                    is_mobile = target_os in ("android", "ios")
+                    
                     result = await fp_chromium_kernel.start(
                         profile_id=profile_id,
                         user_data_dir=user_data_dir,
                         fingerprint_data=profile["fingerprint"],
-                        target_os=profile["target_os"],
+                        target_os=target_os,
                         proxy=kernel_proxy,
                         launch=launch,
                         headless=headless,
                         start_url=start_url,
+                        mobile_mode=is_mobile,
+                        mobile_target_os=target_os if is_mobile else None,
                     )
+                    
                     _fwd = forwarder
+                    
+                    # --- 移动端 CDP 注入 ---
+                    info = result.get("info", {})
+                    viewport = info.get("mobile_viewport")
+                    dpr = info.get("mobile_dpr", 1.0)
+                    ua = info.get("mobile_ua", "")
+                    platform = info.get("mobile_platform", "")
+                    max_touch = int(info.get("mobile_max_touch") or 10)
+                    start_url_final = info.get("mobile_start_url") or ""
+                    mobile_session = None
+                    if viewport or ua:
+                        mobile_session = MobileEmulationSession(
+                            info["ws_endpoint"],
+                            viewport=viewport, dpr=dpr, ua=ua, platform=platform,
+                            max_touch_points=max_touch,
+                            locale=launch.locale or "",
+                            start_url=start_url_final,
+                        )
 
+                    async def _setup_mobile_context():
+                        """建立移动端 CDP 仿真会话（常驻到环境停止）。
+
+                        CDP 仿真设置随客户端断开会被浏览器还原（与 DevTools
+                        设备模式同理），因此必须保持连接；会话同时监听
+                        新开标签页并自动应用仿真。
+                        """
+                        if mobile_session is None:
+                            return
+                        try:
+                            await mobile_session.start()
+                        except asyncio.CancelledError:
+                            with contextlib.suppress(Exception):
+                                await mobile_session.close()
+                            raise
+                        except Exception as e:
+                            log.warning("移动端仿真建立失败：%s", e)
+                            with contextlib.suppress(Exception):
+                                await mobile_session.close()
+                            return
+                        inst.extra["mobile_session"] = mobile_session
+                        log.info("✅ 移动端仿真已生效 (OS=%s, 物理屏 %sx%s, DPR=%.1f)",
+                                 target_os, viewport.get("width") if viewport else 0,
+                                 viewport.get("height") if viewport else 0, dpr)
+                    
+                    # 异步建立仿真（不阻塞启动流程），句柄随实例生命周期管理
+                    mobile_task = asyncio.create_task(_setup_mobile_context())
+                    
                     async def _stop_fpchromium() -> None:
+                        if not mobile_task.done():
+                            mobile_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await mobile_task
+                        sess = inst.extra.get("mobile_session")
+                        if sess is not None:
+                            with contextlib.suppress(Exception):
+                                await sess.close()
                         await fp_chromium_kernel.stop(result)
                         if _fwd:
                             await _fwd.stop()
