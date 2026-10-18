@@ -10,5 +10,8 @@ __pycache__/
 *.py[cod]
 .venv/
 
+# IDE / 工具临时目录（Trae 等编辑器的工作区草稿）
+.trae/
+
 # 浏览器内核二进制（体积大，按文档/脚本自行安装；install_fpchromium.sh 会自动下载）
 tools/fp-chromium/
