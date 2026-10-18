@@ -104,11 +104,19 @@ class LaunchManager:
                 raise LaunchError(f"环境 {profile['name']} 正在启动中")
             self._starting.add(profile_id)
         try:
+            # 提前初始化：异常清理路径（except 块）需要它，早于代理/配置的失败
+            # 都必须能安全走到清理逻辑
+            forwarder: AuthProxyForwarder | None = None
             user_data_dir = PROFILE_ROOT / profile_id
             user_data_dir.mkdir(parents=True, exist_ok=True)
 
             launch = LaunchConfig(**(profile.get("launch") or {}))
             launch = apply_preset(launch)  # 风控预设参数组合
+            # 移动端仅 fp-chromium 支持（CDP 设备仿真）：其余内核会把移动端参数
+            # 直接透传给 camoufox 启动参数而报错，这里提前给出明确错误
+            if (profile.get("target_os") in ("android", "ios")
+                    and profile["kernel"] != fp_chromium_kernel.KERNEL_NAME):
+                raise LaunchError("移动端目标 OS（android/ios）仅支持 fp-chromium 内核")
             # 环境自身未配代理时，兜底使用全局代理
             proxy_data = profile.get("proxy") or security.get_global_proxy()
             proxy = ProxyConfig(**proxy_data) if proxy_data else None
@@ -120,7 +128,6 @@ class LaunchManager:
                     proxy = proxy.model_copy(update={"host": real_ip})
 
             # Chromium 系内核不支持带账密代理命令行：本地起认证转发器桥接
-            forwarder: AuthProxyForwarder | None = None
             kernel_proxy = proxy
             if (profile["kernel"] in (fp_chromium_kernel.KERNEL_NAME,
                                       chromium_kernel.KERNEL_NAME)

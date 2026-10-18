@@ -358,11 +358,14 @@
           </select>
         </label>
         <label>目标 OS（决定指纹的操作系统特征）
-          <select name="target_os">
+          <select name="target_os" id="targetOsSelect">
             <option value="windows">Windows</option>
             <option value="macos">macOS</option>
             <option value="linux">Linux</option>
+            <option value="android">Android（移动端仿真）</option>
+            <option value="ios">iOS（移动端仿真）</option>
           </select>
+          <small class="muted" id="mobileHint" style="display:none">移动端仅支持 fp-chromium 内核（已自动切换），指纹按真实机型合成生成</small>
         </label>
         <label>指纹模式
           <select name="fingerprint_mode" id="fpModeSelect">

@@ -255,6 +255,22 @@ async function runReadiness(id) {
 
 /* ------------------------------------------------ 环境表单 */
 
+/* 移动端目标 OS（android/ios）仅 fp-chromium 内核支持（CDP 设备仿真）：
+   选中移动端时自动切换内核、强制合成生成指纹，并提示原因 */
+function isMobileTargetOs() {
+  return ["android", "ios"].includes($("#targetOsSelect").value);
+}
+
+function syncMobileOptionState() {
+  const f = $("#profileForm");
+  const mobile = isMobileTargetOs();
+  $("#mobileHint").style.display = mobile ? "" : "none";
+  if (!mobile) return;
+  if (f.kernel.value !== "fp-chromium") f.kernel.value = "fp-chromium";
+  // 移动端暂无真实预设库，一律合成生成
+  f.fingerprint_mode.value = "generate";
+}
+
 function openProfileModal(profile, batchMode = false) {
   editingId = profile ? profile.id : null;
   $("#profileModalTitle").textContent = batchMode ? "批量新建环境"
@@ -291,6 +307,7 @@ function openProfileModal(profile, batchMode = false) {
     }
   }
   $("#proxyResult").textContent = "";
+  syncMobileOptionState();
   $("#profileModal").classList.remove("hidden");
 }
 
@@ -337,6 +354,21 @@ function collectProfileForm() {
 
 $("#btnNew").addEventListener("click", () => openProfileModal(null, false));
 $("#btnBatchNew").addEventListener("click", () => openProfileModal(null, true));
+
+// 移动端目标 OS 的内核/指纹模式联动（选中即自动切换，改回也恢复自由选择）
+$("#targetOsSelect").addEventListener("change", syncMobileOptionState);
+$("#kernelSelect").addEventListener("change", () => {
+  if (isMobileTargetOs() && $("#profileForm").kernel.value !== "fp-chromium") {
+    $("#kernelSelect").value = "fp-chromium";
+    toast("移动端目标 OS 仅支持 fp-chromium 内核");
+  }
+});
+$("#fpModeSelect").addEventListener("change", () => {
+  if (isMobileTargetOs() && $("#profileForm").fingerprint_mode.value === "preset") {
+    $("#profileForm").fingerprint_mode.value = "generate";
+    toast("移动端暂无真实预设库，已使用合成生成");
+  }
+});
 
 $("#profileForm").addEventListener("submit", async (e) => {
   e.preventDefault();

@@ -277,6 +277,16 @@ def _check_kernel_available(kernel: str) -> None:
         raise ApiError(400, chromium_kernel.is_available()[1])
 
 
+def _check_mobile_target(kernel: str, target_os: str) -> None:
+    """移动端目标 OS（android/ios）目前仅 fp-chromium 内核支持（CDP 设备仿真）。
+
+    camoufox/chromium 内核无法伪装移动端：放行只会创建出启动必然失败
+    （内核参数不支持）或呈现桌面指纹穿帮的环境，这里在入口处直接拒绝。
+    """
+    if target_os in ("android", "ios") and kernel != "fp-chromium":
+        raise ApiError(400, "移动端目标 OS（android/ios）仅支持 fp-chromium 内核")
+
+
 # ---------------------------------------------------------------- 系统 / 认证 / 成员
 
 @app.get("/api/v1/status")
@@ -529,6 +539,7 @@ async def list_profiles(request: Request, group: Optional[str] = None) -> dict:
 async def create_profile(request: Request, body: ProfileCreate) -> dict:
     member = member_of(request)
     _check_kernel_available(body.kernel)
+    _check_mobile_target(body.kernel, body.target_os)
     fingerprint = create_fingerprint(body.target_os, body.fingerprint_mode)
     p = db.create_profile(
         name=body.name,
@@ -549,6 +560,7 @@ async def create_profile(request: Request, body: ProfileCreate) -> dict:
 async def create_profiles_batch(request: Request, body: ProfileBatchCreate) -> dict:
     member = member_of(request)
     _check_kernel_available(body.template.kernel)
+    _check_mobile_target(body.template.kernel, body.template.target_os)
     created = []
     for i in range(body.count):
         proxy = None
@@ -598,6 +610,8 @@ async def update_profile(request: Request, profile_id: str, body: ProfileUpdate)
     # 与创建路径保持一致：改成本机不可用的内核（如 macOS 上的 fp-chromium）应拒绝
     if body.kernel is not None and body.kernel != p["kernel"]:
         _check_kernel_available(body.kernel)
+    # 移动端配对校验按「改后的生效值」判断（可能只改 kernel 或只改 target_os）
+    _check_mobile_target(body.kernel or p["kernel"], body.target_os or p["target_os"])
 
     updates: dict[str, Any] = {}
     if body.name is not None:
