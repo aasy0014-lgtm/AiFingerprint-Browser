@@ -188,15 +188,26 @@ class LaunchManager:
                     _fwd = forwarder
                     
                     # --- 移动端 CDP 注入 ---
+                    # 注入规格直接取自存储指纹（保证「存储值 = 运行期值」）
                     info = result.get("info", {})
+                    fd = profile.get("fingerprint") or {}
+                    fp_section = fd.get("fingerprint") or {}
                     viewport = info.get("mobile_viewport")
                     dpr = info.get("mobile_dpr", 1.0)
                     ua = info.get("mobile_ua", "")
                     platform = info.get("mobile_platform", "")
-                    max_touch = int(info.get("mobile_max_touch") or 10)
+                    max_touch = int(info.get("mobile_max_touch") or 5)
                     start_url_final = info.get("mobile_start_url") or ""
                     mobile_session = None
-                    if viewport or ua:
+                    if is_mobile and fp_section:
+                        mobile_session = MobileEmulationSession(
+                            info["ws_endpoint"],
+                            fingerprint=fp_section,
+                            target_os=target_os,
+                            locale=launch.locale or "",
+                            start_url=start_url_final,
+                        )
+                    elif viewport or ua:
                         mobile_session = MobileEmulationSession(
                             info["ws_endpoint"],
                             viewport=viewport, dpr=dpr, ua=ua, platform=platform,
@@ -226,9 +237,10 @@ class LaunchManager:
                                 await mobile_session.close()
                             return
                         inst.extra["mobile_session"] = mobile_session
-                        log.info("✅ 移动端仿真已生效 (OS=%s, 物理屏 %sx%s, DPR=%.1f)",
-                                 target_os, viewport.get("width") if viewport else 0,
-                                 viewport.get("height") if viewport else 0, dpr)
+                        log.info("✅ 移动端仿真已生效 (OS=%s, %s %s, CSS %sx%s @%.2fx, 视口高 %s)",
+                                 target_os, fd.get("manufacturer") or "", fd.get("device_model") or "",
+                                 mobile_session.css_w, mobile_session.css_h,
+                                 mobile_session.dpr, mobile_session.viewport_h)
                     
                     # 异步建立仿真（不阻塞启动流程），句柄随实例生命周期管理
                     mobile_task = asyncio.create_task(_setup_mobile_context())

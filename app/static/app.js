@@ -142,7 +142,7 @@ function renderRows() {
       <td>${proxy}</td>
       <td>
         <div class="mono" title="${esc(ua)}">${esc(uaShort)}</div>
-        <span class="tag ${p.fingerprint_summary?.mode === "真实预设" ? "preset" : "generate"}" style="margin-top:2px">${esc(mode)}</span>
+        <span class="tag ${(p.fingerprint_summary?.mode || "").includes("预设") ? "preset" : "generate"}" style="margin-top:2px">${esc(mode)}</span>
       </td>
       <td>${healthCell(p.fingerprint_summary)}</td>
       <td><span class="status ${p.running ? "running" : ""}"><span class="dot"></span>${p.running ? "运行中" : "已停止"}</span></td>
@@ -256,19 +256,61 @@ async function runReadiness(id) {
 /* ------------------------------------------------ 环境表单 */
 
 /* 移动端目标 OS（android/ios）仅 fp-chromium 内核支持（CDP 设备仿真）：
-   选中移动端时自动切换内核、强制合成生成指纹，并提示原因 */
+   选中移动端时自动切换内核、显示机型品牌选择器（真实机型库），
+   指纹模式 preset/generate 均可用（均为真实机型数据） */
 function isMobileTargetOs() {
   return ["android", "ios"].includes($("#targetOsSelect").value);
 }
 
-function syncMobileOptionState() {
+/* 移动端机型库（/api/v1/mobile-devices）懒加载缓存 */
+let mobileLibrary = null;
+
+async function ensureMobileLibrary() {
+  if (mobileLibrary) return mobileLibrary;
+  mobileLibrary = await api("GET", "/mobile-devices");
+  return mobileLibrary;
+}
+
+/* 按当前目标 OS 填充品牌下拉（Apple/Samsung/Google/Xiaomi/OnePlus） */
+function fillMobileBrands() {
+  const sel = $("#mobileBrandSelect");
+  const os = $("#targetOsSelect").value;
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">随机（按在网权重抽取）</option>';
+  if (!mobileLibrary || !["android", "ios"].includes(os)) return;
+  const byBrand = {};
+  (mobileLibrary.devices || [])
+    .filter((d) => d.platform === os)
+    .forEach((d) => { byBrand[d.brand] = (byBrand[d.brand] || 0) + 1; });
+  Object.keys(byBrand).sort().forEach((b) => {
+    const opt = document.createElement("option");
+    opt.value = b;
+    opt.textContent = `${b}（${byBrand[b]} 款机型）`;
+    sel.appendChild(opt);
+  });
+  sel.value = prev;
+}
+
+async function syncMobileOptionState(restoreBrand) {
   const f = $("#profileForm");
   const mobile = isMobileTargetOs();
   $("#mobileHint").style.display = mobile ? "" : "none";
-  if (!mobile) return;
+  $("#mobileBrandWrap").style.display = mobile ? "" : "none";
+  if (!mobile) {
+    $("#mobileBrandSelect").value = "";
+    return;
+  }
   if (f.kernel.value !== "fp-chromium") f.kernel.value = "fp-chromium";
-  // 移动端暂无真实预设库，一律合成生成
-  f.fingerprint_mode.value = "generate";
+  try {
+    await ensureMobileLibrary();
+  } catch (e) {
+    return; // 机型库加载失败：保持"随机"选项可用
+  }
+  fillMobileBrands();
+  // 注意：本函数也作为 change 事件处理器，事件对象不是品牌值
+  if (typeof restoreBrand === "string") {
+    $("#mobileBrandSelect").value = restoreBrand;
+  }
 }
 
 function openProfileModal(profile, batchMode = false) {
@@ -283,7 +325,7 @@ function openProfileModal(profile, batchMode = false) {
     if (profile) {
       f.kernel.value = profile.kernel;
       f.target_os.value = profile.target_os;
-      f.fingerprint_mode.value = profile.fingerprint_summary?.mode === "真实预设" ? "preset" : "generate";
+      f.fingerprint_mode.value = (profile.fingerprint_summary?.mode || "").includes("预设") ? "preset" : "generate";
       f.group_name.value = profile.group_name;
       f.name.value = profile.name;
       f.notes.value = profile.notes;
@@ -307,7 +349,8 @@ function openProfileModal(profile, batchMode = false) {
     }
   }
   $("#proxyResult").textContent = "";
-  syncMobileOptionState();
+  // 编辑移动端环境时恢复其机型品牌（品牌变化会触发重新生成指纹）
+  syncMobileOptionState(profile && !batchMode ? (profile.fingerprint_summary?.manufacturer || "") : "");
   $("#profileModal").classList.remove("hidden");
 }
 
@@ -346,6 +389,8 @@ function collectProfileForm() {
       kernel: fd.get("kernel"),
       target_os: fd.get("target_os"),
       fingerprint_mode: fd.get("fingerprint_mode"),
+      // 移动端机型品牌（仅 android/ios；空值 = 按在网权重随机）
+      manufacturer: isMobileTargetOs() ? (fd.get("manufacturer") || null) : null,
       proxy, launch,
     },
     regen: fd.get("regen_fingerprint") === "on",
@@ -361,12 +406,6 @@ $("#kernelSelect").addEventListener("change", () => {
   if (isMobileTargetOs() && $("#profileForm").kernel.value !== "fp-chromium") {
     $("#kernelSelect").value = "fp-chromium";
     toast("移动端目标 OS 仅支持 fp-chromium 内核");
-  }
-});
-$("#fpModeSelect").addEventListener("change", () => {
-  if (isMobileTargetOs() && $("#profileForm").fingerprint_mode.value === "preset") {
-    $("#profileForm").fingerprint_mode.value = "generate";
-    toast("移动端暂无真实预设库，已使用合成生成");
   }
 });
 

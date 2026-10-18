@@ -79,6 +79,8 @@ class ProfileCreate(BaseModel):
     kernel: KernelName = "camoufox"
     target_os: TargetOS = "windows"
     fingerprint_mode: FingerprintMode = "generate"
+    # 移动端机型库品牌筛选（android/ios 专用；留空=按在网权重随机）
+    manufacturer: Optional[str] = Field(default=None, max_length=32)
     proxy: Optional[ProxyConfig] = None
     launch: LaunchConfig = Field(default_factory=LaunchConfig)
 
@@ -98,6 +100,8 @@ class ProfileUpdate(BaseModel):
     kernel: Optional[KernelName] = None
     target_os: Optional[TargetOS] = None
     fingerprint_mode: Optional[FingerprintMode] = None
+    # 移动端机型库品牌筛选（改品牌会重新生成指纹）
+    manufacturer: Optional[str] = Field(default=None, max_length=32)
     proxy: Optional[ProxyConfig] = None
     launch: Optional[LaunchConfig] = None
     # 指纹重新生成开关：更新时传 regen_fingerprint=true 会为该环境换一套新指纹

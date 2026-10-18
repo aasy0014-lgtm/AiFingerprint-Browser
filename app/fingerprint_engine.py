@@ -5,14 +5,14 @@
 - preset:   Camoufox 内置的真实设备指纹预设库（真实采集数据）
 
 移动端 (Android/iOS):
-- generate: 基于真实移动设备数据库的合成指纹引擎（本项目的扩展实现）
-- preset: 暂不支持（可后续添加真实移动预设）
+- generate: 基于真实机型库（app/data/mobile_devices.json）的合成指纹
+- preset:   真实机型预设（机型库中系统/浏览器版本的主流组合）
 
 统一存储格式（fingerprint_json）:
 {
   "mode": "generate" | "preset",
-  "fingerprint": {...BrowserForge dump...} | null,
-  "preset": {...camoufox preset dict...} | null,
+  "fingerprint": {...BrowserForge dump / 移动端机型指纹...} | null,
+  "preset": {...camoufox preset dict...} | null,   # 仅桌面 preset 模式
   "seeds": {"canvas": int, "audio": int, "font_spacing": int},
   "fonts": [...该环境固定的字体子集...],
   "voices": [...] | null,        # preset 自带 speechVoices 时为 null（用预设的）
@@ -39,12 +39,15 @@ _GPU_OS_HINTS = {
 }
 
 
-def create_fingerprint(target_os: str, mode: str = "generate") -> dict[str, Any]:
-    """创建一套环境指纹（生成模式或真实预设模式）。"""
+def create_fingerprint(target_os: str, mode: str = "generate", manufacturer: Optional[str] = None) -> dict[str, Any]:
+    """创建一套环境指纹（生成模式或真实预设模式）。
+
+    manufacturer 仅移动端使用（机型库品牌筛选，留空则按权重随机）。
+    """
     # 移动端指纹使用专用引擎
     if target_os in ("android", "ios"):
         from .mobile_fingerprints import create_mobile_fingerprint
-        return create_mobile_fingerprint(target_os, mode)
+        return create_mobile_fingerprint(target_os, mode, manufacturer)
     
     data: dict[str, Any] = {
         "mode": mode,
@@ -189,8 +192,19 @@ def build_launch_kwargs(fingerprint_data: dict[str, Any]) -> dict[str, Any]:
 def check_health(fingerprint_data: dict[str, Any], target_os: str) -> dict[str, Any]:
     """静态一致性体检：跨信号矛盾是反检测的头号破绽，创建/更新时检查并落库。"""
     warnings: list[str] = []
+    is_mobile = target_os in ("android", "ios")
 
-    if fingerprint_data.get("mode") == "preset":
+    if is_mobile:
+        # 移动端数据始终存放在 fingerprint 字段（preset 仅是模式标签）
+        fp = fingerprint_data.get("fingerprint") or {}
+        nav = fp.get("navigator") or {}
+        screen = fp.get("screen") or {}
+        vc = fp.get("videoCard") or {}
+        extra = fp.get("mobileExtra") or {}
+        ua, platform = nav.get("userAgent", ""), nav.get("platform", "")
+        renderer = str(vc.get("renderer", ""))
+        hw = nav.get("hardwareConcurrency")
+    elif fingerprint_data.get("mode") == "preset" and (fingerprint_data.get("preset") or {}):
         nav = (fingerprint_data.get("preset") or {}).get("navigator") or {}
         screen = (fingerprint_data.get("preset") or {}).get("screen") or {}
         webgl = (fingerprint_data.get("preset") or {}).get("webgl") or {}
@@ -250,7 +264,7 @@ def check_health(fingerprint_data: dict[str, Any], target_os: str) -> dict[str, 
             dpr = float(screen.get("devicePixelRatio") or 0)
             if not 1.5 <= dpr <= 4.5:
                 warnings.append(f"移动端 devicePixelRatio 异常: {screen.get('devicePixelRatio')}")
-            elif w and not 300 <= w / dpr <= 1024:
+            elif w and not 300 <= w / dpr <= 1400:
                 warnings.append(f"移动端 CSS 视口宽度异常: {w / dpr:.0f}px")
     except (TypeError, ValueError):
         warnings.append("屏幕字段类型异常")
@@ -261,6 +275,66 @@ def check_health(fingerprint_data: dict[str, Any], target_os: str) -> dict[str, 
             warnings.append(f"hardwareConcurrency 异常: {hw}")
     except (TypeError, ValueError):
         warnings.append(f"hardwareConcurrency 非数值: {hw}")
+
+    # ---------------- 移动端专项检查 ----------------
+    if is_mobile:
+        extra = (fingerprint_data.get("fingerprint") or {}).get("mobileExtra") or {}
+        model = str(extra.get("model") or "")
+        os_version = str(extra.get("osVersion") or "")
+
+        # 屏幕 / DPR / CSS / 视口 相互印证
+        try:
+            phys_w = int(screen.get("width", 0))
+            dpr = float(screen.get("devicePixelRatio") or 0)
+            css_w = int(screen.get("cssWidth") or 0)
+            css_h = int(screen.get("cssHeight") or 0)
+            vp_h = int(screen.get("cssViewportHeight") or 0)
+            if phys_w and dpr and css_w and abs(round(phys_w / dpr) - css_w) > 1:
+                warnings.append(f"物理分辨率/DPR 与 CSS 宽度不一致: {phys_w}/{dpr} vs {css_w}")
+            if css_h and vp_h and not 0.5 * css_h <= vp_h <= 0.95 * css_h:
+                warnings.append(f"首屏视口高度异常: {vp_h}（屏幕 CSS 高度 {css_h}）")
+            if css_w and vp_h and vp_h > 0 and not 0.2 <= css_w / vp_h <= 1.6:
+                warnings.append(f"视口纵横比异常: {css_w}x{vp_h}")
+        except (TypeError, ValueError):
+            warnings.append("移动端屏幕字段类型异常")
+
+        # UA ↔ 机型 ↔ 系统版本 相互印证
+        if model and target_os == "android":
+            # 机型名可能含空格（Pixel 8 Pro），做整名匹配
+            if model not in ua:
+                warnings.append(f"UA 中未见机型标识 {model}")
+        if os_version:
+            if target_os == "android" and f"Android {os_version}" not in ua:
+                warnings.append(f"UA 中 Android 版本与档案不一致（应为 {os_version}）")
+            if target_os == "ios" and f"OS {os_version.replace('.', '_')}" not in ua:
+                warnings.append(f"UA 中 iOS 版本与档案不一致（应为 {os_version}）")
+
+        # UA-CH 语义：Android Chrome 必有，iOS Safari 必无
+        ua_ch = extra.get("uaCh")
+        if target_os == "android":
+            if not ua_ch:
+                warnings.append("Android 缺少 UA-CH 元数据")
+            elif model and str(ua_ch.get("model") or "") != model:
+                warnings.append("UA-CH model 与 UA 机型标识不一致")
+        elif ua_ch:
+            warnings.append("iOS 不应携带 UA-CH 元数据")
+
+        # Battery API 语义：Android Chrome 有，iOS Safari 无
+        battery = (fingerprint_data.get("fingerprint") or {}).get("battery")
+        if target_os == "android" and not (extra.get("hasBattery") and battery):
+            warnings.append("Android 缺少 Battery API 数据")
+        if target_os == "ios" and battery:
+            warnings.append("iOS 不应携带 Battery API 数据")
+
+        # GPU 字符串格式（按平台真实上报格式）
+        if target_os == "ios":
+            if renderer and renderer != "Apple GPU":
+                warnings.append(f"iOS WebGL 渲染器应为 Apple GPU: {renderer[:40]}")
+            if str((fingerprint_data.get("fingerprint") or {}).get("videoCard", {}).get("vendor") or "") != "Apple Inc.":
+                warnings.append(f"iOS WebGL 厂商应为 Apple Inc.: {(fingerprint_data.get('fingerprint') or {}).get('videoCard', {}).get('vendor')}")
+        else:
+            if renderer and not renderer.startswith("ANGLE ("):
+                warnings.append(f"Android WebGL 渲染器应为 ANGLE 格式: {renderer[:40]}")
 
     # 固定要素齐全
     seeds = fingerprint_data.get("seeds") or {}
@@ -283,23 +357,33 @@ def summarize(fingerprint_data: dict[str, Any]) -> dict[str, Any]:
         fp = fingerprint_data.get("fingerprint", {}) or {}
         nav = fp.get("navigator", {}) or {}
         screen = fp.get("screen", {}) or {}
-        
+        extra = fp.get("mobileExtra", {}) or {}
+
         # 从 videoCard 获取 GPU（移动端可能不存在）
         vc = fp.get("videoCard") or {}
         renderer = vc.get("renderer")
-        
+
+        mode = fingerprint_data.get("mode", "generate")
+        screen_desc = None
+        if screen.get("width"):
+            screen_desc = f"{screen.get('width')}x{screen.get('height')}@{screen.get('colorDepth')}"
+            if screen.get("cssWidth"):
+                screen_desc += f" (css {screen['cssWidth']}x{screen.get('cssViewportHeight') or screen.get('cssHeight')})"
+
         return {
-            "mode": "合成生成 (移动端)",
+            "mode": "真实机型预设 (移动端)" if mode == "preset" else "合成生成 (移动端)",
             "user_agent": nav.get("userAgent"),
             "platform": nav.get("platform"),
             "languages": nav.get("languages"),
             "hardware_concurrency": nav.get("hardwareConcurrency"),
             "device_memory": nav.get("deviceMemory"),
             "max_touch_points": nav.get("maxTouchPoints"),
-            "screen": f"{screen.get('width')}x{screen.get('height')}@{screen.get('colorDepth')}" if screen.get("width") else None,
+            "screen": screen_desc,
             "webgl_renderer": renderer,
             "manufacturer": fingerprint_data.get("manufacturer", "Unknown"),
             "device_model": fingerprint_data.get("device_model"),
+            "os_version": extra.get("osVersion"),
+            "browser": f"{extra.get('browser')} {extra.get('browserVersion')}".strip() if extra.get("browser") else None,
             "fonts_count": len(fp.get("fonts", []) or []),
             "seeds": fingerprint_data.get("seeds"),
             "health": fingerprint_data.get("health", {"score": 100, "warnings": []}),

@@ -1,0 +1,321 @@
+{
+  "version": "2026.10",
+  "updated": "2026-10-18",
+  "notes": "移动端真实机型指纹库。屏幕/DPR/CSS 视口取自 Chrome DevTools 设备库实测值（Playwright deviceDescriptors）与厂商公开规格；GPU 字符串为对应 SoC 在 Chrome(ANGLE) / Safari 下的真实 WebGL 上报格式；系统版本分布为 2026-10 各机型的在网份额近似值。新增机型时按同结构追加即可。",
+  "android_browsers": [
+    {"major": "156", "full": "156.0.8078.35", "weight": 40},
+    {"major": "156", "full": "156.0.8078.36", "weight": 10},
+    {"major": "155", "full": "155.0.7980.86", "weight": 20},
+    {"major": "154", "full": "154.0.7861.102", "weight": 16},
+    {"major": "153", "full": "153.0.7763.98", "weight": 14}
+  ],
+  "grease_brand": {"brand": "Not_A Brand", "version": "8"},
+  "devices": [
+    {
+      "brand": "Samsung", "platform": "android", "type": "phone",
+      "model": "SM-S928B", "market_name": "Galaxy S24 Ultra", "released": "2024-01",
+      "weight": 4,
+      "screen": {"w": 1440, "h": 3120, "dpr": 3.75, "css_w": 384, "css_h": 832, "viewport_h": 756},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 40, "17": 25, "15": 25, "14": 10}
+    },
+    {
+      "brand": "Samsung", "platform": "android", "type": "phone",
+      "model": "SM-S931B", "market_name": "Galaxy S25", "released": "2025-02",
+      "weight": 4,
+      "screen": {"w": 1080, "h": 2340, "dpr": 3.0, "css_w": 360, "css_h": 780, "viewport_h": 704},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 830, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 40, "17": 35, "15": 25}
+    },
+    {
+      "brand": "Samsung", "platform": "android", "type": "phone",
+      "model": "SM-S938B", "market_name": "Galaxy S25 Ultra", "released": "2025-02",
+      "weight": 3,
+      "screen": {"w": 1440, "h": 3120, "dpr": 3.75, "css_w": 384, "css_h": 832, "viewport_h": 756},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 830, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 40, "17": 35, "15": 25}
+    },
+    {
+      "brand": "Samsung", "platform": "android", "type": "phone",
+      "model": "SM-S911B", "market_name": "Galaxy S23", "released": "2023-02",
+      "weight": 6,
+      "screen": {"w": 1080, "h": 2340, "dpr": 3.0, "css_w": 360, "css_h": 780, "viewport_h": 704},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 740, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 8, "max_touch_points": 5,
+      "os_versions": {"15": 35, "16": 35, "14": 15, "17": 15}
+    },
+    {
+      "brand": "Samsung", "platform": "android", "type": "phone",
+      "model": "SM-A556B", "market_name": "Galaxy A55", "released": "2024-03",
+      "weight": 10,
+      "screen": {"w": 1080, "h": 2340, "dpr": 2.25, "css_w": 480, "css_h": 1040, "viewport_h": 964},
+      "gpu": {"vendor": "Samsung", "renderer": "ANGLE (Samsung, Xclipse 530, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 8, "max_touch_points": 5,
+      "os_versions": {"15": 40, "16": 35, "14": 15, "17": 10}
+    },
+    {
+      "brand": "Samsung", "platform": "android", "type": "tablet",
+      "model": "SM-X710", "market_name": "Galaxy Tab S9", "released": "2023-08",
+      "weight": 1,
+      "screen": {"w": 1600, "h": 2560, "dpr": 2.5, "css_w": 640, "css_h": 1024, "viewport_h": 948},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 740, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 8, "max_touch_points": 5,
+      "os_versions": {"15": 35, "16": 40, "14": 15, "17": 10}
+    },
+    {
+      "brand": "Samsung", "platform": "android", "type": "tablet",
+      "model": "SM-X810", "market_name": "Galaxy Tab S9+", "released": "2023-08",
+      "weight": 1,
+      "screen": {"w": 1752, "h": 2800, "dpr": 2.5, "css_w": 700, "css_h": 1120, "viewport_h": 1044},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 740, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"15": 35, "16": 40, "14": 15, "17": 10}
+    },
+    {
+      "brand": "Google", "platform": "android", "type": "phone",
+      "model": "Pixel 8", "market_name": "Pixel 8", "released": "2023-10",
+      "weight": 4,
+      "screen": {"w": 1080, "h": 2400, "dpr": 2.625, "css_w": 412, "css_h": 915, "viewport_h": 839},
+      "gpu": {"vendor": "ARM", "renderer": "ANGLE (ARM, Mali-G715-Immortalis MC10, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 8, "max_touch_points": 5,
+      "os_versions": {"16": 40, "17": 35, "15": 20, "14": 5}
+    },
+    {
+      "brand": "Google", "platform": "android", "type": "phone",
+      "model": "Pixel 8 Pro", "market_name": "Pixel 8 Pro", "released": "2023-10",
+      "weight": 2,
+      "screen": {"w": 1344, "h": 2992, "dpr": 3.0, "css_w": 448, "css_h": 997, "viewport_h": 921},
+      "gpu": {"vendor": "ARM", "renderer": "ANGLE (ARM, Mali-G715-Immortalis MC10, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 40, "17": 35, "15": 20, "14": 5}
+    },
+    {
+      "brand": "Google", "platform": "android", "type": "phone",
+      "model": "Pixel 9", "market_name": "Pixel 9", "released": "2024-08",
+      "weight": 4,
+      "screen": {"w": 1080, "h": 2424, "dpr": 3.0, "css_w": 360, "css_h": 808, "viewport_h": 732},
+      "gpu": {"vendor": "ARM", "renderer": "ANGLE (ARM, Mali-G715-Immortalis MC10, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 40, "17": 45, "15": 15}
+    },
+    {
+      "brand": "Google", "platform": "android", "type": "phone",
+      "model": "Pixel 9 Pro", "market_name": "Pixel 9 Pro", "released": "2024-08",
+      "weight": 3,
+      "screen": {"w": 1280, "h": 2856, "dpr": 3.0, "css_w": 427, "css_h": 952, "viewport_h": 876},
+      "gpu": {"vendor": "ARM", "renderer": "ANGLE (ARM, Mali-G715-Immortalis MC10, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 16, "max_touch_points": 5,
+      "os_versions": {"16": 40, "17": 45, "15": 15}
+    },
+    {
+      "brand": "Google", "platform": "android", "type": "phone",
+      "model": "Pixel 10", "market_name": "Pixel 10", "released": "2025-08",
+      "weight": 3,
+      "screen": {"w": 1080, "h": 2424, "dpr": 3.0, "css_w": 360, "css_h": 808, "viewport_h": 732},
+      "gpu": {"vendor": "Imagination Technologies", "renderer": "ANGLE (Imagination Technologies, PowerVR DXT-48-1536, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 45, "17": 50, "15": 5}
+    },
+    {
+      "brand": "Google", "platform": "android", "type": "phone",
+      "model": "Pixel 10 Pro", "market_name": "Pixel 10 Pro", "released": "2025-08",
+      "weight": 2,
+      "screen": {"w": 1280, "h": 2856, "dpr": 3.0, "css_w": 427, "css_h": 952, "viewport_h": 876},
+      "gpu": {"vendor": "Imagination Technologies", "renderer": "ANGLE (Imagination Technologies, PowerVR DXT-48-1536, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 16, "max_touch_points": 5,
+      "os_versions": {"16": 45, "17": 50, "15": 5}
+    },
+    {
+      "brand": "Xiaomi", "platform": "android", "type": "phone",
+      "model": "23127PN0CC", "market_name": "Xiaomi 14", "released": "2023-10",
+      "weight": 5,
+      "screen": {"w": 1200, "h": 2670, "dpr": 3.0, "css_w": 400, "css_h": 890, "viewport_h": 814},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 40, "15": 30, "17": 15, "14": 15}
+    },
+    {
+      "brand": "Xiaomi", "platform": "android", "type": "phone",
+      "model": "24129PN74C", "market_name": "Xiaomi 15", "released": "2024-10",
+      "weight": 4,
+      "screen": {"w": 1200, "h": 2670, "dpr": 3.0, "css_w": 400, "css_h": 890, "viewport_h": 814},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 830, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 45, "17": 35, "15": 20}
+    },
+    {
+      "brand": "Xiaomi", "platform": "android", "type": "phone",
+      "model": "Redmi Note 13 Pro", "market_name": "Redmi Note 13 Pro", "released": "2023-09",
+      "weight": 10,
+      "screen": {"w": 1220, "h": 2712, "dpr": 2.75, "css_w": 444, "css_h": 986, "viewport_h": 910},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 710, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 8, "max_touch_points": 5,
+      "os_versions": {"15": 35, "14": 30, "16": 25, "13": 10}
+    },
+    {
+      "brand": "OnePlus", "platform": "android", "type": "phone",
+      "model": "CPH2581", "market_name": "OnePlus 12", "released": "2023-12",
+      "weight": 3,
+      "screen": {"w": 1440, "h": 3168, "dpr": 3.5, "css_w": 411, "css_h": 905, "viewport_h": 829},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"15": 35, "16": 35, "14": 20, "17": 10}
+    },
+    {
+      "brand": "OnePlus", "platform": "android", "type": "phone",
+      "model": "PJZ110", "market_name": "OnePlus 13", "released": "2024-10",
+      "weight": 3,
+      "screen": {"w": 1440, "h": 3168, "dpr": 3.5, "css_w": 411, "css_h": 905, "viewport_h": 829},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 830, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 45, "17": 30, "15": 25}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "phone",
+      "model": "iPhone 17 Pro Max", "market_name": "iPhone 17 Pro Max", "released": "2025-09",
+      "weight": 6,
+      "screen": {"w": 1320, "h": 2868, "dpr": 3.0, "css_w": 440, "css_h": 956, "viewport_h": 763},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 12, "max_touch_points": 5,
+      "ios_versions": {"27.0.1": 35, "27.0": 25, "26.6": 25, "26.5": 15}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "phone",
+      "model": "iPhone 17", "market_name": "iPhone 17", "released": "2025-09",
+      "weight": 7,
+      "screen": {"w": 1206, "h": 2622, "dpr": 3.0, "css_w": 402, "css_h": 874, "viewport_h": 681},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 8, "max_touch_points": 5,
+      "ios_versions": {"27.0.1": 35, "27.0": 25, "26.6": 25, "26.5": 15}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "phone",
+      "model": "iPhone Air", "market_name": "iPhone Air", "released": "2025-09",
+      "weight": 3,
+      "screen": {"w": 1260, "h": 2736, "dpr": 3.0, "css_w": 420, "css_h": 912, "viewport_h": 719},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 12, "max_touch_points": 5,
+      "ios_versions": {"27.0.1": 35, "27.0": 25, "26.6": 25, "26.5": 15}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "phone",
+      "model": "iPhone 16 Pro Max", "market_name": "iPhone 16 Pro Max", "released": "2024-09",
+      "weight": 5,
+      "screen": {"w": 1320, "h": 2868, "dpr": 3.0, "css_w": 440, "css_h": 956, "viewport_h": 763},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 8, "max_touch_points": 5,
+      "ios_versions": {"26.6": 30, "26.5": 25, "27.0.1": 20, "27.0": 15, "18.6": 10}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "phone",
+      "model": "iPhone 16", "market_name": "iPhone 16", "released": "2024-09",
+      "weight": 9,
+      "screen": {"w": 1179, "h": 2556, "dpr": 3.0, "css_w": 393, "css_h": 852, "viewport_h": 659},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 8, "max_touch_points": 5,
+      "ios_versions": {"26.6": 30, "26.5": 25, "27.0.1": 20, "18.6": 15, "27.0": 10}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "phone",
+      "model": "iPhone 16e", "market_name": "iPhone 16e", "released": "2025-02",
+      "weight": 4,
+      "screen": {"w": 1170, "h": 2532, "dpr": 3.0, "css_w": 390, "css_h": 844, "viewport_h": 651},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 8, "max_touch_points": 5,
+      "ios_versions": {"26.6": 30, "26.5": 25, "27.0.1": 20, "18.6": 15, "27.0": 10}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "phone",
+      "model": "iPhone 15", "market_name": "iPhone 15", "released": "2023-09",
+      "weight": 10,
+      "screen": {"w": 1179, "h": 2556, "dpr": 3.0, "css_w": 393, "css_h": 852, "viewport_h": 659},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 6, "max_touch_points": 5,
+      "ios_versions": {"26.6": 30, "26.5": 25, "18.6": 20, "27.0.1": 15, "17.5.1": 10}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "phone",
+      "model": "iPhone 15 Pro Max", "market_name": "iPhone 15 Pro Max", "released": "2023-09",
+      "weight": 6,
+      "screen": {"w": 1290, "h": 2796, "dpr": 3.0, "css_w": 430, "css_h": 932, "viewport_h": 739},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 8, "max_touch_points": 5,
+      "ios_versions": {"26.6": 30, "26.5": 25, "18.6": 20, "27.0.1": 15, "17.5.1": 10}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "phone",
+      "model": "iPhone 14", "market_name": "iPhone 14", "released": "2022-09",
+      "weight": 8,
+      "screen": {"w": 1170, "h": 2532, "dpr": 3.0, "css_w": 390, "css_h": 844, "viewport_h": 651},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 6, "max_touch_points": 5,
+      "ios_versions": {"26.6": 35, "18.6": 25, "26.5": 20, "17.7": 20}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "phone",
+      "model": "iPhone 13", "market_name": "iPhone 13", "released": "2021-09",
+      "weight": 9,
+      "screen": {"w": 1170, "h": 2532, "dpr": 3.0, "css_w": 390, "css_h": 844, "viewport_h": 651},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 4, "max_touch_points": 5,
+      "ios_versions": {"26.6": 35, "18.6": 25, "26.5": 20, "17.7": 20}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "phone",
+      "model": "iPhone SE (3rd generation)", "market_name": "iPhone SE 3", "released": "2022-03",
+      "weight": 2,
+      "screen": {"w": 750, "h": 1334, "dpr": 2.0, "css_w": 375, "css_h": 667, "viewport_h": 553},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 4, "max_touch_points": 5,
+      "ios_versions": {"26.6": 40, "18.6": 25, "17.7": 20, "26.5": 15}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "tablet",
+      "model": "iPad Pro 13", "market_name": "iPad Pro 13\" (M4)", "released": "2024-05",
+      "weight": 2,
+      "screen": {"w": 2064, "h": 2752, "dpr": 2.0, "css_w": 1032, "css_h": 1376, "viewport_h": 1276},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 9, "ram_gb": 8, "max_touch_points": 5,
+      "ios_versions": {"26.6": 40, "26.5": 25, "27.0.1": 15, "27.0": 10, "18.6": 10}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "tablet",
+      "model": "iPad Pro 11", "market_name": "iPad Pro 11\" (M4)", "released": "2024-05",
+      "weight": 2,
+      "screen": {"w": 1668, "h": 2420, "dpr": 2.0, "css_w": 834, "css_h": 1210, "viewport_h": 1110},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 9, "ram_gb": 8, "max_touch_points": 5,
+      "ios_versions": {"26.6": 40, "26.5": 25, "27.0.1": 15, "27.0": 10, "18.6": 10}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "tablet",
+      "model": "iPad Air 13", "market_name": "iPad Air 13\" (M3)", "released": "2025-03",
+      "weight": 2,
+      "screen": {"w": 2048, "h": 2732, "dpr": 2.0, "css_w": 1024, "css_h": 1366, "viewport_h": 1266},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 8, "ram_gb": 8, "max_touch_points": 5,
+      "ios_versions": {"26.6": 40, "26.5": 25, "27.0.1": 15, "27.0": 10, "18.6": 10}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "tablet",
+      "model": "iPad mini (A17 Pro)", "market_name": "iPad mini 7", "released": "2024-10",
+      "weight": 2,
+      "screen": {"w": 1488, "h": 2266, "dpr": 2.0, "css_w": 744, "css_h": 1133, "viewport_h": 1033},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 8, "max_touch_points": 5,
+      "ios_versions": {"26.6": 40, "26.5": 25, "27.0.1": 15, "27.0": 10, "18.6": 10}
+    },
+    {
+      "brand": "Apple", "platform": "ios", "type": "tablet",
+      "model": "iPad (A16)", "market_name": "iPad 11", "released": "2025-03",
+      "weight": 3,
+      "screen": {"w": 1640, "h": 2360, "dpr": 2.0, "css_w": 820, "css_h": 1180, "viewport_h": 1080},
+      "gpu": {"vendor": "Apple Inc.", "renderer": "Apple GPU"},
+      "cpu_cores": 6, "ram_gb": 6, "max_touch_points": 5,
+      "ios_versions": {"26.6": 40, "26.5": 25, "27.0.1": 15, "18.6": 10, "27.0": 10}
+    }
+  ]
+}

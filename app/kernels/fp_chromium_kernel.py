@@ -127,17 +127,26 @@ async def start(
         raise RuntimeError("环境指纹数据缺少种子，请重新生成指纹")
 
     nav = {}
-    if fingerprint_data.get("mode") == "preset":
+    fp_section = fingerprint_data.get("fingerprint") or {}
+    mobile_extra = fp_section.get("mobileExtra") or {}
+    if fingerprint_data.get("mode") == "preset" and fingerprint_data.get("preset"):
         nav = (fingerprint_data.get("preset") or {}).get("navigator") or {}
     else:
         nav = (fingerprint_data.get("fingerprint") or {}).get("navigator") or {}
+
+    # 平台版本：移动端优先取机型档案中的真实系统版本（与 UA/UA-CH 一致）
+    platform_version = launch.fp_platform_version
+    if not platform_version and target_os in ("android", "ios"):
+        platform_version = mobile_extra.get("platformVersionCh")
+    if not platform_version:
+        platform_version = _stable_platform_version(target_os, seed)
 
     port = _free_port()
     args = [
         exe,
         f"--fingerprint={seed}",
         f"--fingerprint-platform={_PLATFORM_ARG.get(target_os, 'windows')}",
-        f"--fingerprint-platform-version={launch.fp_platform_version or _stable_platform_version(target_os, seed)}",
+        f"--fingerprint-platform-version={platform_version}",
         "--fingerprint-brand=Chrome",
         f"--remote-debugging-port={port}",
         f"--user-data-dir={user_data_dir}",
@@ -180,27 +189,27 @@ async def start(
     mobile_dpr = 1.0
     mobile_ua = ua
     mobile_platform = nav.get("platform", "")
-    mobile_max_touch = int(nav.get("maxTouchPoints") or 10)
+    mobile_max_touch = int(nav.get("maxTouchPoints") or 5)
     mobile_start_url = start_url or launch.start_url or ""
     if mobile_mode or mobile_target_os in ("android", "ios"):
-        # 从指纹数据读取移动端屏幕信息（物理分辨率）
-        screen = (fingerprint_data.get("fingerprint") or {}).get("screen", {})
+        # 从指纹数据读取移动端屏幕信息（物理分辨率 + CSS 逻辑尺寸）
+        screen = fp_section.get("screen", {})
         if screen.get("width") and screen.get("height"):
             mobile_viewport = {
                 "width": screen["width"],
                 "height": screen["height"],
             }
             mobile_dpr = screen.get("devicePixelRatio", 2.5)
-        
+
         # 确保 UA 正确
         if not mobile_ua:
             mobile_ua = nav.get("userAgent", "")
-        
+
         # 桌面内核上的移动仿真：窗口尺寸按 CSS 逻辑像素（物理 / DPR）预留，
-        # UA / navigator.mobile / 屏幕尺寸等由 CDP 注入层补齐（mobile_cdp_injector）
+        # UA / UA-CH / 屏幕 / GPU / 色深等由 CDP 注入层补齐（mobile_cdp_injector）
         if mobile_viewport:
-            css_w = round(mobile_viewport["width"] / (mobile_dpr or 1.0))
-            css_h = round(mobile_viewport["height"] / (mobile_dpr or 1.0))
+            css_w = screen.get("cssWidth") or round(mobile_viewport["width"] / (mobile_dpr or 1.0))
+            css_h = screen.get("cssHeight") or round(mobile_viewport["height"] / (mobile_dpr or 1.0))
             args.append(f"--window-size={css_w},{css_h + 130}")
         args.append("--touch-events=enabled")
         if mobile_ua:

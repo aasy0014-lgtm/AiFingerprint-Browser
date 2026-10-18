@@ -365,12 +365,17 @@
             <option value="android">Android（移动端仿真）</option>
             <option value="ios">iOS（移动端仿真）</option>
           </select>
-          <small class="muted" id="mobileHint" style="display:none">移动端仅支持 fp-chromium 内核（已自动切换），指纹按真实机型合成生成</small>
+          <small class="muted" id="mobileHint" style="display:none">移动端仅支持 fp-chromium 内核（已自动切换）；指纹基于真实机型库生成（屏幕 / DPR / GPU / UA-CH / 系统版本均按真机参数）</small>
+        </label>
+        <label id="mobileBrandWrap" style="display:none">机型品牌（移动端）
+          <select name="manufacturer" id="mobileBrandSelect">
+            <option value="">随机（按在网权重抽取）</option>
+          </select>
         </label>
         <label>指纹模式
           <select name="fingerprint_mode" id="fpModeSelect">
-            <option value="generate">合成生成（BrowserForge，无限独特组合）</option>
-            <option value="preset">真实预设（真实设备指纹库）</option>
+            <option value="generate">合成生成（真实机型库随机组合）</option>
+            <option value="preset">真实预设（真实设备 / 机型指纹库）</option>
           </select>
         </label>
         <label id="batchCountWrap" style="display:none">批量数量

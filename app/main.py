@@ -287,6 +287,16 @@ def _check_mobile_target(kernel: str, target_os: str) -> None:
         raise ApiError(400, "移动端目标 OS（android/ios）仅支持 fp-chromium 内核")
 
 
+def _check_mobile_manufacturer(target_os: str, manufacturer: Optional[str]) -> None:
+    """移动端品牌必须存在于机型库（仅 android/ios 且显式指定时校验）。"""
+    if not manufacturer or target_os not in ("android", "ios"):
+        return
+    from .mobile_fingerprints import list_brands
+    brands = list_brands(target_os).get(target_os) or []
+    if manufacturer not in brands:
+        raise ApiError(400, f"机型库中不存在品牌 {manufacturer}（{target_os} 可选: {', '.join(brands)}）")
+
+
 # ---------------------------------------------------------------- 系统 / 认证 / 成员
 
 @app.get("/api/v1/status")
@@ -506,6 +516,16 @@ async def risk_presets() -> dict:
     return ok(PRESET_DOC)
 
 
+@app.get("/api/v1/mobile-devices")
+async def mobile_devices(request: Request) -> dict:
+    """移动端真实机型库信息（品牌选择器与机型清单展示用）。"""
+    member_of(request)
+    from .mobile_fingerprints import library_info, library_devices
+    info = library_info()
+    info["devices"] = library_devices()
+    return ok(info)
+
+
 @app.post("/api/v1/profiles/{profile_id}/readiness")
 async def profile_readiness(request: Request, profile_id: str) -> dict:
     """环境就绪度检测：实测 IP/时区/语言/WebRTC/webdriver/Canvas 等一致性（约 10~40 秒）。"""
@@ -540,7 +560,8 @@ async def create_profile(request: Request, body: ProfileCreate) -> dict:
     member = member_of(request)
     _check_kernel_available(body.kernel)
     _check_mobile_target(body.kernel, body.target_os)
-    fingerprint = create_fingerprint(body.target_os, body.fingerprint_mode)
+    _check_mobile_manufacturer(body.target_os, body.manufacturer)
+    fingerprint = create_fingerprint(body.target_os, body.fingerprint_mode, body.manufacturer)
     p = db.create_profile(
         name=body.name,
         group_name=body.group_name,
@@ -561,6 +582,7 @@ async def create_profiles_batch(request: Request, body: ProfileBatchCreate) -> d
     member = member_of(request)
     _check_kernel_available(body.template.kernel)
     _check_mobile_target(body.template.kernel, body.template.target_os)
+    _check_mobile_manufacturer(body.template.target_os, body.template.manufacturer)
     created = []
     for i in range(body.count):
         proxy = None
@@ -571,7 +593,8 @@ async def create_profiles_batch(request: Request, body: ProfileBatchCreate) -> d
         else:
             proxy = security.get_global_proxy()  # 未指定代理池/模板代理时继承全局代理
         fingerprint = create_fingerprint(
-            body.template.target_os, body.template.fingerprint_mode
+            body.template.target_os, body.template.fingerprint_mode,
+            body.template.manufacturer,
         )
         p = db.create_profile(
             name=f"{body.template.name}-{i + 1}",
@@ -612,6 +635,7 @@ async def update_profile(request: Request, profile_id: str, body: ProfileUpdate)
         _check_kernel_available(body.kernel)
     # 移动端配对校验按「改后的生效值」判断（可能只改 kernel 或只改 target_os）
     _check_mobile_target(body.kernel or p["kernel"], body.target_os or p["target_os"])
+    _check_mobile_manufacturer(body.target_os or p["target_os"], body.manufacturer)
 
     updates: dict[str, Any] = {}
     if body.name is not None:
@@ -636,13 +660,25 @@ async def update_profile(request: Request, profile_id: str, body: ProfileUpdate)
         regen = True  # 换 OS 必须重生成指纹，否则穿帮
     if body.fingerprint_mode and body.fingerprint_mode != p["fingerprint"].get("mode"):
         regen = True
+    effective_os = body.target_os or p["target_os"]
+    stored_brand = p["fingerprint"].get("manufacturer")
+    if (body.manufacturer is not None and effective_os in ("android", "ios")
+            and body.manufacturer != stored_brand):
+        regen = True  # 移动端换品牌必须重生成指纹
     if regen:
         import json as _json
 
         mode = body.fingerprint_mode or p["fingerprint"].get("mode", "generate")
-        os_ = body.target_os or p["target_os"]
+        os_ = effective_os
+        if body.manufacturer is not None:
+            brand = body.manufacturer
+        elif os_ in ("android", "ios"):
+            # 沿用环境当前的机型品牌（换 OS 后品牌不适用时引擎会回退随机）
+            brand = stored_brand or None
+        else:
+            brand = None
         updates["fingerprint_json"] = _json.dumps(
-            create_fingerprint(os_, mode), ensure_ascii=False
+            create_fingerprint(os_, mode, brand), ensure_ascii=False
         )
 
     updated = db.update_profile(profile_id, updates)

@@ -20,7 +20,9 @@ def _features(profile: dict) -> dict[str, Any]:
     fp = profile.get("fingerprint") or {}
     
     # 获取 UA、屏幕、GPU
-    if fp.get("mode") == "preset":
+    # 注意：移动端 preset 的机型数据同样存放在 fingerprint 字段
+    # （preset 字段仅桌面 camoufox 预设使用）
+    if fp.get("mode") == "preset" and (fp.get("preset") or {}):
         nav = (fp.get("preset") or {}).get("navigator") or {}
         screen = (fp.get("preset") or {}).get("screen") or {}
         webgl = (fp.get("preset") or {}).get("webgl") or {}

@@ -1,219 +1,187 @@
-"""移动端设备指纹生成器（Android/iOS）
+"""移动端真实机型指纹库（Android/iOS）
 
-由于 BrowserForge 官方不支持移动平台，本项目实现一套基于真实移动设备指纹数据的
-合成生成引擎。数据来源于：
-1. UA 字符串库（https://user-agents.net/）
-2. Android/iOS 设备特征数据库（屏幕分辨率、DPR、GPU、硬件并发数等）
-3. CreepJS / Pixelscan 的真实采集样本
+数据文件: app/data/mobile_devices.json
+- 机型档案: 屏幕(物理/CSS/视口)、DPR、GPU(真实 WebGL 上报字符串)、CPU/内存、
+  可运行系统版本及在网权重、机型标识（Android UA 可见）
+- 版本库: Chrome 主版本 → 完整构建号（Android UA/UA-CH 使用）
 
-一致性原则：UA 与设备规格必须相互印证——iPhone UA 只配手机屏、iPad UA 只配平板屏，
-屏幕物理分辨率 / DPR / GPU / 核心数均取对应机型真实规格；Android UA 中机型可见时按
-机型精确配对，iOS UA 不含机型则按手机/平板类别配对。
+生成链路：按权重抽取机型 → 按机型可运行版本配对系统版本 → 配对浏览器版本，
+保证 UA / UA-CH / 屏幕 / DPR / GPU / 硬件并发 全部相互印证。
+
+模式:
+- preset:  真实机型预设（系统与浏览器版本取该机型的当前主流组合，不随机化）
+- generate: 基于真实机型库的合成（系统/浏览器版本按在网权重随机）
+
+运行期（fp-chromium 内核 + CDP 注入）：
+- 屏幕/D如下 PR/触控由 CDP 设备仿真落地
+- GPU 字符串、Android UA-CH、deviceMemory、Battery、iOS 特性差异由 JS 注入层落地
+  （见 app/mobile_cdp_injector.py，注入值全部取自本模块生成的 fingerprint 数据）
 
 目标 OS: android, ios
 """
+import json
 import random
-from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.fingerprints import _dump_dataclass
+_LIBRARY_PATH = Path(__file__).resolve().parent / "data" / "mobile_devices.json"
+
+_SEED_MAX = 4_294_967_294
 
 
-# ------------------------------------------------------------------ UA 库
-@dataclass
-class UAEntry:
-    """单条 UA 记录"""
-    user_agent: str
-    platform: str
-    browser: str
-    browser_version: str
-    os_version: str
-    device_type: str  # mobile/tablet
-    manufacturer: Optional[str]  # Samsung/Apple/etc., None for generic
-    device_model: Optional[str] = None  # UA 中可识别的机型标识（iOS UA 不含机型，为 None）
+# ------------------------------------------------------------------ 数据加载
+def _load_library() -> Dict[str, Any]:
+    try:
+        with open(_LIBRARY_PATH, "r", encoding="utf-8") as fh:
+            lib = json.load(fh)
+    except FileNotFoundError as exc:  # pragma: no cover
+        raise RuntimeError(f"移动端机型库缺失: {_LIBRARY_PATH}") from exc
+    devices = lib.get("devices") or []
+    if not devices:
+        raise RuntimeError(f"移动端机型库为空: {_LIBRARY_PATH}")
+    for dev in devices:
+        missing = [k for k in ("brand", "platform", "type", "model", "screen", "gpu", "weight") if k not in dev]
+        if missing:
+            raise RuntimeError(f"机型记录缺字段 {missing}: {dev.get('market_name', dev)}")
+        screen = dev["screen"]
+        for k in ("w", "h", "dpr", "css_w", "css_h", "viewport_h"):
+            if k not in screen:
+                raise RuntimeError(f"机型 {dev['market_name']} 屏幕字段缺失: {k}")
+    return lib
 
 
-# 移动 UA 样本库（保留旧名 _ANDROID_UA_POOL 以兼容历史引用）
-_ANDROID_UA_POOL: List[UAEntry] = [
-    UAEntry(
-        "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        platform="Android", browser="Chrome", browser_version="120.0.0.0",
-        os_version="13", device_type="mobile", manufacturer="Samsung",
-        device_model="SM-S918B"
-    ),
-    UAEntry(
-        "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
-        platform="Android", browser="Chrome", browser_version="121.0.0.0",
-        os_version="14", device_type="mobile", manufacturer="Google",
-        device_model="Pixel 8 Pro"
-    ),
-    UAEntry(
-        "Mozilla/5.0 (Linux; Android 13; 2210132G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        platform="Android", browser="Chrome", browser_version="120.0.0.0",
-        os_version="13", device_type="mobile", manufacturer="Xiaomi",
-        device_model="2210132G"
-    ),
-    UAEntry(
-        "Mozilla/5.0 (Linux; Android 13; CPH2449) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        platform="Android", browser="Chrome", browser_version="120.0.0.0",
-        os_version="13", device_type="mobile", manufacturer="OnePlus",
-        device_model="CPH2449"
-    ),
-    UAEntry(
-        "Mozilla/5.0 (Linux; Android 12; ALN-AL00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        platform="Android", browser="Chrome", browser_version="120.0.0.0",
-        os_version="12", device_type="mobile", manufacturer="Huawei",
-        device_model="ALN-AL00"
-    ),
-    # 平板样本（Android 平板 UA 不含 "Mobile" 标记）
-    UAEntry(
-        "Mozilla/5.0 (Linux; Android 13; SM-X910) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        platform="Android", browser="Chrome", browser_version="120.0.0.0",
-        os_version="13", device_type="tablet", manufacturer="Samsung",
-        device_model="SM-X910"
-    ),
-    UAEntry(
-        "Mozilla/5.0 (Linux; Android 13; Lenovo Tab P12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        platform="Android", browser="Chrome", browser_version="120.0.0.0",
-        os_version="13", device_type="tablet", manufacturer="Lenovo",
-        device_model="Lenovo Tab P12"
-    ),
-    # iOS 样本（Safari UA 不暴露机型，只能按手机/平板类别配对）
-    UAEntry(
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-        platform="iPhone", browser="Safari", browser_version="17.5",
-        os_version="17.5", device_type="mobile", manufacturer="Apple"
-    ),
-    UAEntry(
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
-        platform="iPhone", browser="Safari", browser_version="17.4.1",
-        os_version="17.4.1", device_type="mobile", manufacturer="Apple"
-    ),
-    UAEntry(
-        "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-        platform="iPad", browser="Safari", browser_version="17.0",
-        os_version="17.0", device_type="tablet", manufacturer="Apple"
-    ),
-]
+_LIBRARY: Dict[str, Any] = _load_library()
+
+_DEVICES: List[Dict[str, Any]] = list(_LIBRARY["devices"])
+_ANDROID_BROWSERS: List[Dict[str, Any]] = list(_LIBRARY.get("android_browsers") or [])
 
 
-def _pick_ua_entry(target_os: str, manufacturer: Optional[str]) -> UAEntry:
-    """按平台与（可选）制造商挑选 UA。
+# ------------------------------------------------------------------ 工具
+def _weighted_choice(weights: Dict[str, Any]) -> str:
+    """按 {值: 权重} 抽取（保持 JSON 中的插入顺序作为同权重兜底顺序）"""
+    keys = list(weights.keys())
+    w = [max(0.0001, float(weights[k])) for k in keys]
+    return random.choices(keys, weights=w, k=1)[0]
 
-    制造商无匹配时回退到该平台全池（绝不产生 Apple UA ↔ Android 这类跨类配对）；
-    实际配对结果以返回的 UA 为准，调用方可从 manufacturer 字段读取。
-    """
-    if target_os == "ios":
-        pool = [e for e in _ANDROID_UA_POOL if e.manufacturer == "Apple"]
-    else:
-        pool = [e for e in _ANDROID_UA_POOL if e.manufacturer != "Apple"]
+
+def _version_key(v: str) -> tuple:
+    return tuple(int(x) if x.isdigit() else 0 for x in str(v).split("."))
+
+
+def _memory_class(ram_gb: int) -> int:
+    """Chrome navigator.deviceMemory 上报桶: 取不超过物理内存的 2 的幂，上限 8。"""
+    for cap in (8, 4, 2, 1):
+        if ram_gb >= cap:
+            return cap
+    return 1
+
+
+def _pick_device(target_os: str, manufacturer: Optional[str]) -> Dict[str, Any]:
+    """按平台 + 可选品牌过滤后按权重抽取机型；品牌无匹配时回退到平台全池。"""
+    pool = [d for d in _DEVICES if d["platform"] == target_os]
+    if not pool:
+        raise ValueError(f"机型库中没有平台 {target_os} 的设备")
     if manufacturer:
-        matched = [e for e in pool if e.manufacturer == manufacturer]
+        matched = [d for d in pool if str(d["brand"]).lower() == manufacturer.lower()]
         if matched:
             pool = matched
-    return random.choice(pool)
+    return random.choices(pool, weights=[max(0.0001, float(d["weight"])) for d in pool], k=1)[0]
 
 
-# ------------------------------------------------------------------ 设备特征库
-@dataclass
-class DeviceEntry:
-    """单条设备特征记录（真实机型的典型采集值）
-
-    width/height 为物理像素；浏览器可见的 CSS 像素 = 物理 / dpr。
-    """
-    manufacturer: str
-    model: str          # 机型标识（Android UA 中可见；iOS 用市场名）
-    display_name: str   # 市场名称，用于摘要展示
-    device_type: str    # mobile/tablet
-    width: int
-    height: int
-    dpr: float
-    color_depth: int
-    gpu_vendor: str
-    gpu_renderer: str
-    hw_cores: int
-    memory: int         # GB
+def _pick_os_version(device: Dict[str, Any], mode: str) -> str:
+    versions = device.get("os_versions") or device.get("ios_versions") or {}
+    if not versions:
+        raise RuntimeError(f"机型 {device['market_name']} 缺少系统版本池")
+    if mode == "preset":
+        # 当前主流：权重最高；同权重取版本号更高者（更新更常见）
+        return max(versions.items(), key=lambda kv: (float(kv[1]), _version_key(kv[0])))[0]
+    return _weighted_choice(versions)
 
 
-_DEVICE_DATABASE: Dict[str, List[DeviceEntry]] = {
-    "Samsung": [
-        DeviceEntry("Samsung", "SM-S918B", "Galaxy S23 Ultra", "mobile",
-                    1440, 3088, 3.0, 24, "Adreno", "Adreno 740", 8, 12),
-        DeviceEntry("Samsung", "SM-X910", "Galaxy Tab S9", "tablet",
-                    1600, 2560, 2.5, 24, "Adreno", "Adreno 740", 8, 12),
-    ],
-    "Google": [
-        DeviceEntry("Google", "Pixel 8 Pro", "Pixel 8 Pro", "mobile",
-                    1344, 2992, 2.625, 24, "Mali", "Immortalis-G715 MC10", 8, 12),
-    ],
-    "Xiaomi": [
-        DeviceEntry("Xiaomi", "2210132G", "Xiaomi 13", "mobile",
-                    1080, 2400, 2.75, 24, "Adreno", "Adreno 740", 8, 12),
-    ],
-    "OnePlus": [
-        DeviceEntry("OnePlus", "CPH2449", "OnePlus 11", "mobile",
-                    1440, 3216, 3.0, 24, "Adreno", "Adreno 740", 8, 16),
-    ],
-    "Huawei": [
-        DeviceEntry("Huawei", "ALN-AL00", "Mate 60 Pro", "mobile",
-                    1260, 2720, 2.75, 24, "Mali", "Maleoon 910", 12, 12),
-    ],
-    "Lenovo": [
-        DeviceEntry("Lenovo", "Lenovo Tab P12", "Lenovo Tab P12", "tablet",
-                    1840, 2880, 2.0, 24, "Mali", "Mali-G68 MC4", 8, 8),
-    ],
-    # iOS UA 不含机型，按 device_type 在 iPhone / iPad 之间随机配对
-    "Apple": [
-        DeviceEntry("Apple", "iPhone 15 Pro Max", "iPhone 15 Pro Max", "mobile",
-                    1290, 2796, 3.0, 24, "Apple", "Apple A17 Pro GPU", 6, 8),
-        DeviceEntry("Apple", "iPhone 15", "iPhone 15", "mobile",
-                    1179, 2556, 3.0, 24, "Apple", "Apple A16 Bionic GPU", 6, 6),
-        DeviceEntry("Apple", "iPad Pro 12.9", "iPad Pro 12.9\"", "tablet",
-                    2048, 2732, 2.0, 24, "Apple", "Apple M2 GPU", 8, 16),
-        DeviceEntry("Apple", "iPad Air", "iPad Air", "tablet",
-                    1640, 2360, 2.0, 24, "Apple", "Apple M1 GPU", 8, 8),
-    ],
+def _pick_android_browser(mode: str) -> Dict[str, Any]:
+    if not _ANDROID_BROWSERS:
+        return {"major": "156", "full": "156.0.8078.35", "weight": 1}
+    if mode == "preset":
+        return max(_ANDROID_BROWSERS, key=lambda b: (float(b["weight"]), _version_key(b["full"])))
+    return random.choices(
+        _ANDROID_BROWSERS,
+        weights=[max(0.0001, float(b["weight"])) for b in _ANDROID_BROWSERS],
+        k=1,
+    )[0]
+
+
+def _android_ua_ch(device: Dict[str, Any], os_version: str, browser: Dict[str, Any]) -> Dict[str, Any]:
+    """Chrome Android 的 navigator.userAgentData（含高熵值）。"""
+    major = str(browser["major"])
+    full = str(browser["full"])
+    grease = _LIBRARY.get("grease_brand") or {"brand": "Not_A Brand", "version": "8"}
+    grease_brand = {"brand": grease["brand"], "version": str(grease["version"])}
+    grease_full = {"brand": grease["brand"], "version": f"{grease['version']}.0.0.0"}
+    return {
+        "brands": [
+            {"brand": "Chromium", "version": major},
+            {"brand": "Google Chrome", "version": major},
+            dict(grease_brand),
+        ],
+        "fullVersionList": [
+            {"brand": "Chromium", "version": full},
+            {"brand": "Google Chrome", "version": full},
+            dict(grease_full),
+        ],
+        "fullVersion": full,
+        "platform": "Android",
+        "platformVersion": f"{os_version}.0.0",
+        "architecture": "arm",
+        "bitness": "",
+        "model": str(device["model"]),
+        "mobile": device["type"] == "phone",
+        "wow64": False,
+    }
+
+
+# ------------------------------------------------------------------ 字体
+_MOBILE_FONTS = {
+    "ios": {
+        "essential": [
+            'Helvetica Neue', 'Arial', 'Times New Roman', 'Courier New',
+            'Georgia', 'Verdana', 'Tahoma', 'Palatino', 'Garamond',
+            'Bookman', 'Comic Sans MS', 'Trebuchet MS', 'Lucida Console',
+            'Menlo', 'Monaco', 'Lucida Grande', 'PingFang SC', 'PingFang HK',
+        ],
+        "extra": [
+            'SF Pro Text', 'SF Pro Icons', 'Helvetica', 'Chalkboard SE',
+            'Didot', 'ITC Avant Garde Gothic', 'Century Gothic', 'Sand',
+            'System Font', 'Times', 'Arial MT', 'Georgia MT',
+        ],
+    },
+    "android": {
+        "essential": [
+            'Droid Sans', 'Droid Serif', 'Roboto', 'Open Sans', 'Montserrat',
+            'Noto Sans', 'Noto Sans SC', 'Source Sans Pro', 'Lato',
+        ],
+        "extra": [
+            'Merriweather', 'Oxygen', 'PT Sans', 'PT Serif', 'Fira Sans',
+            'Raleway', 'Ubuntu', 'Karumbi', 'Poppins', 'Josefin Sans',
+        ],
+    },
 }
 
-# 未知制造商兜底（理论上不可达：所有 UA 都绑定在库内机型上）
-_FALLBACK_DEVICE = DeviceEntry(
-    "Unknown", "generic-android", "通用 Android 机型", "mobile",
-    1080, 2400, 2.75, 24, "Adreno", "Adreno 640", 8, 6,
-)
 
-
-def _pick_device(ua_entry: UAEntry) -> DeviceEntry:
-    """为 UA 配对同类设备：UA 中机型可见时精确配对，否则按手机/平板类别配对。"""
-    devices = _DEVICE_DATABASE.get(ua_entry.manufacturer or "", [])
-    if ua_entry.device_model:
-        exact = [d for d in devices if d.model == ua_entry.device_model]
-        if exact:
-            return random.choice(exact)
-    same_type = [d for d in devices if d.device_type == ua_entry.device_type]
-    if same_type:
-        return random.choice(same_type)
-    if devices:
-        return random.choice(devices)
-    return _FALLBACK_DEVICE
+def _generate_mobile_font_subset(target_os: str, *, full: bool = False) -> List[str]:
+    """移动端字体子集：preset 用完整集合（固定），generate 随机子集。"""
+    table = _MOBILE_FONTS.get(target_os, _MOBILE_FONTS["android"])
+    essential, extra = table["essential"], table["extra"]
+    if full or not extra:
+        return list(essential) + list(extra)
+    picked = random.sample(extra, min(len(extra), random.randint(5, len(extra))))
+    return list(essential) + picked
 
 
 # ------------------------------------------------------------------ 辅助数据
-def _chrome_brands(ua_entry: UAEntry) -> List[Dict[str, str]]:
-    """Chrome UA-CH brands（真实 Chrome 会混入 Grease 品牌并随机排序，这里固定次序）"""
-    major = ua_entry.browser_version.split(".")[0]
-    return [
-        {"brand": "Chromium", "version": major},
-        {"brand": "Google Chrome", "version": major},
-        {"brand": "Not_A Brand", "version": "8"},
-    ]
-
-
-# Battery API（移动端特有）
 def _generate_battery_api() -> Dict[str, Any]:
-    """navigator.battery 对象"""
-    level = random.uniform(0.2, 1.0)
-    charging = random.random() < 0.15  # 15% 概率在充电
-
+    """Android Chrome navigator.getBattery() 的初始值（iOS 无该 API，返回 None）。"""
+    level = round(random.uniform(0.2, 1.0), 2)
+    charging = random.random() < 0.15
     return {
         "level": level,
         "charging": charging,
@@ -222,7 +190,6 @@ def _generate_battery_api() -> Dict[str, Any]:
     }
 
 
-# Geolocation API（默认可访问，不伪装）
 _MOBILE_GEOLOCATION = {
     "geolocation": {
         "accessibility": True,
@@ -231,9 +198,7 @@ _MOBILE_GEOLOCATION = {
 }
 
 
-# Camera API
 def _generate_camera_api() -> Dict[str, Any]:
-    """navigator.camera 能力检测"""
     return {
         "hasCamera": True,
         "rearCamera": True,
@@ -243,69 +208,111 @@ def _generate_camera_api() -> Dict[str, Any]:
     }
 
 
-# WebRTC（移动端通常可用）
-_MOBICE_WEBRTC = {
+_MOBILE_WEBRTC = {
     "webrtc": {
         "supported": True,
         "privacyMode": False,
     },
 }
 
+# iOS Safari 不存在、运行期需要从内核（桌面 Chromium）上抹掉的 Navigator 属性
+_IOS_REMOVE_NAV_PROPS = ["connection", "pdfViewerEnabled", "userAgentData", "getBattery", "deviceMemory"]
+
 
 # ------------------------------------------------------------------ 指纹生成
-def generate_mobile_fingerprint(target_os: str, manufacturer: Optional[str] = None) -> Dict[str, Any]:
-    """
-    生成移动端指纹（Android/iOS）。
+def generate_mobile_fingerprint(
+    target_os: str,
+    manufacturer: Optional[str] = None,
+    mode: str = "generate",
+) -> Dict[str, Any]:
+    """生成一套移动端指纹（基于真实机型库）。
 
     Parameters:
         target_os: "android" or "ios"
-        manufacturer: 可选，指定设备制造商（如 "Samsung", "Apple", "Google"）
-                     留空则随机选择；无匹配时自动回退，实际结果见返回值的 manufacturer
-
-    Returns:
-        包含完整浏览器指纹的字典，结构与 BrowserForge 输出兼容；
-        额外包含 manufacturer / deviceModel 字段记录实际配对结果
+        manufacturer: 可选品牌（Samsung/Google/Xiaomi/OnePlus/Apple 等），
+                      无匹配时回退为该平台全库，实际结果见返回的 manufacturer
+        mode: "generate"（版本随机）/ "preset"（版本取机型当前主流组合）
     """
-    ua_entry = _pick_ua_entry(target_os, manufacturer)
-    device = _pick_device(ua_entry)
+    if target_os not in ("android", "ios"):
+        raise ValueError(f"不支持的移动端目标 OS: {target_os}")
+    mode = "preset" if mode == "preset" else "generate"
 
-    if target_os == "ios":
-        # 真机 navigator.platform：iPhone 报 "iPhone"，iPad 报 "iPad"
-        nav_platform = "iPad" if ua_entry.device_type == "tablet" else "iPhone"
-        vendor = "Apple Computer, Inc."
-        user_agent_data = None  # iOS Safari 不暴露 navigator.userAgentData
-    else:
-        nav_platform = "Linux armv81"  # Android ARM64 真机典型值
+    device = _pick_device(target_os, manufacturer)
+    screen_meta = device["screen"]
+    css_w, css_h = int(screen_meta["css_w"]), int(screen_meta["css_h"])
+    viewport_h = int(screen_meta["viewport_h"])
+    dpr = float(screen_meta["dpr"])
+
+    os_version = _pick_os_version(device, mode)
+    is_tablet = device["type"] == "tablet"
+    max_touch_points = int(device.get("max_touch_points") or 5)
+    memory_class = _memory_class(int(device.get("ram_gb") or 4))
+
+    if target_os == "android":
+        browser = _pick_android_browser(mode)
+        major = str(browser["major"]) 
+        mobile_token = "" if is_tablet else "Mobile "
+        user_agent = (
+            f"Mozilla/5.0 (Linux; Android {os_version}; {device['model']}) "
+            f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 "
+            f"{mobile_token}Safari/537.36"
+        )
+        nav_platform = "Linux armv81"
         vendor = "Google Inc."
-        user_agent_data = {
-            "brands": _chrome_brands(ua_entry),
-            "platform": "Android",
-            "mobile": ua_entry.device_type == "mobile",
-        }
+        ua_ch: Optional[Dict[str, Any]] = _android_ua_ch(device, os_version, browser)
+        browser_version = str(browser["full"])
+        platform_version_ch = f"{os_version}.0.0"
+        battery: Optional[Dict[str, Any]] = _generate_battery_api()
+        device_memory: Optional[int] = memory_class
+        remove_props: List[str] = []
+        empty_plugins = False
+    else:
+        os_token = os_version.replace(".", "_")
+        safari_version = ".".join(os_version.split(".")[:2])  # iOS 27.0.1 → Safari 27.0
+        if is_tablet:
+            user_agent = (
+                f"Mozilla/5.0 (iPad; CPU OS {os_token} like Mac OS X) "
+                f"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{safari_version} "
+                f"Mobile/15E148 Safari/604.1"
+            )
+            nav_platform = "iPad"
+        else:
+            user_agent = (
+                f"Mozilla/5.0 (iPhone; CPU iPhone OS {os_token} like Mac OS X) "
+                f"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{safari_version} "
+                f"Mobile/15E148 Safari/604.1"
+            )
+            nav_platform = "iPhone"
+        vendor = "Apple Computer, Inc."
+        ua_ch = None  # Safari 不暴露 UA-CH
+        browser_version = safari_version
+        platform_version_ch = os_version if os_version.count(".") >= 2 else f"{os_version}.0"
+        battery = None  # Safari 无 Battery API
+        device_memory = None
+        remove_props = list(_IOS_REMOVE_NAV_PROPS)
+        empty_plugins = True
 
-    # 真机上 appVersion = UA 去掉 "Mozilla/" 前缀（Chrome/Safari 一致）
-    app_version = ua_entry.user_agent.split("Mozilla/", 1)[-1]
+    app_version = user_agent.split("Mozilla/", 1)[-1]
 
-    # 触控点：手机 5，平板 5/10（真实设备常见值）
-    max_touch_points = 5 if device.device_type == "mobile" else random.choice([5, 10])
-
-    # Screen 对象（只保留 Screen 的真实属性；window 尺寸由 CDP 仿真层决定）
     screen = {
-        "availHeight": device.height,
-        "availWidth": device.width,
+        "availHeight": int(screen_meta["h"]),
+        "availWidth": int(screen_meta["w"]),
         "availTop": 0,
         "availLeft": 0,
-        "colorDepth": device.color_depth,
-        "height": device.height,
-        "pixelDepth": device.color_depth,
-        "width": device.width,
-        "devicePixelRatio": device.dpr,
+        "colorDepth": 24,
+        "height": int(screen_meta["h"]),
+        "pixelDepth": 24,
+        "width": int(screen_meta["w"]),
+        "devicePixelRatio": dpr,
+        # 浏览器可见的 CSS 尺寸（物理 / DPR）与首屏视口高度（扣除浏览器 UI）
+        "cssWidth": css_w,
+        "cssHeight": css_h,
+        "cssViewportHeight": viewport_h,
     }
 
-    # Navigator 对象
     navigator = {
-        "userAgent": ua_entry.user_agent,
-        "userAgentData": user_agent_data,
+        "userAgent": user_agent,
+        "userAgentData": ua_ch,
         "doNotTrack": None,
         "appCodeName": "Mozilla",
         "appName": "Netscape",
@@ -315,8 +322,8 @@ def generate_mobile_fingerprint(target_os: str, manufacturer: Optional[str] = No
         "language": "zh-CN",
         "languages": ["zh-CN", "zh", "en-US", "en"],
         "platform": nav_platform,
-        "hardwareConcurrency": device.hw_cores,
-        "deviceMemory": device.memory,
+        "hardwareConcurrency": int(device.get("cpu_cores") or 8),
+        "deviceMemory": device_memory,
         "product": "Gecko",
         "productSub": "20030107",
         "vendor": vendor,
@@ -327,13 +334,11 @@ def generate_mobile_fingerprint(target_os: str, manufacturer: Optional[str] = No
         "cookieEnabled": True,
     }
 
-    # 视频卡（GPU）
     video_card = {
-        "renderer": device.gpu_renderer,
-        "vendor": device.gpu_vendor,
+        "vendor": device["gpu"]["vendor"],
+        "renderer": device["gpu"]["renderer"],
     }
 
-    # 音频编解码器
     audio_codecs = {
         "aac": "audio/mp4a-enc;codecs=aac",
         "flac": "audio/flac;codecs=flac",
@@ -342,7 +347,6 @@ def generate_mobile_fingerprint(target_os: str, manufacturer: Optional[str] = No
         "vorbis": "audio/ogg;codecs=vorbis",
     }
 
-    # 视频编解码器
     video_codecs = {
         "av1": "video/mp4;codecs=av01.0.05M.08",
         "h264": "video/mp4;codecs=avc1.42E01E",
@@ -350,14 +354,12 @@ def generate_mobile_fingerprint(target_os: str, manufacturer: Optional[str] = No
         "vp9": "video/webm;codecs=vp09.00.10.08",
     }
 
-    # 插件列表（Android Chrome 典型的 plugin 数组）
     plugins_data = {
         "pdfViewer": "application/pdf",
         "widevine": "video/mp4",
         "nacl": "application/x-nacl",
     }
 
-    # 多媒体设备
     multimedia_devices = [
         "microphone",
         "speaker",
@@ -366,10 +368,8 @@ def generate_mobile_fingerprint(target_os: str, manufacturer: Optional[str] = No
         "video-output",
     ]
 
-    # 字体子集（移动端常用字体）
-    fonts = _generate_mobile_font_subset(target_os, ua_entry.manufacturer)
+    fonts = _generate_mobile_font_subset(target_os, full=(mode == "preset"))
 
-    # 合并所有数据
     fingerprint = {
         "screen": screen,
         "navigator": navigator,
@@ -377,63 +377,43 @@ def generate_mobile_fingerprint(target_os: str, manufacturer: Optional[str] = No
         "videoCodecs": video_codecs,
         "audioCodecs": audio_codecs,
         "pluginsData": plugins_data,
-        "battery": _generate_battery_api(),
+        "battery": battery,
         "videoCard": video_card,
         "multimediaDevices": multimedia_devices,
         "fonts": fonts,
         "mockWebRTC": False,
         "slim": False,
         # 实际配对结果（供 create_mobile_fingerprint / 摘要使用）
-        "manufacturer": ua_entry.manufacturer or device.manufacturer,
-        "deviceModel": device.display_name,
-        # 移动端特有扩展
+        "manufacturer": device["brand"],
+        "deviceModel": device["market_name"],
+        # 移动端特有扩展：运行期注入层（mobile_cdp_injector）据此落地
         "mobileExtra": {
-            "maxTouchPoints": navigator["maxTouchPoints"],
+            "model": str(device["model"]),
+            "marketName": device["market_name"],
+            "deviceType": device["type"],
+            "released": device.get("released"),
+            "osVersion": os_version,
+            "browser": "chrome" if target_os == "android" else "safari",
+            "browserVersion": browser_version,
+            "platformVersionCh": platform_version_ch,
+            "memoryClass": memory_class,
+            "hasUaCh": ua_ch is not None,
+            "hasBattery": battery is not None,
+            "emptyPlugins": empty_plugins,
+            "removeNavigatorProps": remove_props,
+            "uaCh": ua_ch,
+            "maxTouchPoints": max_touch_points,
             "geolocation": _MOBILE_GEOLOCATION,
             "camera": _generate_camera_api(),
-            "webrtc": _MOBICE_WEBRTC,
+            "webrtc": _MOBILE_WEBRTC,
         },
     }
 
     return fingerprint
 
 
-def _generate_mobile_font_subset(target_os: str, manufacturer: Optional[str]) -> List[str]:
-    """生成移动端字体子集"""
-
-    if target_os == "ios":
-        essential = [
-            'Helvetica Neue', 'Arial', 'Times New Roman', 'Courier New',
-            'Georgia', 'Verdana', 'Tahoma', 'Palatino', 'Garamond',
-            'Bookman', 'Comic Sans MS', 'Trebuchet MS', 'Lucida Console',
-            'Menlo', 'Monaco', 'Lucida Grande', 'PingFang SC', 'PingFang HK',
-        ]
-        non_essential = [
-            'SF Pro Text', 'SF Pro Icons', 'Helvetica', 'Chalkboard SE',
-            'Didot', 'ITC Avant Garde Gothic', 'Century Gothic', 'Sand',
-            'System Font', 'Times', 'Arial MT', 'Georgia MT',
-        ]
-    else:  # android
-        essential = [
-            'Droid Sans', 'Droid Serif', 'Roboto', 'Open Sans', 'Montserrat',
-            'Noto Sans', 'Noto Sans SC', 'Source Sans Pro', 'Lato',
-        ]
-        non_essential = [
-            'Merriweather', 'Oxygen', 'PT Sans', 'PT Serif', 'Fira Sans',
-            'Raleway', 'Ubuntu', 'Karumbi', 'Poppins', 'Josefin Sans',
-        ]
-
-    # 移动端字体数量较少（约 30-60 个）
-    selected_non_essential = random.sample(non_essential, min(len(non_essential), random.randint(5, 15)))
-
-    return essential + selected_non_essential
-
-
 def seeds_to_config(fingerprint_data: dict) -> dict:
-    """
-    把固定噪声种子转成 camoufox launch_options 的 config 参数。
-    移动端需注入 Canvas/Audio/字体间距种子。
-    """
+    """把固定噪声种子转成 camoufox launch_options 的 config 参数。"""
     seeds = fingerprint_data.get("seeds", {})
     return {
         "canvas:seed": int(seeds.get("canvas", 1)),
@@ -442,27 +422,28 @@ def seeds_to_config(fingerprint_data: dict) -> dict:
     }
 
 
-def create_mobile_fingerprint(target_os: str, mode: str = "generate", manufacturer: Optional[str] = None) -> dict:
-    """
-    创建移动端指纹（与桌面端 create_fingerprint 接口一致）。
+def create_mobile_fingerprint(
+    target_os: str,
+    mode: str = "generate",
+    manufacturer: Optional[str] = None,
+) -> dict:
+    """创建移动端环境指纹（与桌面端 create_fingerprint 接口一致）。
 
-    Parameters:
-        target_os: "android" or "ios"
-        mode: 兼容参数；移动端无真实预设库，一律按 "generate" 处理
-        manufacturer: 设备制造商（可选）
-
-    Returns:
-        标准指纹数据结构（与桌面端格式兼容）
+    - mode=preset:  真实机型预设（版本组合取机型当前主流值）
+    - mode=generate: 基于真实机型库的合成（版本随机）
     """
+    if target_os not in ("android", "ios"):
+        raise ValueError(f"不支持的移动端目标 OS: {target_os}")
+    mode = "preset" if mode == "preset" else "generate"
+
     data = {
-        # 移动端只有合成生成模式（浏览器厂商均未提供移动端真实预设库）
-        "mode": "generate",
+        "mode": mode,
         "fingerprint": None,
         "preset": None,
         "seeds": {
-            "canvas": random.randint(1, 4294967294),
-            "audio": random.randint(1, 4294967294),
-            "font_spacing": random.randint(1, 4294967294),
+            "canvas": random.randint(1, _SEED_MAX),
+            "audio": random.randint(1, _SEED_MAX),
+            "font_spacing": random.randint(1, _SEED_MAX),
         },
         "fonts": [],
         "voices": None,  # 移动端通常没有 TTS
@@ -472,35 +453,87 @@ def create_mobile_fingerprint(target_os: str, mode: str = "generate", manufactur
         "device_model": None,
     }
 
-    # 生成移动端指纹
-    raw_fp = generate_mobile_fingerprint(target_os, manufacturer)
-    data["fingerprint"] = _dump_dataclass(raw_fp)
+    raw_fp = generate_mobile_fingerprint(target_os, manufacturer, mode)
+    data["fingerprint"] = raw_fp
 
-    # 厂商 / 机型以实际生成结果为准（未指定 manufacturer 时会随机选取）
+    # 厂商 / 机型以实际机型库配对结果为准（未指定 manufacturer 时为按权重抽取结果）
     data["manufacturer"] = raw_fp.get("manufacturer") or manufacturer
     data["device_model"] = raw_fp.get("deviceModel")
 
     # 字体子集直接取用指纹内的同一份结果，避免两处随机不一致
     data["fonts"] = list(raw_fp.get("fonts") or [])
 
-    # 一致性体检
     from app.fingerprint_engine import check_health
     data["health"] = check_health(data, target_os)
 
     return data
 
 
-if __name__ == "__main__":
-    # 测试：生成 Android 指纹
-    print("=== Android 指纹 ===")
-    android_fp = create_mobile_fingerprint("android", "generate", "Samsung")
-    print(f"UA: {android_fp['fingerprint']['navigator']['userAgent']}")
-    print(f"Screen: {android_fp['fingerprint']['screen']['width']}x{android_fp['fingerprint']['screen']['height']}")
-    print(f"GPU: {android_fp['fingerprint']['videoCard']['vendor']} {android_fp['fingerprint']['videoCard']['renderer']}")
-    print(f"Battery: {android_fp['fingerprint']['battery']}")
+# ------------------------------------------------------------------ 库查询（API/UI）
+def list_brands(target_os: Optional[str] = None) -> Dict[str, List[str]]:
+    """返回各平台可用品牌（用于面板品牌选择器）。"""
+    result: Dict[str, List[str]] = {"android": [], "ios": []}
+    for dev in _DEVICES:
+        if target_os and dev["platform"] != target_os:
+            continue
+        brand = dev["brand"]
+        if brand not in result.setdefault(dev["platform"], []):
+            result[dev["platform"]].append(brand)
+    return {k: sorted(v) for k, v in result.items()}
 
-    print("\n=== iOS 指纹 ===")
-    ios_fp = create_mobile_fingerprint("ios", "generate", "Apple")
-    print(f"UA: {ios_fp['fingerprint']['navigator']['userAgent']}")
-    print(f"Screen: {ios_fp['fingerprint']['screen']['width']}x{ios_fp['fingerprint']['screen']['height']}")
-    print(f"GPU: {ios_fp['fingerprint']['videoCard']['vendor']} {ios_fp['fingerprint']['videoCard']['renderer']}")
+
+def library_devices(target_os: Optional[str] = None) -> List[Dict[str, Any]]:
+    """机型清单（摘要字段，供 API/UI 展示）。"""
+    out = []
+    for dev in _DEVICES:
+        if target_os and dev["platform"] != target_os:
+            continue
+        out.append({
+            "brand": dev["brand"],
+            "platform": dev["platform"],
+            "type": dev["type"],
+            "model": dev["model"],
+            "market_name": dev["market_name"],
+            "released": dev.get("released"),
+            "screen": f"{dev['screen']['css_w']}x{dev['screen']['css_h']}@{dev['screen']['dpr']}",
+            "gpu": dev["gpu"]["renderer"],
+            "weight": dev["weight"],
+        })
+    return out
+
+
+def library_info() -> Dict[str, Any]:
+    return {
+        "version": _LIBRARY.get("version"),
+        "updated": _LIBRARY.get("updated"),
+        "notes": _LIBRARY.get("notes"),
+        "count": len(_DEVICES),
+        "brands": list_brands(),
+    }
+
+
+if __name__ == "__main__":
+    print("=== 机型库 ===")
+    print(json.dumps(library_info(), ensure_ascii=False, indent=1))
+
+    print("\n=== Android preset ===")
+    android_fp = create_mobile_fingerprint("android", "preset")
+    fp = android_fp["fingerprint"]
+    print(f"UA: {fp['navigator']['userAgent']}")
+    print(f"机型: {android_fp['manufacturer']} {android_fp['device_model']}")
+    print(f"Screen: {fp['screen']['width']}x{fp['screen']['height']} @{fp['screen']['devicePixelRatio']} "
+          f"(css {fp['screen']['cssWidth']}x{fp['screen']['cssHeight']}, vp {fp['screen']['cssViewportHeight']})")
+    print(f"GPU: {fp['videoCard']['vendor']} / {fp['videoCard']['renderer']}")
+    print(f"UA-CH model: {(fp['mobileExtra'].get('uaCh') or {}).get('model')}")
+    print(f"health: {android_fp['health']}")
+
+    print("\n=== iOS generate ===")
+    ios_fp = create_mobile_fingerprint("ios", "generate")
+    fp = ios_fp["fingerprint"]
+    print(f"UA: {fp['navigator']['userAgent']}")
+    print(f"机型: {ios_fp['manufacturer']} {ios_fp['device_model']}")
+    print(f"Screen: {fp['screen']['width']}x{fp['screen']['height']} @{fp['screen']['devicePixelRatio']} "
+          f"(css {fp['screen']['cssWidth']}x{fp['screen']['cssHeight']}, vp {fp['screen']['cssViewportHeight']})")
+    print(f"GPU: {fp['videoCard']['vendor']} / {fp['videoCard']['renderer']}")
+    print(f"remove props: {fp['mobileExtra']['removeNavigatorProps']}")
+    print(f"health: {ios_fp['health']}")
