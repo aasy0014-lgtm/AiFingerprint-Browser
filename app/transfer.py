@@ -20,6 +20,24 @@ from .fingerprint_engine import create_fingerprint
 FORMAT_VERSION = 1
 
 
+def _ensure_kernel_available(kernel: str) -> None:
+    """导入前校验内核在本机可用，避免落地一个永远无法启动的环境。
+
+    与创建/改配环境（main._check_kernel_available）保持同一不变量；
+    导入与整机恢复都必须经过这里。
+    """
+    from .kernels import camoufox_kernel, chromium_kernel, fp_chromium_kernel
+
+    mods = {"camoufox": camoufox_kernel, "chromium": chromium_kernel,
+            "fp-chromium": fp_chromium_kernel}
+    mod = mods.get(kernel)
+    if mod is None:
+        raise ValueError(f"未知内核: {kernel}")
+    available, detail = mod.is_available()
+    if not available:
+        raise ValueError(f"内核 {kernel} 本机不可用，无法导入：{detail}")
+
+
 def export_profile(profile: dict, include_data: bool = False) -> dict:
     out = {
         "format_version": FORMAT_VERSION,
@@ -50,6 +68,8 @@ def import_profile(data: dict, name_override: str | None = None,
                    owner: str = "admin") -> dict:
     """从导出数据创建新环境（生成新 id；数据目录归档可选恢复）。"""
     profile = data["profile"]
+    kernel = profile.get("kernel") or "camoufox"
+    _ensure_kernel_available(kernel)
     # 指纹缺失或格式不符时重新生成，避免导入旧版/外部数据崩溃
     fingerprint = profile.get("fingerprint")
     if not isinstance(fingerprint, dict) or not fingerprint.get("seeds"):
@@ -58,7 +78,7 @@ def import_profile(data: dict, name_override: str | None = None,
         name=(name_override or profile.get("name") or "导入的环境"),
         group_name=profile.get("group_name") or "导入",
         notes=profile.get("notes") or "",
-        kernel=profile.get("kernel") or "camoufox",
+        kernel=kernel,
         target_os=profile.get("target_os") or "windows",
         proxy=profile.get("proxy"),
         fingerprint=fingerprint,
@@ -99,6 +119,10 @@ def restore_all(backup: dict, *, wipe: bool = True) -> int:
     """整机恢复：默认清空现有环境后按备份重建（数据目录不恢复，仅配置+指纹）。"""
     if backup.get("kind") != "fpworkbench-backup":
         raise ValueError("不是有效的整机备份文件")
+    # 先校验全部内核可用，再清空重建：否则 wipe 完成后才因某个内核不可用而中断，
+    # 会留下「已清空但没恢复回来」的空库
+    for item in backup.get("profiles", []):
+        _ensure_kernel_available((item or {}).get("kernel") or "camoufox")
     if wipe:
         for p in db.list_profiles():
             db.delete_profile(p["id"])
