@@ -606,13 +606,18 @@ def set_member_enabled(member_id: str, enabled: bool) -> bool:
 def delete_member(member_id: str) -> bool:
     conn = _require_conn()
     with _lock, conn:
-        # 不允许删掉最后一个管理员
-        admins = conn.execute(
-            "SELECT COUNT(*) AS c FROM members WHERE role='admin' AND enabled=1"
-        ).fetchone()["c"]
-        row = conn.execute("SELECT role FROM members WHERE id=?", (member_id,)).fetchone()
-        if row and row["role"] == "admin" and admins <= 1:
-            return False
+        row = conn.execute(
+            "SELECT role, enabled FROM members WHERE id=?", (member_id,)
+        ).fetchone()
+        # 只在「删除的是启用中的管理员」时才需要保护最后一个管理员：
+        # 删除已停用（enabled=0）的管理员不会减少启用管理员数量，
+        # 此前一律按管理员判断，导致已停用的多余管理员永远删不掉
+        if row and row["role"] == "admin" and row["enabled"]:
+            admins = conn.execute(
+                "SELECT COUNT(*) AS c FROM members WHERE role='admin' AND enabled=1"
+            ).fetchone()["c"]
+            if admins <= 1:
+                return False
         cur = conn.execute("DELETE FROM members WHERE id = ?", (member_id,))
     return cur.rowcount > 0
 
