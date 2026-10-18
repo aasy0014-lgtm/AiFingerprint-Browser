@@ -16,7 +16,10 @@ from .fingerprint_engine import create_fingerprint
 
 
 def _features(profile: dict) -> dict[str, Any]:
+    """从环境提取特征用于矩阵风控分析（兼容移动端）"""
     fp = profile.get("fingerprint") or {}
+    
+    # 获取 UA、屏幕、GPU
     if fp.get("mode") == "preset":
         nav = (fp.get("preset") or {}).get("navigator") or {}
         screen = (fp.get("preset") or {}).get("screen") or {}
@@ -26,7 +29,9 @@ def _features(profile: dict) -> dict[str, Any]:
         nav = bf.get("navigator") or {}
         screen = bf.get("screen") or {}
         webgl = bf.get("videoCard") or {}
+    
     screen_key = f"{screen.get('width')}x{screen.get('height')}" if screen.get("width") else "未知"
+    
     return {
         "profile_id": profile["id"],
         "name": profile["name"],

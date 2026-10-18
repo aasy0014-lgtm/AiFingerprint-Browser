@@ -258,10 +258,13 @@ def _serialize_profile(p: dict, full: bool = False) -> dict:
         if p["proxy"]:
             out["proxy_full"] = p["proxy"]
     if p["kernel"] == "fp-chromium":
-        # 该内核的 UA/指纹由 --fingerprint 种子在内核层实时生成（Chrome 系），
-        # 存储的 BrowserForge 指纹仅提供种子与目标 OS，不作为展示值
-        out["fingerprint_summary"]["user_agent"] = None
-        out["fingerprint_summary"]["kernel_driven"] = True
+        # 桌面端：UA/指纹由 --fingerprint 种子在内核层实时生成（Chrome 系），
+        # 存储的 BrowserForge 指纹仅提供种子与目标 OS，不展示为 UA 值；
+        # 移动端：UA/平台/屏幕由存储指纹显式注入（--user-agent + CDP 仿真），
+        # 摘要如实展示存储指纹中的 UA 与厂商信息
+        if p["target_os"] not in ("android", "ios"):
+            out["fingerprint_summary"]["user_agent"] = None
+            out["fingerprint_summary"]["kernel_driven"] = True
     return out
 
 

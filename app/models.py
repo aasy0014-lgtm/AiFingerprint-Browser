@@ -3,7 +3,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 ProxyScheme = Literal["http", "https", "socks4", "socks5"]
-TargetOS = Literal["windows", "macos", "linux"]
+TargetOS = Literal["windows", "macos", "linux", "android", "ios"]
 KernelName = Literal["camoufox", "chromium", "fp-chromium"]
 # 指纹模式：generate=BrowserForge 合成；preset=真实设备预设库
 FingerprintMode = Literal["generate", "preset"]

@@ -4,6 +4,10 @@
 - generate: BrowserForge 合成指纹（默认，无限独特组合）
 - preset:   Camoufox 内置的真实设备指纹预设库（真实采集数据）
 
+移动端 (Android/iOS):
+- generate: 基于真实移动设备数据库的合成指纹引擎（本项目的扩展实现）
+- preset: 暂不支持（可后续添加真实移动预设）
+
 统一存储格式（fingerprint_json）:
 {
   "mode": "generate" | "preset",
@@ -12,7 +16,9 @@
   "seeds": {"canvas": int, "audio": int, "font_spacing": int},
   "fonts": [...该环境固定的字体子集...],
   "voices": [...] | null,        # preset 自带 speechVoices 时为 null（用预设的）
-  "health": {"score": int, "warnings": [...]}
+  "health": {"score": int, "warnings": [...]},
+  "target_os": "windows" | "macos" | "linux" | "android" | "ios",
+  "manufacturer": ...              # 仅移动端有效（Samsung/Apple/Google 等）
 }
 """
 import random
@@ -27,11 +33,19 @@ _GPU_OS_HINTS = {
     "windows": ("Direct3D", "D3D11", "ANGLE (", "Google Inc."),
     "macos": ("Apple", "ANGLE (Apple", "Metal"),
     "linux": ("Mesa", "llvmpipe", "X11", "DRI"),
+    # 移动端 GPU（Android: Adreno/Mali/PowerVR/Xclipse/Maleoon；iOS: Apple GPU）
+    "android": ("Adreno", "Mali", "PowerVR", "Immortalis", "Xclipse", "Maleoon"),
+    "ios": ("Apple", "Metal", "PVR", "Imagination"),
 }
 
 
 def create_fingerprint(target_os: str, mode: str = "generate") -> dict[str, Any]:
     """创建一套环境指纹（生成模式或真实预设模式）。"""
+    # 移动端指纹使用专用引擎
+    if target_os in ("android", "ios"):
+        from .mobile_fingerprints import create_mobile_fingerprint
+        return create_mobile_fingerprint(target_os, mode)
+    
     data: dict[str, Any] = {
         "mode": mode,
         "fingerprint": None,
@@ -128,6 +142,21 @@ def _align_preset_ua(preset: dict) -> dict:
 
 def build_launch_kwargs(fingerprint_data: dict[str, Any]) -> dict[str, Any]:
     """把存储的指纹转成 AsyncNewBrowser 的指纹相关 kwargs。"""
+    target_os = fingerprint_data.get("target_os", "windows")
+    
+    # 移动端使用专用启动参数装配
+    if target_os in ("android", "ios"):
+        from .mobile_fingerprints import seeds_to_config
+        config = seeds_to_config(fingerprint_data)
+        
+        # 移动端不注入 preset 或 BrowserForge 指纹（camoufox 不支持移动平台）
+        # 返回空 kwargs，由 launcher 层处理移动端特殊启动逻辑
+        return {
+            "config": config,
+            "fonts": fingerprint_data.get("fonts", []),
+            "mobile_target_os": target_os,
+        }
+    
     mode = fingerprint_data.get("mode", "generate")
     kwargs: dict[str, Any] = {}
 
@@ -178,12 +207,30 @@ def check_health(fingerprint_data: dict[str, Any], target_os: str) -> dict[str, 
         hw = nav.get("hardwareConcurrency")
 
     # UA 与 platform 与目标 OS 三方一致
-    ua_os = "windows" if "Windows NT" in ua else "macos" if "Mac OS X" in ua else \
-            "linux" if "X11; Linux" in ua else "unknown"
+    # 注意：iPad UA 含 "like Mac OS X"，必须先判移动端标记再判 macOS
+    if "Android" in ua:
+        ua_os = "android"
+    elif any(tok in ua for tok in ("iPhone", "iPad", "iPod")):
+        ua_os = "ios"
+    elif "Windows NT" in ua:
+        ua_os = "windows"
+    elif "Mac OS X" in ua:
+        ua_os = "macos"
+    elif "X11; Linux" in ua:
+        ua_os = "linux"
+    else:
+        ua_os = "unknown"
     if ua_os != "unknown" and ua_os != target_os:
         warnings.append(f"UA 声称 {ua_os} 但目标是 {target_os}")
-    expected_platform = {"windows": "Win32", "macos": "MacIntel", "linux": "Linux x86_64"}
-    if platform and platform != expected_platform.get(target_os, platform):
+    expected_platform = {
+        "windows": {"Win32"},
+        "macos": {"MacIntel"},
+        "linux": {"Linux x86_64"},
+        # 移动端 JS 层 navigator.platform 的真机典型值
+        "android": {"Linux armv81", "Linux aarch64", "Linux armv7l"},
+        "ios": {"iPhone", "iPad", "iPod"},
+    }
+    if platform and platform not in expected_platform.get(target_os, {platform}):
         warnings.append(f"platform={platform} 与目标 OS {target_os} 不匹配")
 
     # GPU 渲染器与 OS 大方向匹配（宽松检查，只报明显矛盾）
@@ -199,6 +246,12 @@ def check_health(fingerprint_data: dict[str, Any], target_os: str) -> dict[str, 
             warnings.append(f"屏幕尺寸异常: {w}x{h}")
         if screen.get("colorDepth") not in (None, 24, 30):
             warnings.append(f"色深异常: {screen.get('colorDepth')}")
+        if target_os in ("android", "ios"):
+            dpr = float(screen.get("devicePixelRatio") or 0)
+            if not 1.5 <= dpr <= 4.5:
+                warnings.append(f"移动端 devicePixelRatio 异常: {screen.get('devicePixelRatio')}")
+            elif w and not 300 <= w / dpr <= 1024:
+                warnings.append(f"移动端 CSS 视口宽度异常: {w / dpr:.0f}px")
     except (TypeError, ValueError):
         warnings.append("屏幕字段类型异常")
 
@@ -223,6 +276,36 @@ def check_health(fingerprint_data: dict[str, Any], target_os: str) -> dict[str, 
 
 def summarize(fingerprint_data: dict[str, Any]) -> dict[str, Any]:
     """列表页摘要：UA、平台、屏幕、GPU、模式与健康分。"""
+    target_os = fingerprint_data.get("target_os", "windows")
+    
+    # 移动端指纹摘要
+    if target_os in ("android", "ios"):
+        fp = fingerprint_data.get("fingerprint", {}) or {}
+        nav = fp.get("navigator", {}) or {}
+        screen = fp.get("screen", {}) or {}
+        
+        # 从 videoCard 获取 GPU（移动端可能不存在）
+        vc = fp.get("videoCard") or {}
+        renderer = vc.get("renderer")
+        
+        return {
+            "mode": "合成生成 (移动端)",
+            "user_agent": nav.get("userAgent"),
+            "platform": nav.get("platform"),
+            "languages": nav.get("languages"),
+            "hardware_concurrency": nav.get("hardwareConcurrency"),
+            "device_memory": nav.get("deviceMemory"),
+            "max_touch_points": nav.get("maxTouchPoints"),
+            "screen": f"{screen.get('width')}x{screen.get('height')}@{screen.get('colorDepth')}" if screen.get("width") else None,
+            "webgl_renderer": renderer,
+            "manufacturer": fingerprint_data.get("manufacturer", "Unknown"),
+            "device_model": fingerprint_data.get("device_model"),
+            "fonts_count": len(fp.get("fonts", []) or []),
+            "seeds": fingerprint_data.get("seeds"),
+            "health": fingerprint_data.get("health", {"score": 100, "warnings": []}),
+        }
+    
+    # 桌面端指纹摘要（原有逻辑）
     mode = fingerprint_data.get("mode", "generate")
     if mode == "preset":
         nav = (fingerprint_data.get("preset") or {}).get("navigator") or {}
