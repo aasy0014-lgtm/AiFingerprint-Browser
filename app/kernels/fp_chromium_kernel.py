@@ -187,8 +187,16 @@ async def start(
         # WebRTC 默认禁用非代理 UDP，防 IP 泄露（该内核默认行为，显式声明）
         "--disable-non-proxied-udp",
     ]
-    if launch.fp_disable_spoofing:
-        args.append(f"--disable-spoofing={launch.fp_disable_spoofing}")
+    # 内核 canvas 伪装会给 WebGL readPixels 注入种子化像素噪声（R≠A），
+    # 被 BrowserScan 的「纯红三角形 R 应恒等于 A」零知识检查捕获 →
+    # "WebGL exception"（实测：3 个噪声像素 [254,1,0,255]）。
+    # 真机 readPixels 输出纯净，移动端必须关闭该类别；与用户显式配置合并。
+    disabled_spoofing = [s for s in (launch.fp_disable_spoofing or "").split(",") if s]
+    if mobile_mode or mobile_target_os in ("android", "ios"):
+        if "canvas" not in disabled_spoofing:
+            disabled_spoofing.append("canvas")
+    if disabled_spoofing:
+        args.append(f"--disable-spoofing={','.join(disabled_spoofing)}")
     hw = nav.get("hardwareConcurrency")
     if hw:
         args.append(f"--fingerprint-hardware-concurrency={int(hw)}")

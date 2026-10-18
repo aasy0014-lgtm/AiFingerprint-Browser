@@ -10,11 +10,19 @@
   3. DPR / screen 为 CSS 逻辑像素；innerHeight == 首屏视口高度（浏览器 UI 占位）
   4. screen.colorDepth == 24（宿主 macOS 报告 30，属穿帮点）
   5. WebGL 非遮蔽厂商/渲染器 == 指纹中的真机 GPU 字符串
-  6. Android：navigator.userAgentData（UA-CH）完整可用 + Sec-CH-UA* 请求头
+  6. Android：navigator.userAgentData（UA-CH）完整可用 + Sec-CH-UA* 请求头；
+     architecture/bitness 恒为空字符串（Chromium 源码的 Android 手机端行为）
   7. Android：navigator.deviceMemory（上报桶）+ Battery API（数值一致）
   8. iOS：navigator.userAgentData / connection / pdfViewerEnabled 不存在，
      plugins/mimeTypes 为空，navigator.standalone 存在且为 false
   9. navigator 上无 own-property 泄漏（JS 补丁改的是原型）
+ 10. WebGL readPixels 纯净：复刻 BrowserScan webglNoise「纯红三角形 R==A」
+     探针，任何噪声像素（内核 canvas 伪装已关闭）即为失败
+ 11. speechSynthesis.getVoices() 为空列表（宿主 macOS 有上百个语音，
+     是「Different operating systems」服务端判定的直接输入）
+ 12. WebGL getParameter(UNMASKED_RENDERER) 调用吞吐与原生同量级
+     （复刻 BrowserScan E() 计时器，Z<=100；纯 JS 缓存返回会被判
+     "WebGL exception"）
 
 用独立临时数据目录运行，不污染正式数据。
 
@@ -105,6 +113,74 @@ STATE_JS = """async () => {
                             listenable: typeof b.addEventListener === 'function' };
         } catch (e) { out.battery = 'error: ' + e.message; }
     }
+    // ---- speechSynthesis 语音列表（BrowserScan 只取数量作为 OS 判定输入）----
+    out.voices = await new Promise((resolve) => {
+        try {
+            if (!window.speechSynthesis) return resolve(-1);
+            const s = speechSynthesis;
+            const v0 = s.getVoices();
+            if (v0.length) return resolve(v0.length);
+            s.addEventListener('voiceschanged', () => resolve(s.getVoices().length));
+            setTimeout(() => resolve(s.getVoices().length), 1200);
+        } catch (e) { resolve(-2); }
+    });
+    // ---- BrowserScan webglNoise 复刻：纯红三角形，R 应恒等于 A ----
+    out.webglNoiseSample = null;
+    out.webglNoise = (() => {
+        try {
+            const t = document.createElement('canvas');
+            t.width = 41; t.height = 41;
+            const e = t.getContext('webgl2') || t.getContext('webgl');
+            if (!e) return -1;
+            const vsrc = "attribute vec2 attrVertex; void main () {gl_Position = vec4(attrVertex,0,1);}";
+            const fsrc = "void main() {gl_FragColor = vec4(1,0,0,1);}";
+            const c = e.createBuffer();
+            e.bindBuffer(e.ARRAY_BUFFER, c);
+            e.bufferData(e.ARRAY_BUFFER, new Float32Array([0, 1, -1, -1, 1, -1]), e.STATIC_DRAW);
+            const a = e.createProgram();
+            const r = e.createShader(e.VERTEX_SHADER);
+            e.shaderSource(r, vsrc); e.compileShader(r);
+            const E = e.createShader(e.FRAGMENT_SHADER);
+            e.shaderSource(E, fsrc); e.compileShader(E);
+            e.attachShader(a, r); e.attachShader(a, E);
+            e.linkProgram(a); e.useProgram(a);
+            const loc = e.getAttribLocation(a, 'attrVertex');
+            e.enableVertexAttribArray(loc);
+            e.vertexAttribPointer(loc, 2, e.FLOAT, false, 0, 0);
+            e.drawArrays(e.TRIANGLES, 0, 3);
+            const d = new Uint8Array(e.drawingBufferWidth * e.drawingBufferHeight * 4);
+            e.readPixels(0, 0, e.drawingBufferWidth, e.drawingBufferHeight,
+                         e.RGBA, e.UNSIGNED_BYTE, d);
+            const sample = [];
+            let bad = 0;
+            for (let T = 0; T < d.length; T += 4) {
+                if (d[T] !== d[T + 3]) {
+                    bad += 1;
+                    if (sample.length < 20) sample.push(T, d[T], d[T + 1], d[T + 2], d[T + 3]);
+                }
+            }
+            out.webglNoiseSample = sample;
+            return bad;
+        } catch (err) { return -2; }
+    })();
+    // ---- BrowserScan E()：getParameter(UNMASKED_RENDERER) 调用吞吐计时 ----
+    // Z = 5ms 窗口内调用数 / 实际毫秒；原生约 2-3，纯 JS 缓存返回每毫秒数万次。
+    out.glPerfZ = (() => {
+        try {
+            const R = document.createElement('canvas');
+            const Y = R.getContext('webgl2') || R.getContext('webgl');
+            if (!Y) return -1;
+            const te = Y.getExtension('WEBGL_debug_renderer_info');
+            if (!te) return -1;
+            var h = performance.now(), I = 0;
+            while (5 > performance.now() - h) {
+                for (let k = 0; k < 10; k++) { Y.getParameter(te.UNMASKED_RENDERER_WEBGL); }
+                I += 10;
+            }
+            h = performance.now() - h;
+            return Math.round(I / h);
+        } catch (err) { return -2; }
+    })();
     const gl = (() => {
         try {
             const c = document.createElement('canvas');
@@ -375,6 +451,13 @@ async def main() -> int:
         "colorDepth getter 原生且 enumerable": (
             (state.get("integrity") or {}).get("colorDepthGetterNative") is True
             and (state.get("integrity") or {}).get("colorDepthEnumerable") is True),
+        # ---- BrowserScan 服务端 OS 判定输入：语音列表必须为空 ----
+        "speechSynthesis 语音列表为空": state.get("voices") == 0,
+        # ---- BrowserScan webglNoise：readPixels 纯净（内核 canvas 伪装已关闭）----
+        "WebGL readPixels 无噪声（R==A）": state.get("webglNoise") == 0,
+        # ---- BrowserScan E()：getParameter 耗时须与原生同量级（Z<=100）----
+        "WebGL getParameter 吞吐原生量级（Z<=100）": (
+            isinstance(state.get("glPerfZ"), int) and 0 <= state.get("glPerfZ") <= 100),
     }
 
     if is_android:
@@ -393,6 +476,8 @@ async def main() -> int:
                 high.get("platformVersion") == (ua_ch or {}).get("platformVersion")),
             "UA-CH 高熵 fullVersionList == 指纹": bool(high) and (
                 high.get("fullVersionList") == (ua_ch or {}).get("fullVersionList")),
+            "UA-CH 高熵 architecture/bitness 为空串（Android 手机端行为）": bool(high) and (
+                high.get("architecture") == "" and high.get("bitness") == ""),
             "deviceMemory == 内存桶": state.get("deviceMemory") == mem_class,
             "Battery API 可用且数值一致": bool(battery)
                 and abs(battery.get("level", -1) - fpd["battery"]["level"]) < 0.01

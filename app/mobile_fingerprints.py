@@ -153,7 +153,11 @@ def _android_ua_ch(device: Dict[str, Any], os_version: str, browser: Dict[str, A
         "fullVersion": full,
         "platform": "Android",
         "platformVersion": f"{os_version}.0.0",
-        "architecture": "arm",
+        # Chromium 源码行为：Android 手机端 architecture / bitness 恒为空字符串
+        # （components/embedder_support/user_agent_utils.cc：GetCpuArchitecture /
+        # GetCpuBitness 在 IS_ANDROID 且非桌面/XR 设备上返回 ""）。
+        # 填 "arm" 会与真机组合不符，服务端 OS 一致性检查可据此判定为桌面系统。
+        "architecture": "",
         "bitness": "",
         "model": str(device["model"]),
         "mobile": device["type"] == "phone",

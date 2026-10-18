@@ -100,6 +100,15 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
     webgl = {"vendor": str(vc.get("vendor") or ""), "renderer": renderer} if renderer else None
 
     ua_ch = extra.get("uaCh") or None
+    if target_os == "android" and ua_ch:
+        # Chromium 源码事实：Android 手机端 UA-CH 的 architecture/bitness 恒为空字符串
+        # （components/embedder_support/user_agent_utils.cc：GetCpuArchitecture /
+        # GetCpuBitness 在 IS_ANDROID 且非桌面/XR 设备上返回 ""）。
+        # 旧版指纹数据曾填 "arm"，此处运行期归一化，避免「UA 是安卓、高熵值却
+        # 带桌面架构」被服务端 OS 一致性判定命中。
+        ua_ch = dict(ua_ch)
+        ua_ch["architecture"] = ""
+        ua_ch["bitness"] = ""
 
     battery = fp.get("battery") if (target_os == "android" and fp.get("battery")) else None
 
@@ -333,6 +342,21 @@ _PATCH_TEMPLATE = r"""
             defineGet(Screen.prototype, 'pixelDepth', D.colorDepth);
         }
 
+        // ---- SpeechSynthesis：移动端语音列表必须为空 ----
+        // Android Chrome 不提供语音枚举（getVoices() 恒为 []）；宿主 macOS 会
+        // 暴露上百个语音（婷婷/Albert/Samantha…），检测站点把这个数量直接作为
+        // OS 判定输入（BrowserScan 的 "Different operating systems" 即来源于
+        // macOS 语音数 180 vs 安卓期望 0）。iOS Safari 在无用户手势的检测场景
+        // 同样返回空列表，故两端统一清空。
+        try {
+            var SS = (typeof SpeechSynthesis !== 'undefined') ? SpeechSynthesis.prototype : null;
+            if (SS && SS.getVoices) {
+                defineFn(SS, 'getVoices', function () { return []; });
+            } else if (window.speechSynthesis) {
+                defineFn(window.speechSynthesis, 'getVoices', function () { return []; });
+            }
+        } catch (e) {}
+
         // ---- WebGL：非遮蔽厂商/渲染器（内核原生 GPU 伪装不含移动平台）----
         if (D.webgl && D.webgl.renderer) {
             try {
@@ -340,8 +364,16 @@ _PATCH_TEMPLATE = r"""
                     if (!Ctor || !Ctor.prototype || !Ctor.prototype.getParameter) { return; }
                     var orig = Ctor.prototype.getParameter;
                     var wrapped = __maskNative(function (p) {
-                        if (p === 37445) { return D.webgl.vendor; }
-                        if (p === 37446) { return D.webgl.renderer; }
+                        if (p === 37445 || p === 37446) {
+                            // 耗时对齐原生：真实查询仍走一遍原生路径（结果丢弃后返回伪造值）。
+                            // 若纯 JS 直接返回闭包字符串，吞吐量可达每毫秒数万次；
+                            // BrowserScan 的 E() 计时器在 5ms 内压测
+                            // getParameter(UNMASKED_RENDERER_WEBGL) 调用数，Z = 调用数/毫秒，
+                            // Z > 100 即判定「WebGL 被伪造」→ "WebGL exception" -5%。
+                            // 原生路径约 0.5ms/次（Z≈2-3），与真机同量级。
+                            try { orig.apply(this, arguments); } catch (e) {}
+                            return p === 37445 ? D.webgl.vendor : D.webgl.renderer;
+                        }
                         return orig.apply(this, arguments);
                     }, 'getParameter');
                     Object.defineProperty(Ctor.prototype, 'getParameter', {
