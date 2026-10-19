@@ -1,0 +1,3 @@
+=== breakpad-DEPS-entry.txt (chromium/src@0cb96822e59630c82a826186a57b88d10d998e88 DEPS) ===
+  'src/breakpad/src':
+    Var('chromium_git') + '/breakpad/breakpad/src.git' + '@' + '7a65a47345a86c9e9a3fbc2e92a756a429a0c82f',

@@ -1,0 +1,91 @@
+================================================================================
+Chrome 61 IPA 分析 - 第二轮：官方源码快照清单
+================================================================================
+样本:        Chrome for iOS 61.0.3163.73 (stable), SHA-256
+             5f9011796284092acfc271f6e429005daa19fb517ec4370663e68413a83a041c
+锚点:        样本内置 SCMRevision（与构建号 61.0.3163.73 对应）
+             Chromium commit: 0cb96822e59630c82a826186a57b88d10d998e88
+Breakpad:   由该 commit 的 DEPS 指定（见 breakpad-DEPS-entry.txt）
+             breakpad/breakpad/src @ 7a65a47345a86c9e9a3fbc2e92a756a429a0c82f
+获取模板:    https://chromium.googlesource.com/chromium/src/+/<commit>/<path>?format=TEXT
+             https://chromium.googlesource.com/breakpad/breakpad/src/+/<rev>/<path>?format=TEXT
+             （?format=TEXT 返回 base64；用 base64 -d 解码）
+
+--------------------------------------------------------------------------------
+快照文件与本轮用途
+--------------------------------------------------------------------------------
+
+[Safe Mode / 崩溃检测]
+safe_mode_util.cc                             ios/chrome/app/safe_mode_util.cc
+    GetLoadedImages()：_dyld_image_count + _dyld_get_image_name + 前缀过滤
+safe_mode_coordinator.mm / .h                 ios/chrome/app/safe_mode/safe_mode_coordinator.{mm,h}
+    触发条件：启动失败计数 >= 2 且 hasSuggestions；进入后重置计数
+safe_mode_view_controller.mm                  ios/chrome/app/safe_mode/safe_mode_view_controller.mm
+    hasSuggestions / hasReportToUpload / UI 文案与按钮 / 恢复上传流程
+safe_mode_crashing_modules_config.mm          ios/chrome/app/safe_mode_crashing_modules_config.mm
+    读取 SafeModeCrashingModules.plist（StartupCrashModules / ModuleFriendlyName）
+crash_loop_detection_util.mm                  ios/chrome/browser/crash_loop_detection_util.mm
+    NSUserDefaults "AppStartupFailureCount" 计数逻辑
+
+[Breakpad 崩溃上报]
+breakpad_helper.mm                            ios/chrome/browser/crash_report/breakpad_helper.mm
+    上传参数（crashed_in_background/free_memory_in_kb/.../uploaded_in_recovery_mode）、
+    恢复模式上传（setParametersToAddAtUploadTime）、crash key 桥接
+crash_keys.cc                                 ios/chrome/browser/crash_report/crash_keys.cc
+    固定崩溃键：channel / metrics_client_id / num-experiments / variations / zombie...
+components_crash_keys.cc / .h                 components/crash/core/common/crash_keys.{cc,h}
+    上述崩溃键的字面值定义
+breakpad-DEPS-entry.txt                        该 Chromium commit 的 DEPS 片段（Breakpad 修订号）
+breakpad-minidump-generator-excerpt.txt       breakpad client/mac/handler/minidump_generator.cc（节选）
+    Write() 的 stream 列表；WriteModuleListStream / WriteModuleStream（模块全路径写入）
+breakpad-GenerateReport-excerpt.txt           breakpad client/ios/Breakpad.mm（节选）
+    GenerateReport()：MinidumpGenerator(mach_task_self(), MACH_PORT_NULL).Write()
+breakpad-uploader-excerpt.txt                 breakpad client/mac/sender/uploader.mm（节选）
+    guid/client id 生成；minidump 2MB 限制；multipart 字段 upload_file_minidump
+    （iOS 不附带 log 文件）；google 参数映射 ptime/prod/ver/guid
+
+[UA 构造]
+chrome_web_client.mm                          ios/chrome/browser/web/chrome_web_client.mm
+    GetProduct()="CriOS/"+version；GetUserAgent（DESKTOP/MOBILE/--user-agent 覆盖）
+user_agent.mm                                 ios/web/public/user_agent.mm
+    BuildUserAgentFromProduct / BuildOSCpuInfo / 静态 WebKit-Safari 版本表 / sysctl kern.osversion
+web_view_internal_creation_util.mm            ios/web/web_state/web_view_internal_creation_util.mm
+    BuildWKWebView：customUserAgent = GetWebClient()->GetUserAgent(type)
+chrome_web_view_factory.mm                    ios/chrome/browser/ui/chrome_web_view_factory.mm
+    kDesktopUserAgent（"Request Desktop Site" 用的固定 macOS Safari UA）
+
+[页面脚本注入 / 消息通道]
+page_script_util.mm                           ios/web/web_state/js/page_script_util.mm
+    GetEarlyPageScript：`if (typeof __gCrWeb !== 'object')` 幂等包装
+wk_web_view_configuration_provider.mm         ios/web/web_state/ui/wk_web_view_configuration_provider.mm
+    WKUserScript：AtDocumentStart + forMainFrameOnly:YES + addUserScript
+crw_js_injection_manager.mm                   ios/web/web_state/js/crw_js_injection_manager.mm
+    注入管理（脚本缓存、按类缓存、injectIfNecessary）
+crw_js_window_id_manager.mm                   ios/web/web_state/js/crw_js_window_id_manager.mm
+    $(WINDOW_ID) 替换；16 随机字节→hex；重试注入
+message.js                                    ios/web/web_state/js/resources/message.js
+    scheme='crwebinvoke'；postMessage({crwCommand,crwWindowId})；delete window.webkit
+window_id.js                                  ios/web/web_state/js/resources/window_id.js
+    __gCrWeb['windowId']='$(WINDOW_ID)'；invokeQueues()
+crw_web_controller-excerpts.txt               ios/web/web_state/ui/crw_web_controller.mm（节选）
+    kScriptMessageName="crwebinvoke"；windowID 包裹模板；主框架校验；消息路由注册
+
+[WebUI]
+chrome_web_ui_ios_controller_factory.mm       ios/chrome/browser/ui/webui/chrome_web_ui_ios_controller_factory.mm
+    iOS 实际注册的 chrome:// 页面清单
+web_ui_bundle.js                              ios/web/webui/resources/web_ui_bundle.js
+    mojoApi + webUIBind + webUISend（WebUI 页面专属桥）
+chrome_bundle.js                              ios/chrome/browser/web/resources/chrome_bundle.js
+    goog.require('__crWeb.print')（对应包内 chrome_bundle.js）
+navigation.js                                 ios/web/web_state/js/resources/navigation.js
+    对应包内 nav_bundle.js 的源文件
+web_bundle.bundle-def.js                      ios/web/web_state/js/resources/web_bundle.js
+    对应包内 web_bundle.js 的 bundle 定义（goog.require 列表）
+
+--------------------------------------------------------------------------------
+备注
+--------------------------------------------------------------------------------
+- 包内 .js 为重编译产物（Closure ADVANCED_OPTIMIZATIONS），与上面源文件语义一致但
+  变量名被压缩；压缩产物中保留的公共名（如 __gCrWeb、invokeOnHost、crwebinvoke、
+  print.window.print 等）与源文件一一对应。
+- 所有抓取只用官方 Git 仓库（chromium.googlesource.com），未改动样本。

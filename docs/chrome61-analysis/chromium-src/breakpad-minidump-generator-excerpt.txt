@@ -1,0 +1,61 @@
+=== breakpad/client/mac/handler/minidump_generator.cc @7a65a47 (excerpt) ===
+  WriteStreamFN writers[] = {
+    &MinidumpGenerator::WriteThreadListStream,
+    &MinidumpGenerator::WriteMemoryListStream,
+    &MinidumpGenerator::WriteSystemInfoStream,
+    &MinidumpGenerator::WriteModuleListStream,
+    &MinidumpGenerator::WriteMiscInfoStream,
+    &MinidumpGenerator::WriteBreakpadInfoStream,
+    // Exception stream needs to be the last entry in this array as it may
+    // be omitted in the case where the minidump is written without an
+    // exception.
+    &MinidumpGenerator::WriteExceptionStream,
+  };
+  bool result = false;
+...
+
+    int cpu_type = header->cputype;
+    unsigned long slide = _dyld_get_image_vmaddr_slide(index);
+    const char* name = _dyld_get_image_name(index);
+    const struct load_command *cmd =
+        reinterpret_cast<const struct load_command *>(header + 1);
+
+
+          module->base_of_image = seg->vmaddr + slide;
+          module->size_of_image = static_cast<uint32_t>(seg->vmsize);
+          module->module_name_rva = string_location.rva;
+
+...
+bool MinidumpGenerator::WriteModuleListStream(
+    MDRawDirectory *module_list_stream) {
+  TypedMDRVA<MDRawModuleList> list(&writer_);
+
+  uint32_t image_count = dynamic_images_ ?
+      dynamic_images_->GetImageCount() :
+      _dyld_image_count();
+
+  if (!list.AllocateObjectAndArray(image_count, MD_MODULE_SIZE))
+    return false;
+
+  module_list_stream->stream_type = MD_MODULE_LIST_STREAM;
+  module_list_stream->location = list.location();
+  list.get()->number_of_modules = static_cast<uint32_t>(image_count);
+
+  // Write out the executable module as the first one
+  MDRawModule module;
+  uint32_t executableIndex = FindExecutableModule();
+
+  if (!WriteModuleStream(static_cast<unsigned>(executableIndex), &module)) {
+    return false;
+  }
+
+  list.CopyIndexAfterObject(0, &module, MD_MODULE_SIZE);
+  int destinationIndex = 1;  // Write all other modules after this one
+
+  for (uint32_t i = 0; i < image_count; ++i) {
+    if (i != executableIndex) {
+      if (!WriteModuleStream(static_cast<unsigned>(i), &module)) {
+        return false;
+      }
+
+      list.CopyIndexAfterObject(destinationIndex++, &module, MD_MODULE_SIZE);

@@ -1,0 +1,35 @@
+=== breakpad/client/ios/Breakpad.mm GenerateReport (excerpt) ===
+NSDictionary *Breakpad::GenerateReport(NSDictionary *server_parameters) {
+  NSString *dumpDirAsNSString = KeyValue(@BREAKPAD_DUMP_DIRECTORY);
+  if (!dumpDirAsNSString)
+    return nil;
+  const char *dumpDir = [dumpDirAsNSString UTF8String];
+
+  google_breakpad::MinidumpGenerator generator(mach_task_self(),
+                                               MACH_PORT_NULL);
+  std::string dumpId;
+  std::string dumpFilename = generator.UniqueNameInDirectory(dumpDir, &dumpId);
+  bool success = generator.Write(dumpFilename.c_str());
+  if (!success)
+    return nil;
+
+  SimpleStringDictionary params = *config_params_;
+  for (NSString *key in server_parameters) {
+    params.SetKeyValue([key UTF8String],
+                       [[server_parameters objectForKey:key] UTF8String]);
+  }
+  ConfigFile config_file;
+  config_file.WriteFile(dumpDir, &params, dumpDir, dumpId.c_str());
+
+  // Handle results.
+  NSMutableDictionary *result = [NSMutableDictionary dictionary];
+  NSString *dumpFullPath = [NSString stringWithUTF8String:dumpFilename.c_str()];
+  [result setValue:dumpFullPath
+            forKey:@BREAKPAD_OUTPUT_DUMP_FILE];
+  [result setValue:[NSString stringWithUTF8String:config_file.GetFilePath()]
+            forKey:@BREAKPAD_OUTPUT_CONFIG_FILE];
+  return result;
+}
+
+//=============================================================================
+bool Breakpad::HandleMinidump(const char *dump_dir,

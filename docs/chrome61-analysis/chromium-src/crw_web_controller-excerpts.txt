@@ -1,0 +1,61 @@
+=== ios/web/web_state/ui/crw_web_controller.mm (excerpts) ===
+--- kScriptMessageName ---
+
+// URL scheme for messages sent from javascript for asynchronous processing.
+NSString* const kScriptMessageName = @"crwebinvoke";
+
+// Constants for storing the source of NSErrors received by WKWebViews:
+--- windowID script wrapper / message validation ---
+- (NSString*)scriptByAddingWindowIDCheckForScript:(NSString*)script {
+  NSString* kTemplate = @"if (__gCrWeb['windowId'] === '%@') { %@; }";
+  return [NSString
+      stringWithFormat:kTemplate, [_windowIDJSManager windowID], script];
+}
+
+- (BOOL)respondToWKScriptMessage:(WKScriptMessage*)scriptMessage {
+  if (!scriptMessage.frameInfo.mainFrame) {
+    // Messages from iframes are not currently supported.
+    return NO;
+  }
+
+  std::unique_ptr<base::Value> messageAsValue =
+      web::ValueResultFromWKResult(scriptMessage.body);
+  base::DictionaryValue* message = nullptr;
+  if (!messageAsValue || !messageAsValue->GetAsDictionary(&message)) {
+    return NO;
+  }
+  std::string windowID;
+  message->GetString("crwWindowId", &windowID);
+  // Check for correct windowID
+  if (base::SysNSStringToUTF8([_windowIDJSManager windowID]) != windowID) {
+    DLOG(WARNING) << "Message from JS ignored due to non-matching windowID: " <<
+        [_windowIDJSManager windowID]
+                  << " != " << base::SysUTF8ToNSString(windowID);
+    return NO;
+  }
+  base::DictionaryValue* command = nullptr;
+  if (!message->GetDictionary("crwCommand", &command)) {
+    return NO;
+  }
+  if ([scriptMessage.name isEqualToString:kScriptMessageName]) {
+    return [self respondToMessage:command
+                userIsInteracting:[self userIsInteracting]
+                        originURL:net::GURLWithNSURL([_webView URL])];
+  }
+
+  NOTREACHED();
+  return NO;
+}
+--- message router registration ---
+  if (webView) {
+    base::WeakNSObject<CRWWebController> weakSelf(self);
+    [messageRouter setScriptMessageHandler:^(WKScriptMessage* message) {
+      [weakSelf didReceiveScriptMessage:message];
+    }
+                                      name:kScriptMessageName
+                                   webView:webView];
+    _windowIDJSManager.reset(
+        [[CRWJSWindowIDManager alloc] initWithWebView:webView]);
+  } else {
+    _windowIDJSManager.reset();
+  }
