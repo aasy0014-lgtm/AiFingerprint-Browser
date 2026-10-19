@@ -39,6 +39,7 @@
 """
 import asyncio
 import json
+import math
 import os
 import re
 import sys
@@ -287,9 +288,12 @@ try {
   w.onmessage = function (ev) { for (var k in ev.data) { window.workerData[k] = ev.data[k]; } };
 } catch (e) { window.workerErr = String(e); }
 // 跨域 iframe（不同 site → OOPIF）
+// allow 委托传感器权限：devicemotion 受 accelerometer/gyroscope Permissions
+// Policy 门控（默认 allowlist=self），未委托的跨域子帧真机同样拿不到事件。
 var f = document.createElement('iframe');
 f.src = 'http://localhost:__PORT__/oopif-probe';
 f.width = 320; f.height = 240;
+f.setAttribute('allow', 'accelerometer; gyroscope; magnetometer');
 document.documentElement.appendChild(f);
 </script></head><body>main</body></html>"""
 
@@ -326,11 +330,26 @@ try {
   window.__workerData = {};
   w.onmessage = function (ev) { for (var k in ev.data) { window.__workerData[k] = ev.data[k]; } };
 } catch (e) { window.__workerErr = String(e); }
+// 传感器面：跨域 iframe（OOPIF 进程）内 devicemotion 数值流（父页已按
+// Permissions Policy 声明 allow 委托；未委托时内核抑制，与真机同规则）
+window.__dmCount = 0;
+window.__dmNumeric = 0;
+try {
+  window.addEventListener('devicemotion', function (e) {
+    window.__dmCount++;
+    var g = e.accelerationIncludingGravity;
+    if (g && (typeof g.x === 'number' || typeof g.y === 'number' || typeof g.z === 'number')) {
+      window.__dmNumeric++;
+    }
+  }, true);
+} catch (e) {}
 setTimeout(function () {
   var out = {};
   for (var k in window.__early) { out[k] = window.__early[k]; }
   out.worker = window.__workerData || null;
   out.workerErr = window.__workerErr || null;
+  out.dm = window.__dmCount;
+  out.dmNumeric = window.__dmNumeric;
   parent.postMessage(out, '*');
 }, 1300);
 </script></head><body>probe</body></html>"""
@@ -469,6 +488,153 @@ async def input_event_probe(page) -> dict:
         "() => { const el = document.getElementById('__mobile_input_probe');"
         " if (el) el.remove(); }")
     return out
+
+
+# 传感器面探针：真机 Chrome Android 有持续数值事件流（devicemotion 60Hz 级、
+# deviceorientation 随传感器更新派发）；桌面内核只在注册监听时派发一次全 null
+# 的「无传感器」哨兵事件——连续数值流是模拟器/桌面装手机最直接的判据之一。
+# iOS 侧另有 WebKit 专有的 requestPermission 静态方法（iOS 14.5+）与
+# DeviceOrientationEvent.absolute 缺失、deviceorientationabsolute 不存在三个面。
+SENSOR_PROBE_JS = r"""async () => {
+  const S = window.__sensor = {
+    requestPermission: {
+      motion: typeof (window.DeviceMotionEvent || {}).requestPermission,
+      orientation: typeof (window.DeviceOrientationEvent || {}).requestPermission,
+    },
+    orientationAbsoluteInProto: (typeof DeviceOrientationEvent === 'function')
+      && ('absolute' in DeviceOrientationEvent.prototype),
+    onDeviceOrientationAbsolute: 'ondeviceorientationabsolute' in window,
+    counts: { motion: 0, motionNumeric: 0, orientation: 0, orientationNumeric: 0,
+              orientationAbsolute: 0, orientationAbsoluteNumeric: 0 },
+    lastMotion: null, lastOrientation: null, lastOrientationAbsolute: null,
+  };
+  const num = (v) => typeof v === 'number' && isFinite(v);
+  window.addEventListener('devicemotion', (e) => {
+    S.counts.motion++;
+    const aig = e.accelerationIncludingGravity, acc = e.acceleration, rr = e.rotationRate;
+    if (aig && (num(aig.x) || num(aig.y) || num(aig.z))) S.counts.motionNumeric++;
+    S.lastMotion = { trusted: e.isTrusted, interval: e.interval,
+      aig: aig ? [aig.x, aig.y, aig.z] : null,
+      acc: acc ? [acc.x, acc.y, acc.z] : null,
+      rr: rr ? [rr.alpha, rr.beta, rr.gamma] : null };
+  }, true);
+  const orient = (e) => ({ trusted: e.isTrusted, a: e.alpha, b: e.beta, g: e.gamma,
+                           abs: e.absolute });
+  window.addEventListener('deviceorientation', (e) => {
+    S.counts.orientation++;
+    if (num(e.alpha) || num(e.beta) || num(e.gamma)) S.counts.orientationNumeric++;
+    S.lastOrientation = orient(e);
+  }, true);
+  window.addEventListener('deviceorientationabsolute', (e) => {
+    S.counts.orientationAbsolute++;
+    if (num(e.alpha) || num(e.beta) || num(e.gamma)) S.counts.orientationAbsoluteNumeric++;
+    S.lastOrientationAbsolute = orient(e);
+  }, true);
+  await new Promise((r) => setTimeout(r, 1500));
+  return S;
+}"""
+
+
+# requestPermission 语义探针（仅 iOS 有该方法）。
+# 必须在「无自动化激活污染」的独立页面 + 裸 CDP Runtime.evaluate 上测：
+# Playwright 的 evaluate 默认以 userGesture=true 执行（实现细节），会给
+# 文档授予瞬时激活——同一文档内永远测不到「无手势」分支。两段语义：
+#   - 无手势调用 → 真机 reject NotAllowedError（WebKit 原文案）；
+#   - CDP 触摸点击按钮（真实手势）→ 真机弹系统授权框、Promise 保持
+#     pending 直到用户作答；仿真不弹框也不伪造授权结果，同样保持 pending。
+REQUEST_PERMISSION_CALL_JS = (
+    "(() => { const r = window.__rpNoGesture = { state: 'pending' };"
+    " const ua = navigator.userActivation;"
+    " r.activation = ua ? { active: ua.isActive, sticky: ua.hasBeenActive } : null;"
+    " DeviceMotionEvent.requestPermission().then("
+    "  (v) => { r.state = 'resolved:' + v; },"
+    "  (e) => { r.state = 'rejected:' + (e && e.name); });"
+    " return 'called'; })()")
+
+
+REQUEST_PERMISSION_GESTURE_JS = (
+    "(() => { const btn = document.createElement('button');"
+    " btn.id = '__rp_probe'; btn.textContent = 'rp';"
+    " btn.style.cssText = 'position:fixed;left:0;top:0;width:240px;height:240px;'"
+    "  + 'z-index:2147483647;background:transparent;border:0';"
+    " window.__rpGesture = { state: 'pending' };"
+    " btn.addEventListener('click', () => { const ua = navigator.userActivation;"
+    "  window.__rpGesture.activation = ua ? { active: ua.isActive, sticky: ua.hasBeenActive } : null;"
+    "  DeviceMotionEvent.requestPermission().then("
+    "   (v) => { window.__rpGesture.state = 'resolved:' + v; },"
+    "   (e) => { window.__rpGesture.state = 'rejected:' + (e && e.name); }); });"
+    " document.body.appendChild(btn); return 'ok'; })()")
+
+
+async def sensor_probe(page) -> dict:
+    """传感器面：Android 连续数值流 + iOS WebKit 权限面/语义。"""
+    out: dict = await page.evaluate(SENSOR_PROBE_JS)
+    if (out.get("requestPermission") or {}).get("motion") == "function":
+        out.update(await _request_permission_probe(page))
+    return out
+
+
+async def _request_permission_probe(page) -> dict:
+    """iOS requestPermission 两段语义（独立页面 + 裸 CDP，见上注）。"""
+    out: dict = {}
+    fresh = None
+    try:
+        fresh = await page.context.new_page()
+        cdp = await fresh.context.new_cdp_session(fresh)
+        await cdp.send("Page.enable")
+        await cdp.send("Page.navigate", {"url": page.url})
+        await asyncio.sleep(1.0)
+
+        async def raw(expr):
+            res = await cdp.send("Runtime.evaluate",
+                                 {"expression": expr, "returnByValue": True})
+            return res.get("result", {}).get("value")
+
+        out["freshPage"] = await raw("location.href")
+        out["noGestureCalls"] = await raw(REQUEST_PERMISSION_CALL_JS)
+        await asyncio.sleep(0.6)
+        out["noGesture"] = await raw("window.__rpNoGesture")
+        await raw(REQUEST_PERMISSION_GESTURE_JS)
+        await cdp.send("Input.dispatchTouchEvent", {
+            "type": "touchStart",
+            "touchPoints": [{"x": 120, "y": 120, "radiusX": 1, "radiusY": 1,
+                             "force": 1, "id": 1}],
+        })
+        await cdp.send("Input.dispatchTouchEvent",
+                       {"type": "touchEnd", "touchPoints": []})
+        await asyncio.sleep(0.5)
+        out["gesture"] = await raw("window.__rpGesture")
+    except Exception as exc:  # noqa: BLE001
+        out["requestPermissionError"] = f"{type(exc).__name__}: {exc}"[:160]
+    finally:
+        if fresh is not None:
+            try:
+                await fresh.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return out
+
+
+def _sensor_magnitude(values) -> float | None:
+    """向量模长；含 None/非数值时返回 None。"""
+    if not isinstance(values, list) or not values:
+        return None
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+               for v in values):
+        return None
+    return math.sqrt(sum(float(v) ** 2 for v in values))
+
+
+def _aig_from_orientation(beta_deg: float, gamma_deg: float) -> tuple:
+    """真机自洽关系：由 deviceorientation 的 beta/gamma 反推重力方向。
+
+    aig = (−g·cosβ·sinγ, g·sinβ, g·cosβ·cosγ)，与注入层的姿态生成同源。
+    """
+    beta = math.radians(float(beta_deg))
+    gamma = math.radians(float(gamma_deg))
+    return (-9.80665 * math.cos(beta) * math.sin(gamma),
+            9.80665 * math.sin(beta),
+            9.80665 * math.cos(beta) * math.cos(gamma))
 
 
 async def race_test(ws_endpoint: str) -> dict:
@@ -643,6 +809,7 @@ async def main() -> int:
     webgpu_state: dict = {}
     media_state: dict = {}
     event_state: dict = {}
+    sensor_state: dict = {}
 
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
@@ -778,6 +945,13 @@ async def main() -> int:
             media_state = await page.evaluate(MEDIA_JS) or {}
             print("\n== 媒体设备枚举 ==")
             print(json.dumps(media_state, ensure_ascii=False))
+
+            # ---- 传感器面：必须在信任来源（127.0.0.1/localhost）上测量。
+            #      真机 Chrome 在非安全上下文同样不派发传感器事件（probe.test
+            #      不可用），此处页面已在 127.0.0.1 的本地服务上。----
+            sensor_state = await sensor_probe(page)
+            print("\n== 传感器面（devicemotion / deviceorientation）==")
+            print(json.dumps(sensor_state, ensure_ascii=False))
         finally:
             oopif_server.shutdown()
     finally:
@@ -880,6 +1054,26 @@ async def main() -> int:
         "Worker（跨域 iframe）：platform 一致": fr_worker.get("late") == nav.get("platform"),
     })
 
+    # ---- 传感器面：数值流 / 自洽性 / WebKit 权限面 ----
+    sensor = sensor_state if isinstance(sensor_state, dict) else {}
+    sensor_counts = sensor.get("counts") or {}
+    last_motion = sensor.get("lastMotion") or {}
+    last_do = sensor.get("lastOrientation") or {}
+    last_doa = sensor.get("lastOrientationAbsolute") or {}
+    rp = sensor.get("requestPermission") or {}
+    rp_no_gesture = sensor.get("noGesture") or {}
+    rp_gesture = sensor.get("gesture") or {}
+    aig_mag = _sensor_magnitude(last_motion.get("aig"))
+    lin_mag = _sensor_magnitude(last_motion.get("acc"))
+    gyro_mag = _sensor_magnitude(last_motion.get("rr"))
+    gravity_delta = None
+    if (isinstance(last_do.get("b"), (int, float))
+            and isinstance(last_do.get("g"), (int, float))
+            and isinstance(last_motion.get("aig"), list) and aig_mag is not None):
+        expected = _aig_from_orientation(last_do["b"], last_do["g"])
+        gravity_delta = max(abs(expected[i] - float(last_motion["aig"][i]))
+                            for i in range(3))
+
     if is_android:
         ua_data = state.get("uaData") if isinstance(state.get("uaData"), dict) else None
         high = state.get("uaDataHigh") if isinstance(state.get("uaDataHigh"), dict) else None
@@ -976,6 +1170,32 @@ async def main() -> int:
             "媒体设备：未授权时 label/deviceId/groupId 全空 + instanceof 成立": (
                 (media_state or {}).get("allMasked") is True
                 and (media_state or {}).get("protoOk") is True),
+            # ---- 传感器面：真机 Android 持续数值事件流（桌面内核只有 null 哨兵）----
+            "传感器：devicemotion 连续数值流（60Hz 级）": (
+                sensor_counts.get("motionNumeric", 0) >= 30),
+            "传感器：无全 null 哨兵事件（桌面内核无传感器特征）": (
+                sensor_counts.get("motion", 0) == sensor_counts.get("motionNumeric", 0)),
+            "传感器：事件可信（isTrusted）且 interval 合理": (
+                last_motion.get("trusted") is True
+                and 0 < (last_motion.get("interval") or 0) <= 100),
+            "传感器：重力矢量量级 ≈ 9.8 m/s²（手持姿态）": (
+                aig_mag is not None and 9.2 <= aig_mag <= 10.1),
+            "传感器：线性加速度量级合理（去重力 |a| ≤ 2）": (
+                lin_mag is not None and lin_mag <= 2.0),
+            "传感器：角速度近似静止（|ω| ≤ 5 deg/s）": (
+                gyro_mag is not None and gyro_mag <= 5.0),
+            "传感器：重力矢量与 deviceorientation 自洽（交叉校验）": (
+                gravity_delta is not None and gravity_delta <= 0.35),
+            "传感器：deviceorientation 事件流且 absolute == false": (
+                sensor_counts.get("orientationNumeric", 0) >= 10
+                and last_do.get("abs") is False),
+            "传感器：deviceorientationabsolute 事件流且 absolute == true": (
+                sensor_counts.get("orientationAbsoluteNumeric", 0) >= 10
+                and last_doa.get("abs") is True),
+            "传感器：无 requestPermission（Chromium 152 才实现，148 无）": (
+                rp.get("motion") == "undefined" and rp.get("orientation") == "undefined"),
+            "传感器：跨域 iframe（OOPIF，已委托 allow）内 devicemotion 同样有流": (
+                int(fr.get("dm") or 0) >= 20),
         })
     else:
         is_ios_chrome = extra.get("browser") == "chrome_ios"
@@ -1019,6 +1239,23 @@ async def main() -> int:
                 wg.get("hasGpu") is True and wg.get("vendor") == "apple"),
             # ---- iOS 两口径通用：普通页面无 window.chrome（报告 §4.4 / B1-5）----
             "window.chrome 为 undefined（iOS 普通页面无该对象）": state["hasChromeObj"] is False,
+            # ---- 传感器权限面（WebKit 专有）：requestPermission 与授权语义 ----
+            "传感器：requestPermission 存在（iOS 14.5+ 专有静态方法）": (
+                rp.get("motion") == "function" and rp.get("orientation") == "function"),
+            "传感器：无手势调用 → NotAllowedError（WebKit 语义）": (
+                rp_no_gesture.get("state") == "rejected:NotAllowedError"
+                and (rp_no_gesture.get("activation") or {}).get("active") is False),
+            "传感器：手势内调用保持 pending（不伪造授权结果）": (
+                rp_gesture.get("state") == "pending"
+                and (rp_gesture.get("activation") or {}).get("active") is True),
+            "传感器：DeviceOrientationEvent 无 absolute（iOS Safari 口径）": (
+                sensor.get("orientationAbsoluteInProto") is False),
+            "传感器：无 ondeviceorientationabsolute（WebKit 无该事件）": (
+                sensor.get("onDeviceOrientationAbsolute") is False),
+            "传感器：未授权不派发数值事件（真机零事件口径）": (
+                sensor_counts.get("motionNumeric", 0) == 0
+                and sensor_counts.get("orientationNumeric", 0) == 0
+                and sensor_counts.get("orientationAbsoluteNumeric", 0) == 0),
         })
         if is_ios_chrome:
             checks.update({

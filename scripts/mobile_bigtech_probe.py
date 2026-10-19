@@ -237,6 +237,74 @@ EVENT_CAPTURE_JS = r"""() => {
 }"""
 
 
+SENSOR_JS = r"""async () => {
+  // 传感器事件流读数：真机 Chrome Android 有持续数值流（devicemotion 60Hz
+  // 级、orientation 随读数更新派发）；iOS 未授权时零事件（内核只在注册
+  // 监听时派发一次全 null 哨兵，numeric 计数器为 0 可辨别）。
+  const num = (v) => typeof v === 'number' && isFinite(v);
+  const out = {
+    counts: { motion: 0, motionNumeric: 0, orientation: 0, orientationNumeric: 0,
+              orientationAbsolute: 0, orientationAbsoluteNumeric: 0 },
+    requestPermission: {
+      motion: typeof (window.DeviceMotionEvent || {}).requestPermission,
+      orientation: typeof (window.DeviceOrientationEvent || {}).requestPermission },
+    orientationAbsoluteInProto: (typeof DeviceOrientationEvent === 'function')
+      && ('absolute' in DeviceOrientationEvent.prototype),
+    onDeviceOrientationAbsolute: 'ondeviceorientationabsolute' in window,
+    intervals: { motion: null },
+    samples: { motion: [], orientation: [] },
+    sensorApi: null,
+  };
+  window.addEventListener('devicemotion', (e) => {
+    out.counts.motion++;
+    const g = e.accelerationIncludingGravity, a = e.acceleration, r = e.rotationRate;
+    out.intervals.motion = e.interval;
+    if (g && (num(g.x) || num(g.y) || num(g.z))) {
+      out.counts.motionNumeric++;
+      if (out.samples.motion.length < 4) {
+        out.samples.motion.push({
+          trusted: e.isTrusted, interval: e.interval,
+          aig: [g.x, g.y, g.z],
+          acc: a ? [a.x, a.y, a.z] : null,
+          rr: r ? [r.alpha, r.beta, r.gamma] : null,
+        });
+      }
+    }
+  }, true);
+  window.addEventListener('deviceorientation', (e) => {
+    out.counts.orientation++;
+    if (num(e.alpha) || num(e.beta) || num(e.gamma)) {
+      out.counts.orientationNumeric++;
+      if (out.samples.orientation.length < 3) {
+        out.samples.orientation.push({ a: e.alpha, b: e.beta, g: e.gamma, abs: e.absolute });
+      }
+    }
+  }, true);
+  window.addEventListener('deviceorientationabsolute', (e) => {
+    out.counts.orientationAbsolute++;
+    if (num(e.alpha) || num(e.beta) || num(e.gamma)) out.counts.orientationAbsoluteNumeric++;
+  }, true);
+  // Sensor API（Chrome Android）＝同一虚拟传感器的另一读取面
+  if (typeof Accelerometer === 'function') {
+    try {
+      const acc = new Accelerometer({ frequency: 60 });
+      const got = [];
+      acc.addEventListener('reading', () => {
+        if (got.length < 4) got.push([acc.x, acc.y, acc.z]);
+      });
+      acc.start();
+      await new Promise((r) => setTimeout(r, 600));
+      try { acc.stop(); } catch (e2) {}
+      out.sensorApi = { supported: true, samples: got };
+    } catch (e) {
+      out.sensorApi = { supported: false, error: String(e).slice(0, 120) };
+    }
+  }
+  await new Promise((r) => setTimeout(r, 900));
+  return out;
+}"""
+
+
 async def main() -> int:
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
@@ -336,10 +404,15 @@ async def main() -> int:
             scroll_after = await page.evaluate("() => scrollY")
             events_scroll = await page.evaluate("() => window.__ev.splice(0)")
 
+            # 传感器事件流（页面在 127.0.0.1 = 信任来源；真机非安全上下文
+            # 同样不派发，故必须以本地服务页为准）
+            sensor = await page.evaluate(SENSOR_JS)
+
             out = {
                 "target_os": target_os,
                 "device": device_name,
                 "signals": signals,
+                "sensor": sensor,
                 "input_mouse_click_events": events_mouse,
                 "input_playwright_touchscreen_tap": tap_api,
                 "input_touch_tap_events": events_touch,

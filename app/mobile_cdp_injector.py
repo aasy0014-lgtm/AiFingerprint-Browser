@@ -45,6 +45,8 @@ import contextlib
 import itertools
 import json
 import logging
+import math
+import random
 import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
@@ -57,6 +59,94 @@ log = logging.getLogger(__name__)
 # 清单唯一来源在指纹库（mobile_fingerprints），运行期与数据层共享，避免两处漂移。
 _IOS_REMOVE_PROPS = list(_IOS_REMOVE_NAV_PROPS)
 _ANDROID_REMOVE_PROPS = list(_ANDROID_REMOVE_NAV_PROPS)
+
+# ---------------- 传感器面（Android 真机口径）----------------
+# 真机 Chrome Android 在注册 devicemotion/deviceorientation 监听后会收到持续
+# 事件（加速度计/陀螺仪/方向传感器均可用）；桌面内核没有传感器，只在注册时
+# 派发一次全 null 的哨兵事件——「有没有连续的数值事件流」是模拟器/桌面装手机
+# 最直接的传感器判据之一。
+#
+# fp-chromium 支持 CDP 虚拟传感器（Emulation.setSensorOverrideEnabled /
+# setSensorOverrideReadings，148 内核实测可用），据此按真机语义驱动：
+#   devicemotion 由内核 60Hz 轮询派发（读数更新即改变事件内容）；
+#   deviceorientation / deviceorientationabsolute 每个读数变化派发一次，
+#   因此需要按节奏更新读数才能形成「活」的事件流。
+# 读数生成见 _SensorSimulator：姿态（beta/gamma）与重力矢量保持数学一致，
+# 避免「重力矢量与 deviceorientation 不符」的交叉校验命中。
+_SENSOR_TICK_SEC = 0.05          # 20Hz 名义更新率（±40% 抖动，见 _sensor_loop）
+_SENSOR_TICK_JITTER = 0.4        # 抖动幅度：真机传感器采样周期并非严格固定
+_SENSOR_TYPES = ("accelerometer", "linear-acceleration", "gyroscope",
+                 "relative-orientation", "absolute-orientation")
+_GRAVITY = 9.80665               # m/s²
+
+
+def _quaternion_from_euler(alpha: float, beta: float, gamma: float) -> Dict[str, float]:
+    """W3C 口径的欧拉角 → 四元数（R = Rz(α)·Rx(β)·Ry(γ)）。
+
+    与内核反解严格一致（实测：下发后事件读回的 alpha/beta/gamma 即输入值）。
+    """
+    a, b, g = (math.radians(v) for v in (alpha, beta, gamma))
+    ca, sa = math.cos(a), math.sin(a)
+    cb, sb = math.cos(b), math.sin(b)
+    cg, sg = math.cos(g), math.sin(g)
+    row = (
+        (ca * cg - sa * sb * sg, -sa * cb, ca * sg + sa * sb * cg),
+        (sa * cg + ca * sb * sg, ca * cb, sa * sg - ca * sb * cg),
+        (-cb * sg, sb, cb * cg),
+    )
+    w = math.sqrt(max(0.0, 1 + row[0][0] + row[1][1] + row[2][2])) / 2
+    if w < 1e-8:
+        return {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}
+    return {"x": (row[2][1] - row[1][2]) / (4 * w),
+            "y": (row[0][2] - row[2][0]) / (4 * w),
+            "z": (row[1][0] - row[0][1]) / (4 * w),
+            "w": w}
+
+
+class _SensorSimulator:
+    """生成「手持浏览姿态」的手机传感器读数（含缓慢随机游走）。
+
+    - 姿态：beta ∈ [55°, 75°]（竖握略后倾）、gamma ∈ [-10°, 10°]、alpha 随机；
+    - 重力自洽：aig = (−g·cosβ·sinγ, g·sinβ, g·cosβ·cosγ)，与 direction 事件
+      的欧拉角严格同源（真机自洽性正是高级检测的交叉校验点）；
+    - 抖动：加速度 ±0.2 / 线性加速度 ±0.1 级 / 陀螺仪 ±0.005 rad/s——真机在
+      1dp 量化后呈 0.0/±0.1 级变化，恒定常量是模拟器特征。
+    """
+
+    def __init__(self, rng: random.Random) -> None:
+        self._rng = rng
+        self.alpha = rng.uniform(0.0, 360.0)
+        self.beta = rng.uniform(55.0, 75.0)
+        self.gamma = rng.uniform(-10.0, 10.0)
+        self._linear = [0.0, 0.0, 0.0]   # 线性加速度（去重力），m/s²
+        self._gyro = [0.0, 0.0, 0.0]     # 角速度，rad/s（事件里换算为 deg/s）
+
+    def _walk(self, values: List[float], step: float, limit: float) -> None:
+        for i, v in enumerate(values):
+            values[i] = max(-limit, min(limit, v + self._rng.uniform(-step, step)))
+
+    def step(self) -> Dict[str, Dict[str, float]]:
+        """推进一步随机游走，返回各传感器类型的 CDP 读数参数。"""
+        self.alpha = (self.alpha + self._rng.uniform(-0.6, 0.6)) % 360.0
+        self.beta = max(35.0, min(85.0, self.beta + self._rng.uniform(-0.25, 0.25)))
+        self.gamma = max(-25.0, min(25.0, self.gamma + self._rng.uniform(-0.25, 0.25)))
+        beta = math.radians(self.beta)
+        gamma = math.radians(self.gamma)
+        self._walk(self._linear, 0.12, 0.45)
+        self._walk(self._gyro, 0.004, 0.02)
+        quaternion = _quaternion_from_euler(self.alpha, self.beta, self.gamma)
+        return {
+            "accelerometer": {
+                "x": -_GRAVITY * math.cos(beta) * math.sin(gamma),
+                "y": _GRAVITY * math.sin(beta),
+                "z": _GRAVITY * math.cos(beta) * math.cos(gamma),
+            },
+            "linear-acceleration": {"x": self._linear[0], "y": self._linear[1],
+                                    "z": self._linear[2]},
+            "gyroscope": {"x": self._gyro[0], "y": self._gyro[1], "z": self._gyro[2]},
+            "relative-orientation": quaternion,
+            "absolute-orientation": quaternion,
+        }
 
 
 class CDPError(RuntimeError):
@@ -495,6 +585,56 @@ _PATCH_TEMPLATE = r"""
                         __geDefineHandler(__geHandlers[__gi]);
                     }
                 } catch (e) {}
+            }
+            // 4) 传感器权限面（iOS 14.5+）：DeviceMotionEvent/DeviceOrientationEvent
+            //    的 requestPermission 静态方法。MDN BCD：chrome=false、
+            //    chrome_android=false、safari_ios=14.5（Chromium 到 152 才实现，
+            //    148 内核与 Chrome Android 口径都不该出现）——一条 typeof 判断
+            //    即可判「不是 iOS」。真机语义：无瞬时激活 → reject
+            //    NotAllowedError（WebKit 原文案）；有激活 → 弹系统授权框，
+            //    Promise 保持 pending 直到用户作答。仿真不弹系统框（无法伪造
+            //    用户决定），保持 pending 与「用户未作答」一致，不伪造
+            //    granted/denied；未授权时真机本就不派发传感器事件。
+            var __sensorRequestPermission = function () {
+                return new Promise(function (resolve, reject) {
+                    var act = navigator.userActivation;
+                    if (!(act && act.isActive)) {
+                        reject(new DOMException('Requesting device orientation '
+                            + 'or motion access requires a user gesture',
+                            'NotAllowedError'));
+                    }
+                });
+            };
+            var __defineSensorRequestPermission = function (iface) {
+                if (typeof iface === 'undefined') {
+                    return;
+                }
+                try {
+                    Object.defineProperty(iface, 'requestPermission', {
+                        value: __maskNative(__sensorRequestPermission, 'requestPermission'),
+                        writable: true, enumerable: true, configurable: true,
+                    });
+                } catch (e) {}
+            };
+            __defineSensorRequestPermission(window.DeviceMotionEvent);
+            __defineSensorRequestPermission(window.DeviceOrientationEvent);
+            // 5) absolute：iOS Safari 的 DeviceOrientationEvent 无 absolute 属性
+            //    （MDN BCD：safari_ios=false，桌面 Safari 17 才有）——真机一行
+            //    `'absolute' in DeviceOrientationEvent.prototype` 即可判内核。
+            try {
+                if (typeof DeviceOrientationEvent !== 'undefined') {
+                    delete DeviceOrientationEvent.prototype.absolute;
+                    if ('absolute' in DeviceOrientationEvent.prototype) {
+                        defineGet(DeviceOrientationEvent.prototype, 'absolute', undefined);
+                    }
+                }
+            } catch (e) {}
+            // 6) deviceorientationabsolute：WebKit 全平台无该事件（caniuse：
+            //    Safari/Safari iOS 不支持，Chrome 50+ 支持）——处理属性一并抹除。
+            try { delete Window.prototype.ondeviceorientationabsolute; } catch (e) {}
+            try { delete window.ondeviceorientationabsolute; } catch (e) {}
+            if ('ondeviceorientationabsolute' in window) {
+                defineGet(Window.prototype, 'ondeviceorientationabsolute', undefined);
             }
         }
 
@@ -1137,6 +1277,11 @@ class MobileEmulationSession:
         self._first_page_session: Optional[str] = None
         # Accept-CH：CDP session → {源: 该源已声明的高熵提示}（Fetch 域回送）
         self._accept_ch: dict[str, dict[str, set]] = {}
+        # 传感器仿真（Android）：虚拟传感器是浏览器进程级全局对象，全会话
+        # 一条读数循环即可（详见 _setup_sensors）；supported=None 表示未探测
+        self._sensor_supported: Optional[bool] = None
+        self._sensor_task: Optional[asyncio.Task] = None
+        self._sensor_session: Optional[str] = None
         self._closed = False
 
     # ---------------- 生命周期 ----------------
@@ -1182,6 +1327,13 @@ class MobileEmulationSession:
 
     async def close(self) -> None:
         self._closed = True
+        # 传感器噪声任务（每 50ms 一次 CDP 下发）：先取消并回收，避免
+        # 「Task was destroyed but it is pending」与关闭竞态
+        if self._sensor_task is not None:
+            self._sensor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._sensor_task
+            self._sensor_task = None
         if self._reader:
             self._reader.cancel()
             # CancelledError 是 BaseException：等待被 cancel 的读取任务
@@ -1418,6 +1570,9 @@ class MobileEmulationSession:
             # 永久挂起，且产出序列缺兼容鼠标事件与 click。移动端自动化应改用
             # Input.dispatchTouchEvent 派发（见 docs/移动端大厂检测对抗优化方案.md
             # §事件层）。
+            # OOPIF 目标不单独启用传感器：虚拟传感器是浏览器级全局对象，
+            # 页面目标的覆盖对所有帧一并生效；跨域子帧能否收到由 Permissions
+            # Policy 决定（未声明 allow 的跨域子帧真机同样零事件）。
             # UA-CH 低熵请求头：iframe 发出的请求与主文档一致
             # （真机 Chrome 对全站发送；内核不发送任何 Sec-CH-UA* 头）
             ua_ch = self.spec.get("uaCh")
@@ -1653,6 +1808,102 @@ class MobileEmulationSession:
         # 6. Accept-CH：站点声明高熵提示后，对其后续请求回送 Sec-CH-UA-* 高熵头
         #    （内核完全不处理 Accept-CH；真机 Chrome 全量支持，缺回送是明显破绽）
         await self._enable_accept_ch(sid)
+
+        # 7. Android：传感器事件流。真机 Chrome Android 持续派发
+        #    devicemotion/deviceorientation（60Hz 级数值流）；桌面内核没有
+        #    传感器，只在注册监听时派发一次全 null 的哨兵事件——「有没有
+        #    连续数值流」是最直接的模拟器/桌面判据。必须紧随目标挂载下发：
+        #    传感器请求一旦在「无传感器」状态下定型，之后启用覆盖也不会再
+        #    派发事件（实测）。iOS 不启用（真机需 requestPermission 授权，
+        #    未授权时真机为零事件，模板层只按 WebKit 语义伪造静态方法）。
+        await self._setup_sensors(sid)
+
+    # ---------------- 传感器仿真（Android）----------------
+
+    async def _setup_sensors(self, sid: str) -> None:
+        """启用 CDP 虚拟传感器并启动读数噪声循环（仅 Android，会话内一次）。
+
+        虚拟传感器是浏览器进程级全局对象（实测：其他目标再次 enable 返回
+        "The specified sensor type is already overridden"，而推送的读数对
+        所有目标生效）——与真机语义一致：同一设备的所有页面/iframe 共享
+        同一份传感器数据。因此只在首个页面目标上启用并运行一条循环。
+        跨域 iframe 的可用性由 Permissions Policy 决定（devicemotion 需要
+        accelerometer/gyroscope 特性，默认 allowlist=self；未声明 allow 的
+        跨域子帧真机同样拿不到事件，内核行为与真机一致，无需额外处理）。
+        """
+        if self.target_os != "android" or self._sensor_supported is not None:
+            return
+        try:
+            await self._send("Emulation.setSensorOverrideEnabled",
+                             {"enabled": True, "type": _SENSOR_TYPES[0]},
+                             session_id=sid, timeout=5.0)
+        except CDPError as e:
+            log.debug("内核不支持 CDP 虚拟传感器，跳过传感器仿真: %s", e)
+            self._sensor_supported = False
+            return
+        self._sensor_supported = True
+        self._sensor_session = sid
+        for sensor_type in _SENSOR_TYPES[1:]:
+            with contextlib.suppress(CDPError):
+                await self._send("Emulation.setSensorOverrideEnabled",
+                                 {"enabled": True, "type": sensor_type},
+                                 session_id=sid, timeout=5.0)
+        simulator = _SensorSimulator(random.Random())
+        with contextlib.suppress(CDPError):
+            await self._push_sensor_readings(sid, simulator.step())
+        if self._sensor_task is not None:
+            self._sensor_task.cancel()
+        self._sensor_task = asyncio.create_task(self._sensor_loop(simulator))
+
+    async def _push_sensor_readings(self, sid: str,
+                                    readings: Dict[str, Dict[str, float]]) -> None:
+        """下发一步读数（xyz 用于加速度/角速度，四元数用于方向）。
+
+        读数写入全局虚拟传感器，对所有页面/iframe 一并生效。
+        """
+        for sensor_type, values in readings.items():
+            if sensor_type.endswith("orientation"):
+                reading = {"quaternion": values}
+            else:
+                reading = {"xyz": values}
+            await self._send("Emulation.setSensorOverrideReadings",
+                             {"type": sensor_type, "reading": reading},
+                             session_id=sid, timeout=5.0)
+
+    async def _sensor_loop(self, simulator: _SensorSimulator) -> None:
+        """按真机节奏持续更新读数（事件流随读数变化保持「活」）。"""
+        failures = 0
+        try:
+            while not self._closed:
+                # 更新节奏带抖动：严格固定周期会让「事件内容变化」呈精确的
+                # 周期性（如连续 3 样本相同再跳变），真机传感器采样周期不固定
+                jitter = 1.0 + _SENSOR_TICK_JITTER * (random.random() * 2 - 1)
+                await asyncio.sleep(_SENSOR_TICK_SEC * jitter)
+                sid = self._sensor_session
+                if sid is None:
+                    return
+                try:
+                    await self._push_sensor_readings(sid, simulator.step())
+                    failures = 0
+                except CDPError as e:
+                    # 推送通道（首个页面）失效时改绑仍存活的页面会话；
+                    # 连续失败即停止仿真（浏览器随之退出/会话关闭）
+                    failures += 1
+                    if failures >= 5:
+                        candidate = self._first_page_session
+                        if candidate and candidate != sid:
+                            self._sensor_session = candidate
+                            failures = 0
+                            continue
+                        log.debug("传感器读数推送连续失败，停止仿真: %s", e)
+                        return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("传感器仿真循环退出: %s", e)
+        finally:
+            if self._sensor_task is asyncio.current_task():
+                self._sensor_task = None
 
     async def _apply_patch_now(self, sid: str) -> None:
         """对已存在的当前文档立即执行一次 JS 补丁。
