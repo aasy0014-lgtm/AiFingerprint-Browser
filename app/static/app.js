@@ -291,16 +291,25 @@ function fillMobileBrands() {
   sel.value = prev;
 }
 
-async function syncMobileOptionState(restoreBrand) {
+async function syncMobileOptionState(restoreBrand, restoreBrowser) {
   const f = $("#profileForm");
   const mobile = isMobileTargetOs();
+  const ios = $("#targetOsSelect").value === "ios";
   $("#mobileHint").style.display = mobile ? "" : "none";
   $("#mobileBrandWrap").style.display = mobile ? "" : "none";
+  // 浏览器口径仅 iOS 可选（Android 恒为 Chrome）
+  $("#mobileBrowserWrap").style.display = ios ? "" : "none";
   if (!mobile) {
     $("#mobileBrandSelect").value = "";
+    $("#mobileBrowserSelect").value = "safari";
     return;
   }
   if (f.kernel.value !== "fp-chromium") f.kernel.value = "fp-chromium";
+  if (typeof restoreBrowser === "string" && ios) {
+    $("#mobileBrowserSelect").value = restoreBrowser;
+  } else if (!ios) {
+    $("#mobileBrowserSelect").value = "safari";
+  }
   try {
     await ensureMobileLibrary();
   } catch (e) {
@@ -350,7 +359,10 @@ function openProfileModal(profile, batchMode = false) {
   }
   $("#proxyResult").textContent = "";
   // 编辑移动端环境时恢复其机型品牌（品牌变化会触发重新生成指纹）
-  syncMobileOptionState(profile && !batchMode ? (profile.fingerprint_summary?.manufacturer || "") : "");
+  syncMobileOptionState(
+    profile && !batchMode ? (profile.fingerprint_summary?.manufacturer || "") : "",
+    profile && !batchMode ? (profile.fingerprint_summary?.browser_kind || "safari") : "safari",
+  );
   $("#profileModal").classList.remove("hidden");
 }
 
@@ -391,6 +403,8 @@ function collectProfileForm() {
       fingerprint_mode: fd.get("fingerprint_mode"),
       // 移动端机型品牌（仅 android/ios；空值 = 按在网权重随机）
       manufacturer: isMobileTargetOs() ? (fd.get("manufacturer") || null) : null,
+      // 浏览器口径（仅 iOS；Android 恒为 chrome，由后端归一化）
+      browser: $("#targetOsSelect").value === "ios" ? (fd.get("browser") || null) : null,
       proxy, launch,
     },
     regen: fd.get("regen_fingerprint") === "on",

@@ -3,6 +3,7 @@
 > **依据**：[`Chrome61-IPA检测机制分析.md`](Chrome61-IPA检测机制分析.md)（2026-10-18；样本 `Chrome-v61-3163-73.ipa`，SHA-256 `5f901179…a041c`，官方原版、FairPlay 加密）
 > **目的**：把报告的检测面结论整理为可执行的补丁清单，分两条路线——**A：真机 / 云机（IPA 二次开发）**；**B：本项目仿真层（桌面 CDP 补齐 CriOS 检测面）**。
 > **结论先行**（报告 §8.1）：该 IPA 是原版 Chrome，本身不含任何伪装逻辑；"防关联/指纹"能力无论走哪条线都必须在外围补——A 线在设备侧（解密/重签/注入），B 线在本仓库（注入器 + 指纹库）。
+> **B 线状态（2026-10-19）**：P0 已落地并验证——`mobileExtra.browser = "chrome_ios"`、CriOS UA、`derive_spec.iosChrome`、`__gCrWeb` / `webkit.messageHandlers` / history·print·scrollTo 改写痕迹、iOS 两口径 `window.chrome = undefined`。P1 的面板/API 浏览器口径也已落地（创建/更新/MCP/面板）。数据层 215 项、iOS Chrome 真机级 76 项、iOS Safari 64 项、Android 73 项全绿。未做：B1-7（`__crPostRequestWorkaround`，真机仅在 POST 导航时暴露，需按导航状态条件注入，留待校准）、B1-8（PaymentRequest）、真机抓取校准、`window.chrome` 深掩。
 
 ---
 
@@ -112,8 +113,8 @@
 |---|---|
 | `app/mobile_fingerprints.py` | `create_mobile_fingerprint` 新增浏览器口径参数（默认 `safari`，保持现网格）；iOS 分支 `browser=="chrome_ios"` 时：CriOS UA、`browserVersion`、`mobileExtra["browser"]`；其余字段（vendor/removeProps/emptyPlugins/platform）不变 |
 | `app/mobile_cdp_injector.py` | `derive_spec` 识别 `extra.browser`，输出 `"iosChrome": {version:<major>}`；`__maskNative` 增加 `src` 参数；`_PATCH_TEMPLATE` 新增 iOS-Chrome 段 + iOS 公共段补 `window.chrome = undefined`；`build_mobile_patch` 透传 |
-| `scripts/mobile_launch_verify.py` | 新增 iOS-Chrome 模式（参数或按指纹数据自动识别）：探针断言组（§2.3） |
-| `scripts/mobile_test.py` | 数据层新增断言：CriOS UA 形态、`browser` 字段一致性（预计 +6~10 项） |
+| `scripts/mobile_launch_verify.py` | 新增 iOS-Chrome 模式（第三参数 `chrome_ios`，按 `extra.browser` 选择断言组 §2.3） |
+| `scripts/mobile_test.py` | 数据层新增断言：CriOS UA 形态、`browser` 字段一致性、`derive_spec.iosChrome`、口径互斥（实际 +13 项） |
 | 面板 / API（P1） | 指纹创建入口透传 browser 形参；UI 在 iOS 下增加"Safari / Chrome"选择（不选默认 Safari） |
 | `docs/移动端真实指纹库.md` | 覆盖清单/计数/边界同步；iOS Chrome 口径与 window.chrome 边界入表 |
 
@@ -134,7 +135,7 @@
    | `maxTouchPoints / devicePixelRatio / screen / tz / languages` | 沿用既有断言 |
    | `pr`（PaymentRequest 来源） | 仅记录现状（形态差异边界，不断言） |
 
-2. 回归：iOS Safari 56 项、Android 72 项（`mobile_launch_verify.py`）、数据层 138 项（`mobile_test.py`）零回退——两模式互斥，不得污染 Safari 口径。
+2. 回归：iOS Safari 64 项、Android 73 项（`mobile_launch_verify.py`）、数据层 215 项（`mobile_test.py`）零回退——两模式互斥，不得污染 Safari 口径。
 3. 真实站点冒烟：BrowserScan / CreepJS（iOS-Chrome profile 与 Safari profile 各跑一轮，观察无新增红旗）。
 4. （可选）真机对照：在越狱真机 CriOS 上跑同一探针取基准，校准通道名 / 挂载层级 / 文本细节（报告 §7 路线图）。
 
@@ -174,6 +175,8 @@
 |---|---|---|
 | **P0**（1~2 天） | B1-1/2/3/4/5/6/10/11 + `mask` 扩展 + B2 + B3 | iOS-Chrome verify 分支全绿；iOS Safari / Android / 数据层零回退；BrowserScan 冒烟无回退 |
 | **P1**（0.5~1 天） | B1-7；面板/API browser 选择；文档同步（B1-5 的 Safari 口径修复已并入 P0） | 数据层断言 +6~10；面板可创建 iOS-Chrome 指纹 |
+
+> P1 现状：面板/API/MCP 与文档同步已完成；B1-7 未做（真机仅 POST 导航时暴露，无条件注入反而新增差异，待与 P2 校准一起处理）。
 | **P2**（按需） | B1-8；真机抓取校准（通道名/文本/挂载层级/standalone）；`window.chrome` 内核层深掩评估；路线 A（A0~A4）落地执行 | 校准报告 + 探针与真机逐项一致 |
 
 ---

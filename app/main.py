@@ -311,6 +311,17 @@ def _check_mobile_manufacturer(target_os: str, manufacturer: Optional[str]) -> N
         raise ApiError(400, f"机型库中不存在品牌 {manufacturer}（{target_os} 可选: {', '.join(brands)}）")
 
 
+def _check_mobile_browser(target_os: str, browser: Optional[str]) -> None:
+    """移动端浏览器口径校验：Android 仅 chrome；iOS 为 safari / chrome_ios。"""
+    if not browser or target_os not in ("android", "ios"):
+        return
+    from .mobile_fingerprints import _normalize_browser
+    try:
+        _normalize_browser(target_os, browser)
+    except ValueError as e:
+        raise ApiError(400, str(e)) from e
+
+
 # ---------------------------------------------------------------- 系统 / 认证 / 成员
 
 @app.get("/api/v1/status")
@@ -575,7 +586,9 @@ async def create_profile(request: Request, body: ProfileCreate) -> dict:
     _check_kernel_available(body.kernel)
     _check_mobile_target(body.kernel, body.target_os)
     _check_mobile_manufacturer(body.target_os, body.manufacturer)
-    fingerprint = create_fingerprint(body.target_os, body.fingerprint_mode, body.manufacturer)
+    _check_mobile_browser(body.target_os, body.browser)
+    fingerprint = create_fingerprint(body.target_os, body.fingerprint_mode,
+                                     body.manufacturer, browser=body.browser)
     p = db.create_profile(
         name=body.name,
         group_name=body.group_name,
@@ -597,6 +610,7 @@ async def create_profiles_batch(request: Request, body: ProfileBatchCreate) -> d
     _check_kernel_available(body.template.kernel)
     _check_mobile_target(body.template.kernel, body.template.target_os)
     _check_mobile_manufacturer(body.template.target_os, body.template.manufacturer)
+    _check_mobile_browser(body.template.target_os, body.template.browser)
     created = []
     for i in range(body.count):
         proxy = None
@@ -608,7 +622,7 @@ async def create_profiles_batch(request: Request, body: ProfileBatchCreate) -> d
             proxy = security.get_global_proxy()  # 未指定代理池/模板代理时继承全局代理
         fingerprint = create_fingerprint(
             body.template.target_os, body.template.fingerprint_mode,
-            body.template.manufacturer,
+            body.template.manufacturer, browser=body.template.browser,
         )
         p = db.create_profile(
             name=f"{body.template.name}-{i + 1}",
@@ -650,6 +664,7 @@ async def update_profile(request: Request, profile_id: str, body: ProfileUpdate)
     # 移动端配对校验按「改后的生效值」判断（可能只改 kernel 或只改 target_os）
     _check_mobile_target(body.kernel or p["kernel"], body.target_os or p["target_os"])
     _check_mobile_manufacturer(body.target_os or p["target_os"], body.manufacturer)
+    _check_mobile_browser(body.target_os or p["target_os"], body.browser)
 
     updates: dict[str, Any] = {}
     if body.name is not None:
@@ -679,6 +694,10 @@ async def update_profile(request: Request, profile_id: str, body: ProfileUpdate)
     if (body.manufacturer is not None and effective_os in ("android", "ios")
             and body.manufacturer != stored_brand):
         regen = True  # 移动端换品牌必须重生成指纹
+    stored_browser = ((p["fingerprint"].get("fingerprint") or {}).get("mobileExtra") or {}).get("browser")
+    if (body.browser is not None and effective_os in ("android", "ios")
+            and body.browser != stored_browser):
+        regen = True  # 移动端换浏览器口径必须重生成指纹（UA/检测面随之变化）
     if regen:
         import json as _json
 
@@ -691,8 +710,16 @@ async def update_profile(request: Request, profile_id: str, body: ProfileUpdate)
             brand = stored_brand or None
         else:
             brand = None
+        # 未显式改口径时沿用已存储的浏览器口径，避免重生成静默回退到 Safari；
+        # 换 OS 后旧口径可能不适用（如 iOS 的 chrome_ios 用于 Android），此时丢弃
+        browser = body.browser
+        if browser is None:
+            if os_ == "ios" and stored_browser in ("safari", "chrome_ios"):
+                browser = stored_browser
+            elif os_ == "android" and stored_browser == "chrome":
+                browser = stored_browser
         updates["fingerprint_json"] = _json.dumps(
-            create_fingerprint(os_, mode, brand), ensure_ascii=False
+            create_fingerprint(os_, mode, brand, browser=browser), ensure_ascii=False
         )
 
     updated = db.update_profile(profile_id, updates)

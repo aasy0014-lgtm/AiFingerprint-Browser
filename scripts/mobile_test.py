@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.fingerprint_engine import create_fingerprint, summarize
-from app.mobile_cdp_injector import derive_spec
+from app.mobile_cdp_injector import _android_webgpu, build_mobile_patch, derive_spec
 from app.mobile_fingerprints import (
     _kernel_browser,
     create_mobile_fingerprint,
@@ -69,6 +69,11 @@ _RE_IOS_UA = re.compile(
     r"^Mozilla/5\.0 \((?P<dev>iPhone|iPad); CPU (?P<prefix>iPhone )?OS (?P<os>[\d_]+) like Mac OS X\) "
     r"AppleWebKit/605\.1\.15 \(KHTML, like Gecko\) Version/(?P<ver>\d+\.\d+) Mobile/15E148 Safari/604\.1$"
 )
+_RE_IOS_CHROME_UA = re.compile(
+    r"^Mozilla/5\.0 \((?P<dev>iPhone|iPad); CPU (?P<prefix>iPhone )?OS (?P<os>[\d_]+) like Mac OS X\) "
+    r"AppleWebKit/605\.1\.15 \(KHTML, like Gecko\) CriOS/(?P<major>\d+)\.0\.0\.0 "
+    r"Mobile/15E148 Safari/604\.1$"
+)
 
 
 def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
@@ -90,15 +95,21 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
             check(f"[{tag}] UA Appendix 与设备类型匹配",
                   (m.group("mobile") is not None) == (extra["deviceType"] == "phone"))
     else:
-        m = _RE_IOS_UA.match(ua)
-        check(f"[{tag}] iOS UA 格式", m is not None, ua[:110])
+        is_crios = extra.get("browser") == "chrome_ios"
+        m = (_RE_IOS_CHROME_UA if is_crios else _RE_IOS_UA).match(ua)
+        check(f"[{tag}] iOS {'Chrome（CriOS）' if is_crios else 'Safari'} UA 格式",
+              m is not None, ua[:110])
         if m:
             check(f"[{tag}] UA 设备类型匹配",
                   (m.group("dev") == "iPad") == (extra["deviceType"] == "tablet"))
             check(f"[{tag}] UA 系统版本 == 档案",
                   m.group("os") == extra["osVersion"].replace(".", "_"))
-            check(f"[{tag}] Version 取主次版本",
-                  m.group("ver") == ".".join(extra["osVersion"].split(".")[:2]))
+            if is_crios:
+                check(f"[{tag}] CriOS 主版本 == 档案浏览器版本",
+                      m.group("major") == extra["browserVersion"].split(".")[0])
+            else:
+                check(f"[{tag}] Version 取主次版本",
+                      m.group("ver") == ".".join(extra["osVersion"].split(".")[:2]))
             check(f"[{tag}] iPhone 前缀正确（平板无 iPhone 前缀）",
                   (m.group("prefix") is not None) == (extra["deviceType"] == "phone"))
 
@@ -203,12 +214,38 @@ def test_android(devices: dict) -> None:
 
 
 def test_ios(devices: dict) -> None:
-    section("3. iOS 指纹（preset / generate）")
+    section("3. iOS 指纹（preset / generate × Safari / Chrome）")
     for mode in ("preset", "generate"):
         fp = create_mobile_fingerprint("ios", mode, "Apple")
         print(f"\n[{mode}] {fp['manufacturer']} {fp['device_model']} | "
               f"iOS {fp['fingerprint']['mobileExtra']['osVersion']}")
         verify_fp_consistency(fp, "ios", devices)
+    for mode in ("preset", "generate"):
+        fp = create_mobile_fingerprint("ios", mode, "Apple", browser="chrome_ios")
+        extra = fp["fingerprint"]["mobileExtra"]
+        print(f"\n[{mode}/chrome_ios] {fp['manufacturer']} {fp['device_model']} | "
+              f"CriOS {extra['browserVersion']}")
+        verify_fp_consistency(fp, "ios", devices)
+        check("iOS Chrome：browser 口径落库", extra["browser"] == "chrome_ios")
+        check("iOS Chrome：CriOS 版本跟随内核/版本池",
+              bool(extra["browserVersion"]) and "CriOS/" in fp["fingerprint"]["navigator"]["userAgent"])
+        spec = derive_spec(fp["fingerprint"], "ios")
+        check("iOS Chrome：注入层识别 iosChrome", bool(spec.get("iosChrome")))
+        check("iOS Chrome：仍无 UA-CH / Battery",
+              spec["uaCh"] is None and spec["battery"] is None)
+
+    # Android 口径互斥
+    try:
+        create_mobile_fingerprint("android", "generate", browser="chrome_ios")
+        check("Android 拒绝 chrome_ios 口径", False, "未抛错")
+    except ValueError:
+        check("Android 拒绝 chrome_ios 口径", True)
+    # 未知口径拒绝
+    try:
+        create_mobile_fingerprint("ios", "generate", browser="crios")
+        check("iOS 拒绝未知浏览器口径", False, "未抛错")
+    except ValueError:
+        check("iOS 拒绝未知浏览器口径", True)
 
 
 def test_preset_determinism() -> None:
@@ -266,6 +303,7 @@ def test_engines_compat() -> None:
     s = summarize(fp)
     check("summarize 移动端 preset 标签", s["mode"] == "真实机型预设 (移动端)", s["mode"])
     check("summarize 含机型信息", bool(s["device_model"]) and s["manufacturer"] == "Google")
+    check("summarize 含浏览器口径", s.get("browser_kind") == "chrome")
     fp["id"] = "test-1"
     fp["name"] = "test-1"
     feat = _features({"id": "test-1", "name": "test-1", "target_os": "android", "fingerprint": fp})
@@ -277,6 +315,28 @@ def test_engines_compat() -> None:
     check("注入层读取 Battery", spec["battery"] is not None)
     check("注入层读取视口高（< CSS 高）", spec["viewportHeight"] < spec["cssHeight"])
     check("注入层 deviceMemory 为上报表", spec["deviceMemory"] in (1, 2, 4, 8))
+
+    # ---- WebGPU 适配器口径（内核 148 二进制内嵌的 Dawn gpu_info 字面量实证：
+    #      Qualcomm 代际 adreno-Nxx / ARM valhall·gen-5 / Samsung rdna-N /
+    #      ImgTec d-series；非库内 GPU 不伪造）----
+    for renderer, want in (
+        ("ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2)", ("qualcomm", "adreno-7xx")),
+        ("ANGLE (Qualcomm, Adreno (TM) 830, OpenGL ES 3.2)", ("qualcomm", "adreno-8xx")),
+        ("ANGLE (ARM, Mali-G715-Immortalis MC10, OpenGL ES 3.2)", ("arm", "gen-5")),
+        ("ANGLE (ARM, Mali-G78 MP14, OpenGL ES 3.2)", ("arm", "valhall")),
+        ("ANGLE (Samsung, Xclipse 530, OpenGL ES 3.2)", ("samsung", "rdna-2")),
+        ("ANGLE (Imagination Technologies, PowerVR DXT-48-1536, OpenGL ES 3.2)",
+         ("img-tec", "d-series")),
+    ):
+        w = _android_webgpu(renderer) or {}
+        check(f"WebGPU 口径 {want[0]}/{want[1]}",
+              (w.get("vendor"), w.get("architecture")) == want, renderer)
+    check("WebGPU 口径：库外 GPU 不伪造", _android_webgpu("ANGLE (NVIDIA, RTX 4090, ...)") is None)
+    lib_all = json.loads((Path(__file__).parent.parent / "app" / "data" / "mobile_devices.json")
+                         .read_text(encoding="utf-8"))["devices"]
+    uncovered = [d["market_name"] for d in lib_all if d.get("platform") == "android"
+                 and _android_webgpu((d.get("gpu") or {}).get("renderer", "")) is None]
+    check("WebGPU 口径：库内 Android 机型全覆盖", not uncovered, str(uncovered[:4]))
 
     # 旧版结构（无 mobileExtra / css 字段）兼容
     legacy = {

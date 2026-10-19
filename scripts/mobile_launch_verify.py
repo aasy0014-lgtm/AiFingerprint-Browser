@@ -13,8 +13,12 @@
   6. Android：navigator.userAgentData（UA-CH）完整可用 + Sec-CH-UA* 请求头；
      architecture/bitness 恒为空字符串（Chromium 源码的 Android 手机端行为）
   7. Android：navigator.deviceMemory（上报桶）+ Battery API（数值一致）
-  8. iOS：navigator.userAgentData / connection / pdfViewerEnabled 不存在，
-     plugins/mimeTypes 为空，navigator.standalone 存在且为 false
+  8. iOS Safari：navigator.userAgentData / connection / pdfViewerEnabled 不存在，
+     plugins/mimeTypes 为空，navigator.standalone 存在且为 false，
+     无 __gCrWeb / webkit.messageHandlers
+  8b. iOS Chrome（CriOS）：UA 含 CriOS、__gCrWeb（windowId + 成员族）、
+     webkit.messageHandlers、被改写的 history/print/scrollTo（toString 痕迹）
+     均在文档起点生效；standalone 不存在；两口径均无 window.chrome
   9. navigator 上无 own-property 泄漏（JS 补丁改的是原型）
  10. WebGL readPixels 纯净：复刻 BrowserScan webglNoise「纯红三角形 R==A」
      探针，任何噪声像素（内核 canvas 伪装已关闭）即为失败
@@ -31,7 +35,7 @@
 用独立临时数据目录运行，不污染正式数据。
 
 用法：
-    .venv/bin/python scripts/mobile_launch_verify.py [android|ios] [generate|preset]
+    .venv/bin/python scripts/mobile_launch_verify.py [android|ios] [generate|preset] [safari|chrome_ios]
 """
 import asyncio
 import json
@@ -51,7 +55,7 @@ from app.config import ensure_dirs
 from app.fingerprint_engine import create_fingerprint
 from app.kernels.fp_chromium_kernel import is_available
 from app.launcher import LaunchManager
-from app.mobile_cdp_injector import sec_ch_headers
+from app.mobile_cdp_injector import derive_spec, sec_ch_headers
 
 STATE_JS = """async () => {
     const nav = navigator;
@@ -78,6 +82,19 @@ STATE_JS = """async () => {
         hasPdfViewer: 'pdfViewerEnabled' in nav,
         hasStandalone: 'standalone' in nav,
         standalone: nav.standalone,
+        // ---- iOS Chrome（CriOS）检测面（报告 §4.4 / 补丁方案 §2.3）----
+        hasGCrWeb: typeof window.__gCrWeb !== 'undefined',
+        gCrWebWindowId: (window.__gCrWeb && window.__gCrWeb.windowId) || null,
+        gCrWebKeys: window.__gCrWeb ? Object.keys(window.__gCrWeb) : [],
+        hasWK: !!(window.webkit && window.webkit.messageHandlers),
+        wkHandlers: window.webkit && window.webkit.messageHandlers
+            ? Object.keys(window.webkit.messageHandlers) : [],
+        historyPatched: /invokeOnHost/.test(String(window.history.pushState)),
+        printPatched: /invokeOnHost/.test(String(window.print)),
+        scrollPatched: /setWebViewScrollViewIsDragging/.test(String(window.scrollTo)),
+        hasChromeObj: typeof window.chrome !== 'undefined',
+        isCriOS: /CriOS\\/[\\d.]+/.test(nav.userAgent),
+        paymentRequest: String(window.PaymentRequest || ''),
         pluginsLen: nav.plugins.length,
         mimeTypesLen: nav.mimeTypes.length,
         dpr: window.devicePixelRatio,
@@ -211,6 +228,13 @@ window.__probe = {
   colorDepth: screen.colorDepth,
   memory: navigator.deviceMemory,
   hasUaData: !!navigator.userAgentData,
+  // iOS Chrome（CriOS）检测面：文档起点即应存在（init 脚本先于页面脚本）
+  gcr: typeof window.__gCrWeb !== 'undefined',
+  gcrWindowId: (window.__gCrWeb && window.__gCrWeb.windowId) || null,
+  wk: !!(window.webkit && window.webkit.messageHandlers),
+  hist: /invokeOnHost/.test(String(window.history.pushState)),
+  scroll: /setWebViewScrollViewIsDragging/.test(String(window.scrollTo)),
+  chromeType: typeof window.chrome,
   webgl: (function () { try { var g = document.createElement('canvas').getContext('webgl');
     var e = g.getExtension('WEBGL_debug_renderer_info');
     return e ? g.getParameter(e.UNMASKED_RENDERER_WEBGL) : null; } catch (err) { return 'err'; } })(),
@@ -256,6 +280,11 @@ window.__early = {
   orientation: screen.orientation ? screen.orientation.type : null,
   uaP: navigator.userAgentData ? navigator.userAgentData.platform : null,
   uaMobile: navigator.userAgentData ? navigator.userAgentData.mobile : null,
+  // iOS Chrome：init 脚本对子帧同样生效，CriOS 检测面在 OOPIF 内也应成立
+  gcr: typeof window.__gCrWeb !== 'undefined',
+  wk: !!(window.webkit && window.webkit.messageHandlers),
+  hist: /invokeOnHost/.test(String(window.history.pushState)),
+  chromeType: typeof window.chrome,
   gl: 'ERR'
 };
 try {
@@ -290,6 +319,10 @@ FRAME_LIVE_JS = """(() => ({
   maxTouch: navigator.maxTouchPoints,
   coarse: matchMedia('(pointer: coarse)').matches,
   uaP: navigator.userAgentData ? navigator.userAgentData.platform : null,
+  gcr: typeof window.__gCrWeb !== 'undefined',
+  wk: !!(window.webkit && window.webkit.messageHandlers),
+  hist: /invokeOnHost/.test(String(window.history.pushState)),
+  chromeType: typeof window.chrome,
 }))()"""
 
 # Accept-CH 高熵头回送探针：/accept-ch 的响应声明高熵提示，页面同源 fetch
@@ -306,8 +339,9 @@ fetch('/accept-ch-second').catch(function () {});
 </script></head><body>accept-ch</body></html>"""
 
 # WebGPU 适配器信息：安全上下文（localhost/127.0.0.1）下读取 GPUAdapterInfo；
-# 真机 Android Chrome 为 vendor "qualcomm" / architecture "adreno-<型号>"，
-# 宿主 Apple GPU（vendor "apple"/"metal-*"）会在跨 API 对照下暴露。
+# 真机 Android Chrome 报内核 Dawn gpu_info 映射的代际级架构名（qualcomm/
+# adreno-Nxx、arm/valhall·gen-5、samsung/rdna-N、img-tec/d-series，见
+# _android_webgpu），宿主 Apple GPU（"apple"/"metal-*"）会在跨 API 对照下暴露。
 WEBGPU_JS = """(async () => {
   const out = { hasGpu: !!navigator.gpu };
   if (!navigator.gpu) { return out; }
@@ -438,8 +472,11 @@ async def race_test(ws_endpoint: str) -> dict:
 async def main() -> int:
     target_os = (sys.argv[1] if len(sys.argv) > 1 else "android").lower()
     mode = (sys.argv[2] if len(sys.argv) > 2 else "generate").lower()
-    if target_os not in ("android", "ios"):
-        print("用法: mobile_launch_verify.py [android|ios] [generate|preset]")
+    browser = (sys.argv[3] if len(sys.argv) > 3 else None)
+    if target_os not in ("android", "ios") or (
+            browser is not None
+            and browser not in (("chrome",) if target_os == "android" else ("safari", "chrome_ios"))):
+        print("用法: mobile_launch_verify.py [android|ios] [generate|preset] [safari|chrome_ios]")
         return 2
 
     ok, msg = is_available()
@@ -451,7 +488,7 @@ async def main() -> int:
     ensure_dirs()
     db.init_db()
 
-    fp = create_fingerprint(target_os, mode)
+    fp = create_fingerprint(target_os, mode, browser=browser)
     fpd = fp["fingerprint"]
     nav = fpd["navigator"]
     screen = fpd["screen"]
@@ -630,7 +667,7 @@ async def main() -> int:
             print("\n== Accept-CH 高熵头回送（两次请求实收头）==")
             print(json.dumps(accept_ch_state, ensure_ascii=False, indent=1))
 
-            # ---- WebGPU 适配器信息（安全上下文；Android 应为 Qualcomm Adreno）----
+            # ---- WebGPU 适配器信息（安全上下文；Android 按 Dawn 代际口径）----
             webgpu_state = await page.evaluate(WEBGPU_JS) or {}
             print("\n== WebGPU 适配器信息 ==")
             print(json.dumps(webgpu_state, ensure_ascii=False))
@@ -705,10 +742,9 @@ async def main() -> int:
     # ---- Accept-CH：声明后同源请求实际收到的头（真机 Chrome 补高熵）----
     ac_first = (accept_ch_state or {}).get("first") or {}
     ac_second = (accept_ch_state or {}).get("second") or {}
-    # ---- WebGPU：适配器信息（安全上下文实测；真机 Android 为 Qualcomm Adreno）----
+    # ---- WebGPU：适配器信息（安全上下文实测；口径与注入规格同源，Dawn 代际级）----
     wg = webgpu_state if isinstance(webgpu_state, dict) else {}
-    _wg_m = re.search(r"Adreno\s*(?:\(TM\))?\s*(\d{3,4})", str(vc.get("renderer") or ""))
-    wg_arch = ("adreno-" + _wg_m.group(1)) if _wg_m else None
+    _wg_expect = (derive_spec(fpd, target_os).get("webgpu") or {}) if is_android else {}
     # ---- 媒体设备枚举（类型计数）----
     media_counts = (media_state or {}).get("counts") or {}
     checks.update({
@@ -795,11 +831,11 @@ async def main() -> int:
                 and ac_second.get("sec-ch-ua-mobile") == "?1"
                 and ac_second.get("sec-ch-ua-platform") == f'"{ua_ch.get("platform") or "Android"}"'
                 and ac_second.get("user-agent") == nav["userAgent"]),
-            # ---- WebGPU：适配器信息（真机 Android Chrome 为 Qualcomm Adreno）----
-            "WebGPU：适配器 vendor == qualcomm（非宿主 apple）": (
-                wg.get("hasGpu") is True and wg.get("vendor") == "qualcomm"),
-            "WebGPU：architecture == adreno-<WebGL 型号>（跨 API 一致）": (
-                bool(wg_arch) and wg.get("architecture") == wg_arch),
+            # ---- WebGPU：适配器信息（口径与注入规格同源；非宿主 apple）----
+            "WebGPU：适配器 vendor == 规格（非宿主 apple）": (
+                wg.get("hasGpu") is True and wg.get("vendor") == _wg_expect.get("vendor")),
+            "WebGPU：architecture == Dawn 代际口径（跨 API 一致）": (
+                wg.get("architecture") == _wg_expect.get("architecture")),
             "WebGPU：GPUAdapterInfo 原型链/空 device/description 保持原生形态": (
                 wg.get("protoOk") is True and wg.get("device") == ""
                 and wg.get("description") == ""),
@@ -813,29 +849,91 @@ async def main() -> int:
                 and (media_state or {}).get("protoOk") is True),
         })
     else:
+        is_ios_chrome = extra.get("browser") == "chrome_ios"
         checks.update({
-            "UA-CH 不存在（Safari 无该 API）": state["uaData"] == "ABSENT",
-            "getBattery 不存在（Safari 无该 API）": state["hasGetBattery"] is False,
-            "deviceMemory 不暴露（Safari 无该 API）": state["deviceMemory"] is None,
-            "connection 不存在（Safari 无该 API）": state["hasConnection"] is False,
-            "pdfViewerEnabled 不存在（Safari 无该 API）": state["hasPdfViewer"] is False,
-            "standalone 存在且为 false（iOS 专有属性）": state["hasStandalone"] is True and state["standalone"] is False,
-            "plugins/mimeTypes 为空（Safari 行为）": state["pluginsLen"] == 0 and state["mimeTypesLen"] == 0,
-            "无 Sec-CH-UA 请求头（Safari 不发）": not any(k.startswith("sec-ch") for k in seen_headers),
+            "UA-CH 不存在（Safari/CriOS 均无该 API）": state["uaData"] == "ABSENT",
+            "getBattery 不存在（WKWebView 无该 API）": state["hasGetBattery"] is False,
+            "deviceMemory 不暴露（WKWebView 无该 API）": state["deviceMemory"] is None,
+            "connection 不存在（Safari/CriOS 均无该 API）": state["hasConnection"] is False,
+            "pdfViewerEnabled 不存在（Safari/CriOS 均无该 API）": state["hasPdfViewer"] is False,
+            "plugins/mimeTypes 为空（WKWebView 行为）": state["pluginsLen"] == 0 and state["mimeTypesLen"] == 0,
+            "无 Sec-CH-UA 请求头（WKWebView 不发）": not any(k.startswith("sec-ch") for k in seen_headers),
             "请求头 User-Agent == 指纹 UA": seen_headers.get("user-agent") == nav["userAgent"],
-            "竞态：首文档无 UA-CH（Safari 行为）": probe.get("hasUaData") is False,
-            "跨域 iframe：UA-CH 不存在（Safari 行为）": fr.get("uaP") is None,
-            "Worker（页面）：UA-CH 不存在（Safari 行为）": wk_main.get("uaP") is None,
-            "Worker（页面）：deviceMemory 不暴露（Safari 行为）": wk_main.get("devMem") is None,
-            "Worker（跨域 iframe）：UA-CH 不存在（Safari 行为）": fr_worker.get("uaP") is None,
-            # ---- Accept-CH：Safari 无 UA-CH，声明后也没有任何 Sec-CH-UA* 头 ----
-            "Accept-CH：Safari 声明前后均无 UA-CH 头": (
+            "竞态：首文档无 UA-CH（WKWebView 行为）": probe.get("hasUaData") is False,
+            "跨域 iframe：UA-CH 不存在（WKWebView 行为）": fr.get("uaP") is None,
+            "Worker（页面）：UA-CH 不存在（WKWebView 行为）": wk_main.get("uaP") is None,
+            "Worker（页面）：deviceMemory 不暴露（WKWebView 行为）": wk_main.get("devMem") is None,
+            "Worker（跨域 iframe）：UA-CH 不存在（WKWebView 行为）": fr_worker.get("uaP") is None,
+            # ---- Accept-CH：无 UA-CH，声明后也没有任何 Sec-CH-UA* 头 ----
+            "Accept-CH：声明前后均无 UA-CH 头": (
                 not any(k.startswith("sec-ch") for k in ac_first)
                 and not any(k.startswith("sec-ch") for k in ac_second)),
             # ---- WebGPU：iOS 保持宿主 Apple 适配器（真机 iPhone 同为 Apple GPU）----
             "WebGPU：iOS 适配器 vendor == apple（真机一致）": (
                 wg.get("hasGpu") is True and wg.get("vendor") == "apple"),
+            # ---- iOS 两口径通用：普通页面无 window.chrome（报告 §4.4 / B1-5）----
+            "window.chrome 为 undefined（iOS 普通页面无该对象）": state["hasChromeObj"] is False,
         })
+        if is_ios_chrome:
+            checks.update({
+                # ---- CriOS 检测面（补丁方案 §2.3 断言组）----
+                "CriOS：UA 含 CriOS/<version>": state["isCriOS"] is True,
+                "CriOS：UA 版本 == 指纹 browserVersion": (
+                    f"CriOS/{str(extra.get('browserVersion') or '').split('.')[0]}.0.0.0"
+                    in nav["userAgent"]),
+                "CriOS：window.__gCrWeb 存在": state["hasGCrWeb"] is True,
+                "CriOS：__gCrWeb.windowId 非空": bool(state["gCrWebWindowId"]),
+                "CriOS：__gCrWeb 成员族齐全": (
+                    {"message", "autofill", "suggestion", "contextualSearch",
+                     "languageDetection", "translate", "findInPage", "plugin",
+                     "findPasswordForms", "dispatchPopstateEvent", "replaceWebViewURL"}
+                    <= set(state["gCrWebKeys"] or [])),
+                "CriOS：window.webkit.messageHandlers 存在": state["hasWK"] is True,
+                "CriOS：messageHandlers 含已确认通道": (
+                    {"POSTSuccessHandler", "POSTErrorHandler"}
+                    <= set(state["wkHandlers"] or [])),
+                "CriOS：history.pushState toString 含 invokeOnHost": state["historyPatched"] is True,
+                "CriOS：print toString 含 invokeOnHost": state["printPatched"] is True,
+                "CriOS：scrollTo toString 含 setWebViewScrollViewIsDragging": (
+                    state["scrollPatched"] is True),
+                "CriOS：vendor == Apple Computer, Inc.": (
+                    state["vendor"] == "Apple Computer, Inc."),
+                # 文档起点：init 脚本先于页面脚本，竞态下也必须已补齐
+                "竞态：首文档 __gCrWeb 已存在": probe.get("gcr") is True,
+                "竞态：首文档 __gCrWeb.windowId 非空": bool(probe.get("gcrWindowId")),
+                "竞态：首文档 webkit.messageHandlers 已存在": probe.get("wk") is True,
+                "竞态：首文档 history 改写已生效": probe.get("hist") is True,
+                "竞态：首文档 scrollTo 改写已生效": probe.get("scroll") is True,
+                "竞态：首文档无 window.chrome": probe.get("chromeType") == "undefined",
+                # 子帧（OOPIF）随 init 脚本同一份补丁：检测面不应只在顶层成立
+                "跨域 iframe：CriOS 检测面一致": (
+                    fr.get("gcr") is True and fr.get("wk") is True
+                    and fr.get("hist") is True and fr.get("chromeType") == "undefined"),
+                # 二次客户端（Playwright 自建 OOPIF 会话）实时读取同一补丁
+                "跨域 iframe：二次客户端 CriOS 检测面一致": (
+                    fr_live.get("gcr") is True and fr_live.get("wk") is True
+                    and fr_live.get("hist") is True
+                    and fr_live.get("chromeType") == "undefined"),
+            })
+        else:
+            checks.update({
+                "Safari：UA 不含 CriOS": state["isCriOS"] is False,
+                "Safari：无 __gCrWeb（真机 Safari 无该对象）": state["hasGCrWeb"] is False,
+                "Safari：无 window.webkit.messageHandlers": state["hasWK"] is False,
+                "Safari：history/print/scrollTo 保持原生外观": (
+                    state["historyPatched"] is False
+                    and state["printPatched"] is False
+                    and state["scrollPatched"] is False),
+                "Safari：standalone 存在且为 false（iOS 专有属性）": (
+                    state["hasStandalone"] is True and state["standalone"] is False),
+                "跨域 iframe：无 CriOS 检测面（Safari 口径）": (
+                    fr.get("gcr") is False and fr.get("wk") is False
+                    and fr.get("hist") is False and fr.get("chromeType") == "undefined"),
+                "跨域 iframe：二次客户端无 CriOS 检测面": (
+                    fr_live.get("gcr") is False and fr_live.get("wk") is False
+                    and fr_live.get("hist") is False
+                    and fr_live.get("chromeType") == "undefined"),
+            })
 
     print("\n== 检查项 ==")
     ok_all = True

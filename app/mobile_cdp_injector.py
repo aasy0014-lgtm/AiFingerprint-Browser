@@ -18,6 +18,9 @@
   navigator.deviceMemory、Battery API、Sec-CH-UA* 请求头
 - iOS：抹掉 Safari 不存在的属性（navigator.connection、pdfViewerEnabled、
   userAgentData），plugins/mimeTypes 置空，navigator.vendor=Apple
+- iOS Chrome（CriOS 口径）：页面世界检测面补齐（__gCrWeb 全局、被改写的
+  history/print/scrollTo（toString 含真机字样）、webkit.messageHandlers），
+  普通页面无 window.chrome（iOS 两口径通用）
 - screen.colorDepth/pixelDepth = 24（宿主 macOS 报告 30，是明显的穿帮点）
 
 关键设计：**仿真设置随 CDP 客户端断开会被浏览器还原**（与 DevTools
@@ -78,6 +81,55 @@ def _memory_bucket(value: Any) -> Optional[int]:
     return 1
 
 
+# ---- Android WebGPU（GPUAdapterInfo）架构口径 ----
+# 真机 Android Chrome 的 WebGPU 由 Dawn/Vulkan 驱动，架构名来自 Dawn 内置
+# 的 gpu_info 数据（PCI 设备 ID → 架构映射，见 Dawn src/dawn/gpu_info.json）。
+# 依据本仓库内核（148.0.7778.215）二进制内嵌字面量实证：Qualcomm 为代际级
+# "adreno-4xx".."adreno-8xx"（非具体型号）；ARM 为 "midgard"/"bifrost"/
+# "valhall"/"gen-5"；Samsung 为 "rdna-1".."rdna-4"；ImgTec 为 "d-series"。
+# 非库内 GPU 返回 None（不伪造口径）。
+_MALI_ARCH = {
+    # 5th Gen（Dawn: 0xC/0xD/0xE0 千位段）
+    "G310": "gen-5", "G615": "gen-5", "G715": "gen-5",
+    "G625": "gen-5", "G725": "gen-5", "G925": "gen-5",
+    # Valhall（4th Gen，0x9/0xA/0xB0 段）
+    "G57": "valhall", "G68": "valhall", "G77": "valhall", "G78": "valhall",
+    "G510": "valhall", "G610": "valhall", "G710": "valhall",
+    # Bifrost（0x6/0x70 段）
+    "G31": "bifrost", "G51": "bifrost", "G52": "bifrost", "G76": "bifrost",
+    # Midgard（最高位为 0）
+    "G71": "midgard", "G72": "midgard",
+}
+_XCLIPSE_ARCH = {"530": "rdna-2", "920": "rdna-2", "940": "rdna-3"}
+
+
+def _android_webgpu(renderer: str) -> Optional[Dict[str, str]]:
+    """从 WebGL 渲染器字符串还原真机 Dawn 会报告的 WebGPU 适配器口径。
+
+    WebGL↔WebGPU 跨 API 一致性是检测站常用对照点：宿主 macOS 报
+    "apple"/"metal-*"，与 Android 机型声明的 GPU 直接矛盾。规则与内核
+    内置的 Dawn gpu_info 映射一致（见上方表注释）。
+    """
+    if "Adreno" in renderer:
+        m = re.search(r"Adreno\s*(?:\(TM\))?\s*(\d{3,4})", renderer)
+        if m and m.group(1)[0] in "45678":
+            return {"vendor": "qualcomm", "architecture": f"adreno-{m.group(1)[0]}xx"}
+    if "Mali" in renderer:
+        m = re.search(r"Mali-(G\d+)", renderer)
+        if m and m.group(1) in _MALI_ARCH:
+            return {"vendor": "arm", "architecture": _MALI_ARCH[m.group(1)]}
+    if "Xclipse" in renderer:
+        m = re.search(r"Xclipse\s*(\d{3,4})", renderer)
+        if m and m.group(1) in _XCLIPSE_ARCH:
+            return {"vendor": "samsung", "architecture": _XCLIPSE_ARCH[m.group(1)]}
+    if "PowerVR" in renderer:
+        if "DXT" in renderer or "D-Series" in renderer:
+            return {"vendor": "img-tec", "architecture": "d-series"}
+        if re.search(r"\bGE\d{4}\b|Rogue", renderer):
+            return {"vendor": "img-tec", "architecture": "rogue"}
+    return None
+
+
 def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
     """从存储的移动端 fingerprint 提取运行期仿真规格（兼容旧版结构）。"""
     fp = fingerprint or {}
@@ -101,20 +153,24 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
     renderer = str(vc.get("renderer") or "")
     webgl = {"vendor": str(vc.get("vendor") or ""), "renderer": renderer} if renderer else None
 
-    # WebGPU（GPUAdapterInfo）真机 Android Chrome 口径（Dawn/Vulkan）：
-    # vendor "qualcomm"、architecture "adreno-<型号>"。宿主是 Apple GPU
-    # （vendor "apple" / "metal-*"），与 WebGL 已声明的 Qualcomm 直接矛盾，
-    # 跨 API 一致性检查可命中；型号取自 WebGL 渲染器，两 API 口径互相印证。
-    webgpu = None
-    if target_os == "android":
-        m = re.search(r"Adreno\s*(?:\(TM\))?\s*(\d{3,4})", renderer)
-        if m:
-            webgpu = {"vendor": "qualcomm", "architecture": "adreno-" + m.group(1)}
+    # WebGPU（GPUAdapterInfo）真机 Android Chrome 口径（Dawn/Vulkan）：宿主
+    # 是 Apple GPU（vendor "apple" / "metal-*"），与 Android 机型声明的 GPU
+    # 直接矛盾，WebGL↔WebGPU 跨 API 对照可命中；映射见 _android_webgpu。
+    webgpu = _android_webgpu(renderer) if target_os == "android" else None
 
     # 媒体设备枚举（enumerateDevices）：真机 Android Chrome 至少枚举前后两个
     # 摄像头（videoinput ×2）；宿主 Mac 是单摄像头（×1），数量偏差可直接被
     # 设备枚举型检测捕获。audioinput/audiooutput 真机各 1，与宿主相同。
     media_video_inputs = 2 if target_os == "android" else 0
+
+    # iOS Chrome（CriOS）口径：mobileExtra.browser == "chrome_ios"（兼容 "chrome"）。
+    # 运行期在页面世界补齐 CriOS 检测面（__gCrWeb / 改写痕迹 /
+    # webkit.messageHandlers / 无 window.chrome），见 _PATCH_TEMPLATE。
+    ios_chrome = (
+        {"version": str(extra.get("browserVersion") or "")}
+        if target_os == "ios" and str(extra.get("browser") or "") in ("chrome", "chrome_ios")
+        else None
+    )
 
     ua_ch = extra.get("uaCh") or None
     if target_os == "android" and ua_ch:
@@ -157,6 +213,7 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
         "removeProps": list(remove_props),
         "emptyPlugins": empty_plugins,
         "ios": target_os == "ios",
+        "iosChrome": ios_chrome,
         "webgl": webgl,
         "webgpu": webgpu,
         "mediaVideoInputs": media_video_inputs,
@@ -240,10 +297,10 @@ _PATCH_TEMPLATE = r"""
                 var v = registry.get(this);
                 return v !== undefined ? v : origToString.call(this);
             };
-            var mask = function (fn, name) {
+            var mask = function (fn, name, src) {
                 try {
                     if (typeof fn === 'function') {
-                        registry.set(fn, 'function ' + name + '() { [native code] }');
+                        registry.set(fn, src || ('function ' + name + '() { [native code] }'));
                         try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e2) {}
                     }
                 } catch (e) {}
@@ -273,6 +330,18 @@ _PATCH_TEMPLATE = r"""
         try {
             Object.defineProperty(proto, name, {
                 value: __maskNative(fn, name),
+                writable: true, enumerable: true, configurable: true,
+            });
+            return true;
+        } catch (e) { return false; }
+    };
+    // 与 defineFn 相同，但自定义 toString() 返回的源码文本：真机 Chrome iOS
+    // 改写的 history/print/scrollTo 是非原生外观（源码含 invokeOnHost /
+    // setWebViewScrollViewIsDragging 字样），不能伪装成 [native code]。
+    var defineFnSrc = function (proto, name, fn, src) {
+        try {
+            Object.defineProperty(proto, name, {
+                value: __maskNative(fn, name, src),
                 writable: true, enumerable: true, configurable: true,
             });
             return true;
@@ -325,8 +394,16 @@ _PATCH_TEMPLATE = r"""
             defineGet(N, 'deviceMemory', D.deviceMemory);
         }
         if (D.ios) {
-            // iOS Safari 专有：standalone（非独立 PWA 模式恒为 false）
-            defineGet(N, 'standalone', false);
+            if (!D.iosChrome) {
+                // iOS Safari 专有：standalone（非独立 PWA 模式恒为 false）；
+                // CriOS 是 WKWebView 壳，不暴露该属性（待真机校准，暂不定义）
+                defineGet(N, 'standalone', false);
+            }
+            // 真机 iOS（Safari / Chrome）普通页面没有 window.chrome；桌面内核
+            // 必然携带该对象且属性 configurable:false（删除/重定义均不可行）。
+            // 赋值 undefined 后 typeof/truthiness 检查通过；'chrome' in window
+            // 与 getOwnPropertyDescriptor 的残余暴露属内核层限制（已知边界）。
+            try { window.chrome = undefined; } catch (e) {}
         }
 
         // ---- 抹掉该平台不存在的桌面 Chromium 属性（如 iOS 的 connection）----
@@ -352,6 +429,117 @@ _PATCH_TEMPLATE = r"""
                     defineFn(emptyMimes, 'item', function () { return null; });
                     defineFn(emptyMimes, 'namedItem', function () { return null; });
                     defineGet(N, 'mimeTypes', emptyMimes);
+                }
+            } catch (e) {}
+        }
+
+        // ---- iOS Chrome（CriOS）：页面世界检测面 ----
+        // 真机 Chrome iOS 是 WKWebView 壳：web_bundle.js 等用户脚本注入页面
+        // 世界，网站 JS 可见 window.__gCrWeb（约 30 成员）、被改写的 history/
+        // print/scrollTo（toString 可见 "invokeOnHost"、"setWebViewScrollView
+        // IsDragging" 字样）、window.webkit.messageHandlers。桌面内核均缺失
+        // 这些特征，按 Chrome61-IPA 分析报告 §4.4 补齐；成员全集与文本细节以
+        // 真机抓取二次校准（P2）。worker 内真机同样没有这些对象，故本段仅
+        // 存在于页面模板。
+        if (D.iosChrome) {
+            try {
+                var mkFn = function (name) {
+                    var f = function () {};
+                    try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
+                    return f;
+                };
+                var mkNS = function (names) {
+                    var o = {};
+                    for (var ni = 0; ni < names.length; ni++) { o[names[ni]] = mkFn(names[ni]); }
+                    return o;
+                };
+                // windowId：每窗口唯一（真机为宿主填充的会话标识，格式待校准）
+                var winId = '';
+                try {
+                    var rnd = new Uint8Array(16);
+                    crypto.getRandomValues(rnd);
+                    for (var bi = 0; bi < rnd.length; bi++) {
+                        winId += ('0' + rnd[bi].toString(16)).slice(-2);
+                    }
+                } catch (e) {
+                    winId = 'w' + Date.now().toString(16) + Math.random().toString(16).slice(2);
+                }
+                var gcr = {
+                    windowId: winId,
+                    common: mkNS([]),
+                    message: mkNS(['invokeOnHost']),
+                    console: mkNS([]),
+                    autofill: mkNS([]),
+                    suggestion: mkNS(['getNextElementInTabOrder']),
+                    contextualSearch: mkNS(['mutationEvent', 'selectionChanged']),
+                    languageDetection: mkNS(['getTextContent']),
+                    translate: mkNS([]),
+                    findInPage: mkNS([]),
+                    plugin: mkNS([])
+                };
+                var gcrFnNames = ['stringify', 'getElementFromPoint',
+                    'findPasswordForms', 'fillPasswordForm',
+                    'fillPasswordFormWithGeneratedPassword', 'findMatchingPasswordForms',
+                    'isAutofilled', 'setAutofilled', 'clearAutofilledPasswords',
+                    'getPasswordForm', 'getPasswordFormData', 'getPasswordFormDataList',
+                    'getElementByNameWithParent', 'selectText',
+                    'dispatchPopstateEvent', 'dispatchHashchangeEvent', 'replaceWebViewURL'];
+                for (var gi = 0; gi < gcrFnNames.length; gi++) {
+                    gcr[gcrFnNames[gi]] = mkFn(gcrFnNames[gi]);
+                }
+                Object.defineProperty(window, '__gCrWeb', {
+                    value: gcr, writable: true, enumerable: true, configurable: true,
+                });
+
+                // history.* 改写：行为透传原生；toString 呈真机的 JS 源码文本
+                var H = (typeof History !== 'undefined') ? History.prototype : null;
+                var wrapHistory = function (name, arity, src) {
+                    if (!H || typeof H[name] !== 'function') { return; }
+                    var orig = H[name];
+                    var fn = arity === 3
+                        ? function (state, title, url) { return orig.apply(this, arguments); }
+                        : (arity === 1
+                            ? function (delta) { return orig.apply(this, arguments); }
+                            : function () { return orig.apply(this, arguments); });
+                    defineFnSrc(H, name, fn, src);
+                };
+                wrapHistory('pushState', 3,
+                    "function pushState(state, title, url) { window.__gCrWeb.message.invokeOnHost('window.history.willChangeState', String(url)); }");
+                wrapHistory('replaceState', 3,
+                    "function replaceState(state, title, url) { window.__gCrWeb.message.invokeOnHost('window.history.willChangeState', String(url)); }");
+                wrapHistory('back', 0,
+                    "function back() { window.__gCrWeb.message.invokeOnHost('window.history.back'); }");
+                wrapHistory('forward', 0,
+                    "function forward() { window.__gCrWeb.message.invokeOnHost('window.history.forward'); }");
+                wrapHistory('go', 1,
+                    "function go(delta) { window.__gCrWeb.message.invokeOnHost('window.history.go', String(delta)); }");
+
+                // window.print / window.scrollTo 改写（同上报文形态）
+                var origPrint = window.print;
+                if (typeof origPrint === 'function') {
+                    defineFnSrc(window, 'print', function () { return origPrint.apply(this, arguments); },
+                        "function print() { window.__gCrWeb.message.invokeOnHost('print.window.print'); }");
+                }
+                var origScrollTo = window.scrollTo;
+                if (typeof origScrollTo === 'function') {
+                    defineFnSrc(window, 'scrollTo', function (x, y) { return origScrollTo.apply(this, arguments); },
+                        "function scrollTo(x, y) { setWebViewScrollViewIsDragging(false); window.__gCrWeb.message.invokeOnHost('window.scrollTo', x, y); }");
+                }
+
+                // WKWebView 痕迹：webkit.messageHandlers（已确认通道；postMessage
+                // 为原生 binding 外观的 no-op；通道全集待真机抓取校准）
+                if (typeof window.webkit === 'undefined') {
+                    var handlers = {};
+                    var handlerNames = ['POSTSuccessHandler', 'POSTErrorHandler'];
+                    for (var hi = 0; hi < handlerNames.length; hi++) {
+                        handlers[handlerNames[hi]] = {
+                            postMessage: __maskNative(function () {}, 'postMessage')
+                        };
+                    }
+                    Object.defineProperty(window, 'webkit', {
+                        value: { messageHandlers: handlers },
+                        writable: true, enumerable: true, configurable: true,
+                    });
                 }
             } catch (e) {}
         }
@@ -535,10 +723,11 @@ _PATCH_TEMPLATE = r"""
 
         // ---- WebGPU：适配器信息（GPUAdapterInfo）必须与移动 GPU 口径一致 ----
         // 宿主是 Apple GPU（vendor "apple" / architecture "metal-*"），而 WebGL
-        // 已声明 Qualcomm Adreno；真机 Android Chrome（Dawn/Vulkan）报告
-        // vendor "qualcomm" / architecture "adreno-<型号>"，跨 API 对照可直接
-        // 命中（GPUAdapterInfo 属性在原型上，实例无 own property；device/
-        // description 宿主本就为空串，与真机相同，无需处理）。
+        // 已声明 Android 机型的 GPU；真机 Android Chrome（Dawn/Vulkan）报内核
+        // Dawn gpu_info 数据映射的代际级架构名（qualcomm/adreno-Nxx、arm/
+        // valhall|gen-5、samsung/rdna-N、img-tec/d-series，见 _android_webgpu），
+        // 跨 API 对照可直接命中（GPUAdapterInfo 属性在原型上，实例无 own
+        // property；device/description 宿主本就为空串，与真机相同，无需处理）。
         if (D.webgpu && typeof GPUAdapterInfo !== 'undefined' && GPUAdapterInfo.prototype) {
             try {
                 defineGet(GPUAdapterInfo.prototype, 'vendor', D.webgpu.vendor);
@@ -564,6 +753,7 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "removeProps": list(spec.get("removeProps") or []),
         "emptyPlugins": bool(spec.get("emptyPlugins")),
         "ios": bool(spec.get("ios")),
+        "iosChrome": spec.get("iosChrome"),
         "webgl": spec.get("webgl"),
         "webgpu": spec.get("webgpu"),
         "mediaVideoInputs": int(spec.get("mediaVideoInputs") or 0),
@@ -597,10 +787,10 @@ _WORKER_PATCH_TEMPLATE = r"""
                 var v = registry.get(this);
                 return v !== undefined ? v : origToString.call(this);
             };
-            var mask = function (fn, name) {
+            var mask = function (fn, name, src) {
                 try {
                     if (typeof fn === 'function') {
-                        registry.set(fn, 'function ' + name + '() { [native code] }');
+                        registry.set(fn, src || ('function ' + name + '() { [native code] }'));
                         try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e2) {}
                     }
                 } catch (e) {}
@@ -711,7 +901,7 @@ _WORKER_PATCH_TEMPLATE = r"""
 
         // ---- WebGPU：Worker 内 GPUAdapterInfo 与主文档同口径 ----
         // （Dedicated Worker 可用 navigator.gpu；宿主 Apple 适配器信息在这里
-        //   同样泄漏，真机 Android Worker 报告 Qualcomm Adreno）
+        //   同样泄漏，真机 Android Worker 报与主文档相同的 Dawn 代际口径）
         if (D.webgpu && typeof GPUAdapterInfo !== 'undefined' && GPUAdapterInfo.prototype) {
             defineGet(GPUAdapterInfo.prototype, 'vendor', D.webgpu.vendor);
             defineGet(GPUAdapterInfo.prototype, 'architecture', D.webgpu.architecture);
@@ -784,7 +974,7 @@ class MobileEmulationSession:
                 "maxTouchPoints": int(max_touch_points or 5),
                 "deviceMemory": None, "colorDepth": None, "uaCh": None,
                 "battery": None, "removeProps": [], "emptyPlugins": False,
-                "ios": target_os == "ios", "webgl": None, "webgpu": None,
+                "ios": target_os == "ios", "iosChrome": None, "webgl": None, "webgpu": None,
                 "mediaVideoInputs": 0,
                 "cssWidth": css_w, "cssHeight": css_h,
                 "viewportHeight": css_h, "dpr": scale,

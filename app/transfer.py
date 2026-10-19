@@ -73,7 +73,11 @@ def import_profile(data: dict, name_override: str | None = None,
     # 指纹缺失或格式不符时重新生成，避免导入旧版/外部数据崩溃
     fingerprint = profile.get("fingerprint")
     if not isinstance(fingerprint, dict) or not fingerprint.get("seeds"):
-        fingerprint = create_fingerprint(profile.get("target_os", "windows"))
+        # 重建时沿用导出数据的移动端口径（iOS Chrome 不应静默回退 Safari）
+        stored_browser = (((fingerprint if isinstance(fingerprint, dict) else {}).get("fingerprint") or {})
+                          .get("mobileExtra") or {}).get("browser")
+        fingerprint = create_fingerprint(profile.get("target_os", "windows"),
+                                         browser=stored_browser)
     imported = db.create_profile(
         name=(name_override or profile.get("name") or "导入的环境"),
         group_name=profile.get("group_name") or "导入",

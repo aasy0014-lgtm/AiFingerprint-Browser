@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 ProxyScheme = Literal["http", "https", "socks4", "socks5"]
 TargetOS = Literal["windows", "macos", "linux", "android", "ios"]
 KernelName = Literal["camoufox", "chromium", "fp-chromium"]
+# 移动端浏览器口径：Android 恒为 chrome；iOS 为 safari / chrome_ios（CriOS）
+MobileBrowser = Literal["chrome", "safari", "chrome_ios"]
 # 指纹模式：generate=BrowserForge 合成；preset=真实设备预设库
 FingerprintMode = Literal["generate", "preset"]
 # RPA 步骤动作
@@ -81,6 +83,8 @@ class ProfileCreate(BaseModel):
     fingerprint_mode: FingerprintMode = "generate"
     # 移动端机型库品牌筛选（android/ios 专用；留空=按在网权重随机）
     manufacturer: Optional[str] = Field(default=None, max_length=32)
+    # 移动端浏览器口径（iOS 专用；留空=safari。Android 恒为 chrome）
+    browser: Optional[MobileBrowser] = None
     proxy: Optional[ProxyConfig] = None
     launch: LaunchConfig = Field(default_factory=LaunchConfig)
 
@@ -102,6 +106,8 @@ class ProfileUpdate(BaseModel):
     fingerprint_mode: Optional[FingerprintMode] = None
     # 移动端机型库品牌筛选（改品牌会重新生成指纹）
     manufacturer: Optional[str] = Field(default=None, max_length=32)
+    # 移动端浏览器口径（改口径会重新生成指纹；Android 仅 chrome）
+    browser: Optional[MobileBrowser] = None
     proxy: Optional[ProxyConfig] = None
     launch: Optional[LaunchConfig] = None
     # 指纹重新生成开关：更新时传 regen_fingerprint=true 会为该环境换一套新指纹

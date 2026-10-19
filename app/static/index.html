@@ -372,6 +372,12 @@
             <option value="">随机（按在网权重抽取）</option>
           </select>
         </label>
+        <label id="mobileBrowserWrap" style="display:none">浏览器口径（iOS）
+          <select name="browser" id="mobileBrowserSelect">
+            <option value="safari">Safari（默认）</option>
+            <option value="chrome_ios">Chrome（CriOS，补齐 __gCrWeb 检测面）</option>
+          </select>
+        </label>
         <label>指纹模式
           <select name="fingerprint_mode" id="fpModeSelect">
             <option value="generate">合成生成（真实机型库随机组合）</option>

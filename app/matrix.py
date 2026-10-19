@@ -150,10 +150,13 @@ def regenerate_risky(profile_ids: list[str]) -> list[dict[str, Any]]:
         import json
 
         mode = (p["fingerprint"] or {}).get("mode", "generate")
+        # 沿用环境的移动端浏览器口径（如 iOS Chrome），否则重生成会静默回退 Safari
+        stored_browser = (((p["fingerprint"] or {}).get("fingerprint") or {})
+                          .get("mobileExtra") or {}).get("browser")
         old_key = _feature_key(p["fingerprint"], p["target_os"])
         candidate = None
         for _ in range(8):  # 有界重试：先保证不与现有矩阵精确撞车
-            cand = create_fingerprint(p["target_os"], mode)
+            cand = create_fingerprint(p["target_os"], mode, browser=stored_browser)
             key = _feature_key(cand, p["target_os"])
             if key not in existing_keys and crowd[(key[1], key[2])] < 3:
                 candidate = cand

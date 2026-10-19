@@ -132,6 +132,36 @@ def _pick_android_browser(mode: str) -> Dict[str, Any]:
     )[0]
 
 
+def _pick_ios_browser() -> Dict[str, Any]:
+    """Chrome iOS（CriOS）版本：与内核实测引擎一致（与 Android 侧同法）。
+
+    Chrome iOS 的大版本与桌面 Chrome 同步演进（120 ↔ 120），因此直接复用
+    「内核版本优先」策略，避免 UA 声称版本与引擎特性错位被检测站命中。
+    未安装内核时回退到库内 Chrome 版本池（仅用于无内核环境生成指纹）。
+    """
+    kernel = _kernel_browser()
+    if kernel:
+        return kernel
+    if _ANDROID_BROWSERS:
+        fb = max(_ANDROID_BROWSERS, key=lambda b: (float(b["weight"]), _version_key(b["full"])))
+        return {"major": fb["major"], "full": fb["full"], "weight": 1.0, "source": "library"}
+    return {"major": "156", "full": "156.0.8078.35", "weight": 1.0, "source": "fallback"}
+
+
+def _normalize_browser(target_os: str, browser: Optional[str]) -> str:
+    """归一化浏览器口径：Android 恒为 chrome；iOS 为 safari / chrome_ios。"""
+    value = (browser or "").strip().lower()
+    if target_os == "android":
+        if value in ("", "chrome"):
+            return "chrome"
+        raise ValueError(f"Android 端浏览器口径仅支持 chrome（收到 {browser}）")
+    if value in ("", "safari"):
+        return "safari"
+    if value in ("chrome", "chrome_ios"):
+        return "chrome_ios"
+    raise ValueError(f"iOS 端浏览器口径仅支持 safari / chrome_ios（收到 {browser}）")
+
+
 def _android_ua_ch(device: Dict[str, Any], os_version: str, browser: Dict[str, Any]) -> Dict[str, Any]:
     """Chrome Android 的 navigator.userAgentData（含高熵值）。"""
     major = str(browser["major"])
@@ -250,6 +280,7 @@ def generate_mobile_fingerprint(
     target_os: str,
     manufacturer: Optional[str] = None,
     mode: str = "generate",
+    browser: Optional[str] = None,
 ) -> Dict[str, Any]:
     """生成一套移动端指纹（基于真实机型库）。
 
@@ -258,10 +289,13 @@ def generate_mobile_fingerprint(
         manufacturer: 可选品牌（Samsung/Google/Xiaomi/OnePlus/Apple 等），
                       无匹配时回退为该平台全库，实际结果见返回的 manufacturer
         mode: "generate"（版本随机）/ "preset"（版本取机型当前主流组合）
+        browser: 浏览器口径。Android 仅 "chrome"（默认）；iOS 可选
+                 "safari"（默认）/"chrome_ios"（Chrome iOS，CriOS）。
     """
     if target_os not in ("android", "ios"):
         raise ValueError(f"不支持的移动端目标 OS: {target_os}")
     mode = "preset" if mode == "preset" else "generate"
+    browser_choice = _normalize_browser(target_os, browser)
 
     device = _pick_device(target_os, manufacturer)
     screen_meta = device["screen"]
@@ -275,8 +309,8 @@ def generate_mobile_fingerprint(
     memory_class = _memory_class(int(device.get("ram_gb") or 4))
 
     if target_os == "android":
-        browser = _pick_android_browser(mode)
-        major = str(browser["major"]) 
+        android_browser = _pick_android_browser(mode)
+        major = str(android_browser["major"]) 
         mobile_token = "" if is_tablet else "Mobile "
         user_agent = (
             f"Mozilla/5.0 (Linux; Android {os_version}; {device['model']}) "
@@ -285,8 +319,8 @@ def generate_mobile_fingerprint(
         )
         nav_platform = "Linux armv81"
         vendor = "Google Inc."
-        ua_ch: Optional[Dict[str, Any]] = _android_ua_ch(device, os_version, browser)
-        browser_version = str(browser["full"])
+        ua_ch: Optional[Dict[str, Any]] = _android_ua_ch(device, os_version, android_browser)
+        browser_version = str(android_browser["full"])
         platform_version_ch = f"{os_version}.0.0"
         battery: Optional[Dict[str, Any]] = _generate_battery_api()
         device_memory: Optional[int] = memory_class
@@ -295,25 +329,38 @@ def generate_mobile_fingerprint(
     else:
         os_token = os_version.replace(".", "_")
         safari_version = ".".join(os_version.split(".")[:2])  # iOS 27.0.1 → Safari 27.0
+        if browser_choice == "chrome_ios":
+            # Chrome iOS（CriOS）：WKWebView 壳 + 系统 WebKit。UA 为 reduced
+            # 形态 CriOS/<major>.0.0.0（与 Android 侧 Chrome/<major>.0.0.0
+            # 同法），版本随内核实测引擎；无 UA-CH / Battery（WKWebView 无
+            # 这些 API）。页面世界检测面差异（__gCrWeb / 改写痕迹 /
+            # webkit.messageHandlers / 无 window.chrome）由运行期注入层
+            # （mobile_cdp_injector 的 iosChrome 段）补齐。
+            ios_browser = _pick_ios_browser()
+            crios_major = str(ios_browser["major"])
+            browser_version = str(ios_browser["full"])
+            ua_segment = f"CriOS/{crios_major}.0.0.0"
+        else:
+            browser_version = safari_version
+            ua_segment = f"Version/{safari_version}"
         if is_tablet:
             user_agent = (
                 f"Mozilla/5.0 (iPad; CPU OS {os_token} like Mac OS X) "
-                f"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{safari_version} "
+                f"AppleWebKit/605.1.15 (KHTML, like Gecko) {ua_segment} "
                 f"Mobile/15E148 Safari/604.1"
             )
             nav_platform = "iPad"
         else:
             user_agent = (
                 f"Mozilla/5.0 (iPhone; CPU iPhone OS {os_token} like Mac OS X) "
-                f"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{safari_version} "
+                f"AppleWebKit/605.1.15 (KHTML, like Gecko) {ua_segment} "
                 f"Mobile/15E148 Safari/604.1"
             )
             nav_platform = "iPhone"
         vendor = "Apple Computer, Inc."
-        ua_ch = None  # Safari 不暴露 UA-CH
-        browser_version = safari_version
+        ua_ch = None  # Safari / CriOS 均不暴露 UA-CH
         platform_version_ch = os_version if os_version.count(".") >= 2 else f"{os_version}.0"
-        battery = None  # Safari 无 Battery API
+        battery = None  # WKWebView 无 Battery API
         device_memory = None
         remove_props = list(_IOS_REMOVE_NAV_PROPS)
         empty_plugins = True
@@ -419,7 +466,7 @@ def generate_mobile_fingerprint(
             "deviceType": device["type"],
             "released": device.get("released"),
             "osVersion": os_version,
-            "browser": "chrome" if target_os == "android" else "safari",
+            "browser": browser_choice,
             "browserVersion": browser_version,
             "platformVersionCh": platform_version_ch,
             "memoryClass": memory_class,
@@ -452,11 +499,13 @@ def create_mobile_fingerprint(
     target_os: str,
     mode: str = "generate",
     manufacturer: Optional[str] = None,
+    browser: Optional[str] = None,
 ) -> dict:
     """创建移动端环境指纹（与桌面端 create_fingerprint 接口一致）。
 
     - mode=preset:  真实机型预设（版本组合取机型当前主流值）
     - mode=generate: 基于真实机型库的合成（版本随机）
+    - browser: Android 恒为 chrome；iOS 可选 safari（默认）/ chrome_ios
     """
     if target_os not in ("android", "ios"):
         raise ValueError(f"不支持的移动端目标 OS: {target_os}")
@@ -479,7 +528,7 @@ def create_mobile_fingerprint(
         "device_model": None,
     }
 
-    raw_fp = generate_mobile_fingerprint(target_os, manufacturer, mode)
+    raw_fp = generate_mobile_fingerprint(target_os, manufacturer, mode, browser)
     data["fingerprint"] = raw_fp
 
     # 厂商 / 机型以实际机型库配对结果为准（未指定 manufacturer 时为按权重抽取结果）

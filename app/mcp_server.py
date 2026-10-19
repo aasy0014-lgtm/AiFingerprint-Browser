@@ -93,10 +93,14 @@ def build_tools(client: WorkbenchClient) -> list[Tool]:
              _obj({"profile_id": _s("环境 ID", minLength=1)}, ["profile_id"]),
              lambda a: client.call("GET", f"/api/v1/profiles/{a['profile_id']}")),
         Tool("create_profile", "创建环境。proxy_json 如 {\"scheme\":\"socks5\",\"host\":\"1.2.3.4\",\"port\":1080,\"username\":\"u\",\"password\":\"p\"}；"
-             "launch_json 如 {\"geoip\":true,\"preset\":\"china\",\"start_url\":\"https://...\"}",
+             "launch_json 如 {\"geoip\":true,\"preset\":\"china\",\"start_url\":\"https://...\"}。"
+             "移动端（target_os=android/ios）需 kernel=fp-chromium；"
+             "iOS 可用 browser=safari（默认）/chrome_ios 选择浏览器口径",
              _obj({"name": _s("环境名", minLength=1), "kernel": _s("camoufox（默认）/fp-chromium/chromium"),
                    "fingerprint_mode": _s("generate=合成（默认）/preset=真实设备预设"),
-                   "target_os": _s("windows/macos/linux"), "group": _s("分组名"),
+                   "target_os": _s("windows/macos/linux/android/ios"), "group": _s("分组名"),
+                   "manufacturer": _s("移动端机型品牌（可选，留空按在网权重随机）"),
+                   "browser": _s("移动端浏览器口径：iOS 可选 safari（默认）/chrome_ios"),
                    "proxy_json": _s("代理配置 JSON 字符串，空=直连"),
                    "launch_json": _s("启动选项 JSON 字符串")},
                   ["name"]),
@@ -107,6 +111,8 @@ def build_tools(client: WorkbenchClient) -> list[Tool]:
                      "name": a["name"], "kernel": a.get("kernel"),
                      "fingerprint_mode": a.get("fingerprint_mode"),
                      "target_os": a.get("target_os"),
+                     "manufacturer": a.get("manufacturer"),
+                     "browser": a.get("browser"),
                      "group_name": a.get("group"),
                      "proxy": json.loads(a["proxy_json"]) if a.get("proxy_json") else None,
                      "launch": json.loads(a["launch_json"]) if a.get("launch_json") else None,
