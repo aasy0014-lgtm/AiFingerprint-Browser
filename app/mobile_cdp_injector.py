@@ -1225,7 +1225,269 @@ _PATCH_TEMPLATE = r"""
                 defineFn(Document.prototype, 'createEvent', __createEvent);
             } catch (e) {}
 
-            // 12) WebKit 专属 CSS 面：-webkit-touch-callout（WebKit CSSProperties.json
+            // ---- WebKit 媒体面（P2-13）：AirPlay / EME 前缀面 ----
+            // 检测站按「声明 iOS 但无这些成员」判「现代 Blink」。真机形态取证
+            // （Playwright WebKit 27.2 实测）：
+            //   * WebKitPlaybackTargetAvailabilityEvent：**可构造**，length=1，
+            //     `new E('x')` 得 availability=''、`new E('x',{availability:'available'})`
+            //     得 'available'（未知值原样保留，不校验）；prototype.availability 为
+            //     getter（enumerable+configurable）；toString 为 `[object WebKit...]`；
+            //     无 new 抛 TypeError。
+            //   * WebKitMediaKeys：isTypeSupported 静态方法（length 1，恒 false——
+            //     内核无加密系统）；prototype.keySystem getter、createSession(length 2)；
+            //     `new` 抛 NotSupportedError（不是 Illegal constructor）。
+            //   * WebKitMediaKeySession / MessageEvent / NeededEvent：均为接口对象，
+            //     own = [length,name,prototype]；prototype 上为只读成员。
+            //   * WebKitMediaKeyError：静态常量 MEDIA_KEYERR_* = 1..6
+            //     （writable:false, enumerable:true, configurable:false）。
+            //   * HTMLMediaElement.prototype：webkitShowPlaybackTargetPicker(length 0)
+            //     与 webkitSetMediaKeys(length 1) 为数据属性（w/e/c 均 true）；
+            //     webkitCurrentPlaybackTargetIsWireless / webkitKeys 为 getter
+            //     （enumerable+configurable，get.length 0，默认 false / null）。
+            //   * HTMLVideoElement.prototype（不是 MediaElement）：webkitPresentationMode
+            //     为 getter，默认 'inline'。
+            // 全部走 __maskNative 保持原生外观；坏 receiver 走 __slotHas 抛 TypeError。
+            try {
+                if (typeof Event === 'function' && typeof document !== 'undefined') {
+                    // ---- AirPlay 事件构造器（可构造）----
+                    var __Avail = function (type, init) {
+                        // 真机无 new 调用抛 TypeError（WebKit 构造器统一语义）
+                        if (!(this instanceof __Avail)) {
+                            throw new TypeError("Constructor WebKitPlaybackTargetAvailabilityEvent requires 'new'");
+                        }
+                        var e = new Event(String(type));
+                        var avail = (init && init.availability !== undefined)
+                            ? String(init.availability) : '';
+                        Object.setPrototypeOf(e, __AvailP);
+                        Object.defineProperty(e, '___av', {
+                            value: avail, writable: true, enumerable: false, configurable: true,
+                        });
+                        try {
+                            Object.defineProperty(e, Symbol.toStringTag, {
+                                value: 'WebKitPlaybackTargetAvailabilityEvent',
+                                configurable: true,
+                            });
+                        } catch (x) {}
+                        return e;
+                    };
+                    try {
+                        Object.defineProperty(__Avail, 'length', { value: 1, configurable: true });
+                        Object.defineProperty(__Avail, 'name', {
+                            value: 'WebKitPlaybackTargetAvailabilityEvent', configurable: true,
+                        });
+                    } catch (x) {}
+                    var __AvailP = Object.create(Event.prototype);
+                    Object.defineProperty(__AvailP, 'constructor', {
+                        value: __Avail, writable: true, enumerable: false, configurable: true,
+                    });
+                    Object.defineProperty(__AvailP, 'availability', {
+                        get: __maskNative(function () {
+                            if (!(this instanceof Event)) { throw new TypeError('Illegal invocation'); }
+                            return this.___av === undefined ? '' : this.___av;
+                        }, 'get availability'),
+                        enumerable: true, configurable: true,
+                    });
+                    Object.defineProperty(__Avail, 'prototype', {
+                        value: __AvailP, writable: false, enumerable: false, configurable: false,
+                    });
+                    Object.defineProperty(window, 'WebKitPlaybackTargetAvailabilityEvent', {
+                        value: __maskNative(__Avail, 'WebKitPlaybackTargetAvailabilityEvent'),
+                        writable: true, enumerable: false, configurable: true,
+                    });
+
+                    // ---- EME 接口对象（不可构造）----
+                    var __ifaceCtor = function (name, len) {
+                        var C = function () { throw new TypeError('Illegal constructor'); };
+                        try {
+                            Object.defineProperty(C, 'name', { value: name, configurable: true });
+                            Object.defineProperty(C, 'length', { value: len, configurable: true });
+                        } catch (x) {}
+                        return C;
+                    };
+                    var __installIface = function (name, len) {
+                        if (name in window) { return null; }
+                        var C = __ifaceCtor(name, len);
+                        Object.defineProperty(window, name, {
+                            value: __maskNative(C, name),
+                            writable: true, enumerable: false, configurable: true,
+                        });
+                        return C;
+                    };
+                    __installIface('WebKitMediaKeySession', 0);
+                    __installIface('WebKitMediaKeyMessageEvent', 1);
+                    __installIface('WebKitMediaKeyNeededEvent', 1);
+
+                    // 原型成员：真机形态（Playwright WebKit 27.2 实测）
+                    //   Session.prototype = constructor,error,keySystem,sessionId,
+                    //     onwebkitkeyadded,onwebkitkeyerror,onwebkitkeymessage,update,close
+                    //   MessageEvent.prototype = constructor,message,destinationURL
+                    //   NeededEvent.prototype = constructor,initData
+                    var __ifaceProtoMembers = function (name, props) {
+                        var C = window[name];
+                        if (typeof C !== 'function' || !C.prototype) { return; }
+                        for (var i = 0; i < props.length; i++) {
+                            var spec = props[i];
+                            var pname = spec[0], kind = spec[1];
+                            if (pname in C.prototype) { continue; }
+                            try {
+                                if (kind === 'fn') {
+                                    Object.defineProperty(C.prototype, pname, {
+                                        value: __maskNative(function () {
+                                            if (!__slotHas(C.prototype, this)) { throw new TypeError('Illegal invocation'); }
+                                            return undefined;
+                                        }, pname),
+                                        writable: true, enumerable: true, configurable: true,
+                                    });
+                                } else {
+                                    // 事件钩子 / 只读属性：get/set 访问器（默认 null）
+                                    var slot = '__' + pname;
+                                    Object.defineProperty(C.prototype, pname, {
+                                        get: __maskNative(function () {
+                                            if (!__slotHas(C.prototype, this)) { throw new TypeError('Illegal invocation'); }
+                                            return this[slot] === undefined ? null : this[slot];
+                                        }, 'get ' + pname),
+                                        set: __maskNative(function (v) {
+                                            if (!__slotHas(C.prototype, this)) { throw new TypeError('Illegal invocation'); }
+                                            try { Object.defineProperty(this, slot, { value: v, writable: true, enumerable: false, configurable: true }); } catch (x) {}
+                                        }, 'set ' + pname),
+                                        enumerable: true, configurable: true,
+                                    });
+                                }
+                            } catch (x) {}
+                        }
+                    };
+                    __ifaceProtoMembers('WebKitMediaKeySession', [
+                        ['error', 'get'], ['keySystem', 'get'], ['sessionId', 'get'],
+                        ['onwebkitkeyadded', 'get'], ['onwebkitkeyerror', 'get'],
+                        ['onwebkitkeymessage', 'get'], ['update', 'fn'], ['close', 'fn'],
+                    ]);
+                    __ifaceProtoMembers('WebKitMediaKeyMessageEvent', [
+                        ['message', 'get'], ['destinationURL', 'get'],
+                    ]);
+                    __ifaceProtoMembers('WebKitMediaKeyNeededEvent', [
+                        ['initData', 'get'],
+                    ]);
+
+                    // WebKitMediaKeys：静态 isTypeSupported + 原型成员；new 抛 NotSupportedError
+                    if (!('WebKitMediaKeys' in window)) {
+                        var __MK = function () {
+                            throw new DOMException('', 'NotSupportedError');
+                        };
+                        try {
+                            Object.defineProperty(__MK, 'name', { value: 'WebKitMediaKeys', configurable: true });
+                            Object.defineProperty(__MK, 'length', { value: 1, configurable: true });
+                        } catch (x) {}
+                        __MK.isTypeSupported = __maskNative(function () { return false; }, 'isTypeSupported');
+                        try { Object.defineProperty(__MK.isTypeSupported, 'length', { value: 1, configurable: true }); } catch (x) {}
+                        Object.defineProperty(__MK.prototype, 'keySystem', {
+                            get: __maskNative(function () {
+                                if (!__slotHas(__MK.prototype, this)) { throw new TypeError('Illegal invocation'); }
+                                return this.___ks || '';
+                            }, 'get keySystem'),
+                            enumerable: true, configurable: true,
+                        });
+                        Object.defineProperty(__MK.prototype, 'createSession', {
+                            value: __maskNative(function () {
+                                if (!__slotHas(__MK.prototype, this)) { throw new TypeError('Illegal invocation'); }
+                                return null;
+                            }, 'createSession'),
+                            writable: true, enumerable: true, configurable: true,
+                        });
+                        try { Object.defineProperty(__MK.prototype.createSession, 'length', { value: 2, configurable: true }); } catch (x) {}
+                        Object.defineProperty(__MK.prototype, 'constructor', {
+                            value: __MK, writable: true, enumerable: false, configurable: true,
+                        });
+                        Object.defineProperty(window, 'WebKitMediaKeys', {
+                            value: __maskNative(__MK, 'WebKitMediaKeys'),
+                            writable: true, enumerable: false, configurable: true,
+                        });
+                    }
+
+                    // WebKitMediaKeyError：6 个常量 1..6（w:false, e:true, c:false）
+                    if (!('WebKitMediaKeyError' in window)) {
+                        var __EK = __ifaceCtor('WebKitMediaKeyError', 0);
+                        var __codes = ['MEDIA_KEYERR_UNKNOWN', 'MEDIA_KEYERR_CLIENT',
+                            'MEDIA_KEYERR_SERVICE', 'MEDIA_KEYERR_OUTPUT',
+                            'MEDIA_KEYERR_HARDWARECHANGE', 'MEDIA_KEYERR_DOMAIN'];
+                        for (var __ci = 0; __ci < __codes.length; __ci++) {
+                            (function (k, val) {
+                                var d = { value: val, writable: false, enumerable: true, configurable: false };
+                                try { Object.defineProperty(__EK, k, d); } catch (x) {}
+                                try { Object.defineProperty(__EK.prototype, k, d); } catch (x) {}
+                            })(__codes[__ci], __ci + 1);
+                        }
+                        Object.defineProperty(window, 'WebKitMediaKeyError', {
+                            value: __maskNative(__EK, 'WebKitMediaKeyError'),
+                            writable: true, enumerable: false, configurable: true,
+                        });
+                    }
+                }
+
+                // ---- HTMLMediaElement / HTMLVideoElement 原型面 ----
+                if (typeof HTMLMediaElement === 'function' && typeof HTMLVideoElement === 'function') {
+                    var mp = HTMLMediaElement.prototype;
+                    var vp = HTMLVideoElement.prototype;
+
+                    if (!('webkitShowPlaybackTargetPicker' in mp)) {
+                        Object.defineProperty(mp, 'webkitShowPlaybackTargetPicker', {
+                            value: __maskNative(function () {
+                                if (!__slotHas(mp, this)) { throw new TypeError('Illegal invocation'); }
+                                return undefined;
+                            }, 'webkitShowPlaybackTargetPicker'),
+                            writable: true, enumerable: true, configurable: true,
+                        });
+                        try {
+                            Object.defineProperty(mp.webkitShowPlaybackTargetPicker, 'length', {
+                                value: 0, configurable: true,
+                            });
+                        } catch (x) {}
+                    }
+                    if (!('webkitSetMediaKeys' in mp)) {
+                        Object.defineProperty(mp, 'webkitSetMediaKeys', {
+                            value: __maskNative(function () {
+                                if (!__slotHas(mp, this)) { throw new TypeError('Illegal invocation'); }
+                                return null;
+                            }, 'webkitSetMediaKeys'),
+                            writable: true, enumerable: true, configurable: true,
+                        });
+                        try {
+                            Object.defineProperty(mp.webkitSetMediaKeys, 'length', {
+                                value: 1, configurable: true,
+                            });
+                        } catch (x) {}
+                    }
+                    if (!('webkitCurrentPlaybackTargetIsWireless' in mp)) {
+                        Object.defineProperty(mp, 'webkitCurrentPlaybackTargetIsWireless', {
+                            get: __maskNative(function () {
+                                if (!__slotHas(mp, this)) { throw new TypeError('Illegal invocation'); }
+                                return false;
+                            }, 'get webkitCurrentPlaybackTargetIsWireless'),
+                            enumerable: true, configurable: true,
+                        });
+                    }
+                    if (!('webkitKeys' in mp)) {
+                        Object.defineProperty(mp, 'webkitKeys', {
+                            get: __maskNative(function () {
+                                if (!__slotHas(mp, this)) { throw new TypeError('Illegal invocation'); }
+                                return null;
+                            }, 'get webkitKeys'),
+                            enumerable: true, configurable: true,
+                        });
+                    }
+                    if (!('webkitPresentationMode' in vp)) {
+                        Object.defineProperty(vp, 'webkitPresentationMode', {
+                            get: __maskNative(function () {
+                                if (!__slotHas(vp, this)) { throw new TypeError('Illegal invocation'); }
+                                return 'inline';
+                            }, 'get webkitPresentationMode'),
+                            enumerable: true, configurable: true,
+                        });
+                    }
+                }
+            } catch (e) {}
+
+
+            // 13) WebKit 专属 CSS 面：-webkit-touch-callout（WebKit CSSProperties.json
             //     非标准属性，值 default|none；MDN BCD 仅 safari_ios=2，chrome /
             //     chrome_android=false）与 -webkit-overflow-scrolling（同源非标准，
             //     值 auto|touch；Chromium 从未实现）。iOS 检测脚本的经典组合正是

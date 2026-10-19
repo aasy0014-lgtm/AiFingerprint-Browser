@@ -719,6 +719,92 @@ STATE_JS = """async () => {
                         catch (x) { return 'ERR'; } })(),
                 };
             })(),
+            // ---- WebKit 媒体面（P2-13）：AirPlay / EME 前缀面 ----
+            // 桌面内核全缺席（实测），真机 Safari/CriOS 全存在。检测站按
+            // 「声明 iOS 但无这些成员」判「现代 Blink」。取证见
+            // app/mobile_cdp_injector.py 的「WebKit 媒体面」注释块。
+            media: (() => {
+                const P = HTMLMediaElement.prototype;
+                const V = HTMLVideoElement.prototype;
+                const v = document.createElement('video');
+                const ctor = window.WebKitPlaybackTargetAvailabilityEvent;
+                const mk = window.WebKitMediaKeys;
+                const sessionC = window.WebKitMediaKeySession;
+                const errC = window.WebKitMediaKeyError;
+                const desc = (o, n) => {
+                    const x = descOf(o, n);
+                    return x ? [x.get ? 'accessor' : 'data', x.writable,
+                                x.enumerable, x.configurable] : null;
+                };
+                return {
+                    picker: [typeof P.webkitShowPlaybackTargetPicker,
+                             'webkitShowPlaybackTargetPicker' in P,
+                             desc(P, 'webkitShowPlaybackTargetPicker')],
+                    pickerLen: P.webkitShowPlaybackTargetPicker
+                        ? P.webkitShowPlaybackTargetPicker.length : null,
+                    setKeys: [typeof P.webkitSetMediaKeys,
+                              'webkitSetMediaKeys' in P,
+                              desc(P, 'webkitSetMediaKeys')],
+                    setKeysLen: P.webkitSetMediaKeys ? P.webkitSetMediaKeys.length : null,
+                    wireless: [typeof v.webkitCurrentPlaybackTargetIsWireless,
+                               desc(P, 'webkitCurrentPlaybackTargetIsWireless')],
+                    wirelessVal: v.webkitCurrentPlaybackTargetIsWireless,
+                    keys: [typeof v.webkitKeys, desc(P, 'webkitKeys')],
+                    keysVal: v.webkitKeys,
+                    presMode: desc(V, 'webkitPresentationMode'),
+                    presVal: v.webkitPresentationMode,
+                    // 真机：webkitPresentationMode 只在 HTMLVideoElement，不在
+                    // HTMLMediaElement（容易挂错层级）
+                    presOnMedia: desc(P, 'webkitPresentationMode'),
+                    badRecv: (() => { try { P.webkitKeys; return 'ok'; }
+                        catch (x) { return 'throw:' + x.name; } })(),
+                    availCtor: ctor ? {
+                        len: ctor.length, name: ctor.name,
+                        own: Object.getOwnPropertyNames(ctor),
+                        protoOwn: Object.getOwnPropertyNames(ctor.prototype),
+                        availDesc: desc(ctor.prototype, 'availability'),
+                        noArg: (() => { try { return new ctor('x').availability; }
+                            catch (x) { return 'throw:' + x.name; } })(),
+                        withArg: (() => { try {
+                            return new ctor('x', {availability: 'available'}).availability;
+                        } catch (x) { return 'throw:' + x.name; } })(),
+                        tag: (() => { try {
+                            return Object.prototype.toString.call(new ctor('x'));
+                        } catch (x) { return 'throw:' + x.name; } })(),
+                        instOf: (() => { try {
+                            const e = new ctor('x');
+                            return [e instanceof ctor, e instanceof Event];
+                        } catch (x) { return 'throw:' + x.name; } })(),
+                        noNew: (() => { try { ctor('x'); return 'ok'; }
+                            catch (x) { return 'throw:' + x.name; } })(),
+                        native: nativeStr(ctor),
+                    } : null,
+                    mk: mk ? {
+                        len: mk.length, name: mk.name,
+                        own: Object.getOwnPropertyNames(mk),
+                        protoOwn: Object.getOwnPropertyNames(mk.prototype),
+                        isTypeSupported: typeof mk.isTypeSupported,
+                        supported: (() => { try { return mk.isTypeSupported('x', 'y'); }
+                            catch (x) { return 'throw:' + x.name; } })(),
+                        noNew: (() => { try { new mk('x'); return 'ok'; }
+                            catch (x) { return 'throw:' + x.name; } })(),
+                    } : null,
+                    sessionProto: sessionC
+                        ? Object.getOwnPropertyNames(sessionC.prototype) : null,
+                    msgProto: window.WebKitMediaKeyMessageEvent
+                        ? Object.getOwnPropertyNames(WebKitMediaKeyMessageEvent.prototype) : null,
+                    neededProto: window.WebKitMediaKeyNeededEvent
+                        ? Object.getOwnPropertyNames(WebKitMediaKeyNeededEvent.prototype) : null,
+                    errCodes: errC ? ['MEDIA_KEYERR_UNKNOWN', 'MEDIA_KEYERR_CLIENT',
+                        'MEDIA_KEYERR_SERVICE', 'MEDIA_KEYERR_OUTPUT',
+                        'MEDIA_KEYERR_HARDWARECHANGE', 'MEDIA_KEYERR_DOMAIN']
+                        .map((k) => [k, errC[k]]) : null,
+                    errDesc: errC ? desc(errC, 'MEDIA_KEYERR_UNKNOWN') : null,
+                    errProtoCodes: errC
+                        ? Object.getOwnPropertyNames(errC.prototype).filter((n) =>
+                            n.indexOf('MEDIA_KEYERR_') === 0) : null,
+                };
+            })(),
         },
         ownProps: Object.getOwnPropertyNames(nav).filter((n) =>
             ['platform','userAgent','maxTouchPoints','mobile','deviceMemory',
@@ -924,6 +1010,8 @@ try {
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
     + ' , intlV8: (function () { try { return "v8BreakIterator" in Intl; } catch (e) { return "ERR"; } })()'
     + ' , intlOwn: (function () { try { return Object.getOwnPropertyNames(Intl).indexOf("v8BreakIterator") !== -1; } catch (e) { return "ERR"; } })()'
+    + ' , mediaW: (function () { var ns = ["WebKitPlaybackTargetAvailabilityEvent","WebKitMediaKeys","WebKitMediaKeySession","WebKitMediaKeyMessageEvent","WebKitMediaKeyNeededEvent","WebKitMediaKeyError","HTMLMediaElement","HTMLVideoElement"];'
+    + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
     + '}); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.workerData = {};
@@ -985,6 +1073,8 @@ try {
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
     + ' , intlV8: (function () { try { return "v8BreakIterator" in Intl; } catch (e) { return "ERR"; } })()'
     + ' , intlOwn: (function () { try { return Object.getOwnPropertyNames(Intl).indexOf("v8BreakIterator") !== -1; } catch (e) { return "ERR"; } })()'
+    + ' , mediaW: (function () { var ns = ["WebKitPlaybackTargetAvailabilityEvent","WebKitMediaKeys","WebKitMediaKeySession","WebKitMediaKeyMessageEvent","WebKitMediaKeyNeededEvent","WebKitMediaKeyError","HTMLMediaElement","HTMLVideoElement"];'
+    + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
     + '}); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.__workerData = {};
@@ -1858,6 +1948,7 @@ async def main() -> int:
     ns = eng.get("ns") or {}
     plat = eng.get("plat") or {}
     jsc = eng.get("jsc") or {}
+    med = eng.get("media") or {}
     aig_mag = _sensor_magnitude(last_motion.get("aig"))
     lin_mag = _sensor_magnitude(last_motion.get("acc"))
     gyro_mag = _sensor_magnitude(last_motion.get("rr"))
@@ -2118,6 +2209,19 @@ async def main() -> int:
             "平台API：跨域 iframe Worker 同口径": (
                 (fr_worker.get("platW") or {}).get("FileSystemObserver") == "undefined"
                 and (fr_worker.get("platW") or {}).get("IdleDetector") == "function"),
+            # WebKit 媒体面（AirPlay/EME 前缀面）是 Safari 专有，Android Chrome
+            # 全无——不得因为 iOS 目标的补丁而误挂到 Android 上。
+            "媒体面：WebKit 媒体面在 Android 上全缺席（未误伤）": (
+                (med.get("picker") or [None, None, None])[0] == "undefined"
+                and (med.get("picker") or [None, None, None])[2] is None
+                and (med.get("setKeys") or [None, None, None])[0] == "undefined"
+                and (med.get("wireless") or [None, None])[0] == "undefined"
+                and (med.get("keys") or [None, None])[0] == "undefined"
+                and med.get("presMode") is None
+                and med.get("availCtor") is None and med.get("mk") is None
+                and med.get("sessionProto") is None and med.get("errCodes") is None
+                and all(v == "undefined"
+                        for v in (wk_main.get("mediaW") or {}).values())),
         })
     else:
         is_ios_chrome = extra.get("browser") == "chrome_ios"
@@ -2327,6 +2431,81 @@ async def main() -> int:
                 wk_main.get("intlV8") is False
                 and wk_main.get("intlOwn") is False
                 and fr_worker.get("intlV8") is False),
+            # ---- WebKit 媒体面（AirPlay / EME 前缀面）----
+            # 桌面内核六项全缺席；真机 Safari/CriOS 全存在（Playwright WebKit
+            # 27.2 实测）。取证见 app/mobile_cdp_injector.py 同名注释块。
+            "媒体面：HTMLMediaElement 四项 WebKit 成员（函数为 data、属性为 accessor）": (
+                (med.get("picker") or [None, None, None])[0] == "function"
+                and (med.get("picker") or [None, None, None])[2]
+                == ["data", True, True, True]
+                and med.get("pickerLen") == 0
+                and (med.get("setKeys") or [None, None, None])[0] == "function"
+                and (med.get("setKeys") or [None, None, None])[2]
+                == ["data", True, True, True]
+                and med.get("setKeysLen") == 1
+                and (med.get("wireless") or [None, None])[1]
+                == ["accessor", None, True, True]
+                and med.get("wirelessVal") is False
+                and (med.get("keys") or [None, None])[1]
+                == ["accessor", None, True, True]
+                and med.get("keysVal") is None),
+            "媒体面：webkitPresentationMode 只挂 HTMLVideoElement（默认 'inline'）": (
+                med.get("presMode") == ["accessor", None, True, True]
+                and med.get("presVal") == "inline"
+                # 挂错层级（挂到 HTMLMediaElement）是常见实现错误
+                and med.get("presOnMedia") is None),
+            "媒体面：webkitKeys 取用者为非媒体元素时抛 TypeError": (
+                med.get("badRecv") == "throw:TypeError"),
+            "媒体面：WebKitPlaybackTargetAvailabilityEvent 可构造且语义正确": (
+                (med.get("availCtor") or {}).get("len") == 1
+                and (med.get("availCtor") or {}).get("name")
+                == "WebKitPlaybackTargetAvailabilityEvent"
+                and (med.get("availCtor") or {}).get("own")
+                == ["length", "name", "prototype"]
+                and (med.get("availCtor") or {}).get("protoOwn")
+                == ["constructor", "availability"]
+                and (med.get("availCtor") or {}).get("availDesc")
+                == ["accessor", None, True, True]
+                and (med.get("availCtor") or {}).get("noArg") == ""
+                and (med.get("availCtor") or {}).get("withArg") == "available"
+                and (med.get("availCtor") or {}).get("tag")
+                == "[object WebKitPlaybackTargetAvailabilityEvent]"
+                and (med.get("availCtor") or {}).get("instOf") == [True, True]
+                and (med.get("availCtor") or {}).get("noNew") == "throw:TypeError"
+                and (med.get("availCtor") or {}).get("native") is True),
+            "媒体面：WebKitMediaKeys 静态面/原型面/构造语义": (
+                (med.get("mk") or {}).get("len") == 1
+                and (med.get("mk") or {}).get("name") == "WebKitMediaKeys"
+                and (med.get("mk") or {}).get("own")
+                == ["length", "name", "prototype", "isTypeSupported"]
+                and (med.get("mk") or {}).get("protoOwn")
+                == ["constructor", "keySystem", "createSession"]
+                and (med.get("mk") or {}).get("isTypeSupported") == "function"
+                and (med.get("mk") or {}).get("supported") is False
+                # 真机 new WebKitMediaKeys() 抛 NotSupportedError（无 CDM 实现）
+                and (med.get("mk") or {}).get("noNew") == "throw:NotSupportedError"),
+            "媒体面：WebKitMediaKeySession/MessageEvent/NeededEvent 原型成员齐全": (
+                med.get("sessionProto") == ["constructor", "error", "keySystem",
+                                            "sessionId", "onwebkitkeyadded",
+                                            "onwebkitkeyerror", "onwebkitkeymessage",
+                                            "update", "close"]
+                and med.get("msgProto") == ["constructor", "message", "destinationURL"]
+                and med.get("neededProto") == ["constructor", "initData"]),
+            "媒体面：WebKitMediaKeyError 六个常量（静态 + 原型，值 1..6，不可写不可配置）": (
+                med.get("errCodes") == [
+                    ["MEDIA_KEYERR_UNKNOWN", 1], ["MEDIA_KEYERR_CLIENT", 2],
+                    ["MEDIA_KEYERR_SERVICE", 3], ["MEDIA_KEYERR_OUTPUT", 4],
+                    ["MEDIA_KEYERR_HARDWARECHANGE", 5], ["MEDIA_KEYERR_DOMAIN", 6]]
+                and med.get("errDesc") == ["data", False, True, False]
+                and sorted(med.get("errProtoCodes") or [])
+                == sorted(k for k, _ in (med.get("errCodes") or []))),
+            # 真机 WebKit Worker 里媒体面全部缺席（实测），内核不得漏出，
+            # 否则「页面有、Worker 无」的跨上下文矛盾会变成反方向的破绽。
+            "媒体面：Worker 内媒体面全缺席（与 WebKit Worker 同口径）": (
+                all(v == "undefined" for v in (wk_main.get("mediaW") or {}).values())
+                and all(v == "undefined"
+                        for v in (fr_worker.get("mediaW") or {}).values())
+                and bool(wk_main.get("mediaW")) and bool(fr_worker.get("mediaW"))),
             # ---- 色域：Display P3（iPhone 7 及以后全系硬件判据）----
             "色域：(color-gamut: p3) 为真且 srgb 亦为真（iPhone 屏口径）": (
                 (state.get("mediaQueries") or {}).get("p3") is True
