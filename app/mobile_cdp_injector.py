@@ -1339,23 +1339,71 @@ _PATCH_TEMPLATE = r"""
                 // CriOS：页面世界有注册过的消息处理器 → window.webkit 实例出现
                 // （Safari 页面世界无处理器 → 保持 undefined，见 P1-2 裁定）。
                 if (D.iosChrome && typeof window.webkit === 'undefined') {
+                    // UserMessageHandlersNamespace 是「只具名 getter」接口：
+                    // supportedPropertyNames() 恒为空（UserMessageHandlersNamespace.cpp
+                    // 的 FIXME 未实现枚举），具名属性的可见性改由 namedItem 返回
+                    // 非 null 判定（JSDOMAbstractOperations.h accessVisibleNamedProperty
+                    // 步骤 1）。真机因此「可读不可枚举」：Object.keys 与
+                    // getOwnPropertyNames 都是 []，而 'crwebinvoke' in handlers 为
+                    // true、handlers.crwebinvoke 可取值、未知名 undefined；
+                    // [[GetOwnProperty]] 侧仍返回 Writable|Enumerable|Configurable
+                    // 描述符（CodeGeneratorJS.pm GenerateNamedGetter + slot.setValue）。
                     var __wkHandlersOf = function (names) {
-                        var ns = Object.create(UserMessageHandlersNamespace.prototype);
+                        var map = {};
                         for (var __hi = 0; __hi < names.length; __hi++) {
-                            try {
-                                Object.defineProperty(ns, names[__hi], {
-                                    value: Object.create(UserMessageHandler.prototype),
-                                    writable: false, enumerable: true, configurable: true,
-                                });
-                            } catch (e) {}
+                            map[names[__hi]] = Object.create(UserMessageHandler.prototype);
                         }
-                        return ns;
+                        var __hasOwn = function (k) {
+                            return Object.prototype.hasOwnProperty.call(map, k);
+                        };
+                        var target = Object.create(UserMessageHandlersNamespace.prototype);
+                        if (typeof Proxy === 'undefined') { return target; }
+                        return new Proxy(target, {
+                            get: function (t, k, r) {
+                                if (typeof k === 'string' && __hasOwn(k)) { return map[k]; }
+                                return Reflect.get(t, k, r);
+                            },
+                            has: function (t, k) {
+                                if (typeof k === 'string' && __hasOwn(k)) { return true; }
+                                return Reflect.has(t, k);
+                            },
+                            ownKeys: function (t) { return Reflect.ownKeys(t); },
+                            getOwnPropertyDescriptor: function (t, k) {
+                                if (typeof k === 'string' && __hasOwn(k)) {
+                                    return { value: map[k], writable: true,
+                                             enumerable: true, configurable: true };
+                                }
+                                return Reflect.getOwnPropertyDescriptor(t, k);
+                            },
+                        });
                     };
+                    // WebKitBufferNamespace 同为只具名 getter 接口，且
+                    // LegacyNoInterfaceObject——全局没有 WebKitBufferNamespace，
+                    // 构造器只挂在原型上。页面世界没注册 buffer，所有名字不可见：
+                    // ownKeys [] / in false / 取值 undefined（空对象 + 正确原型即等价）。
+                    var __wkBufCtor = __maskNative(function () {
+                        throw new TypeError('Illegal constructor');
+                    }, 'WebKitBufferNamespace');
+                    var __wkBufProto = {};
+                    Object.defineProperty(__wkBufCtor, 'prototype', {
+                        value: __wkBufProto, writable: false,
+                        enumerable: false, configurable: false,
+                    });
+                    Object.defineProperty(__wkBufProto, 'constructor', {
+                        value: __wkBufCtor, writable: true,
+                        enumerable: false, configurable: true,
+                    });
+                    try {
+                        Object.defineProperty(__wkBufProto, Symbol.toStringTag, {
+                            value: 'WebKitBufferNamespace',
+                            writable: false, enumerable: false, configurable: true,
+                        });
+                    } catch (e) {}
                     var __wkNsObj = Object.create(WebKitNamespace.prototype);
                     __wkNsSlots.set(__wkNsObj, {
                         handlers: __wkHandlersOf(['crwebinvoke', 'POSTSuccessHandler',
                                                   'POSTErrorHandler']),
-                        buffers: {},
+                        buffers: Object.create(__wkBufProto),
                     });
                     Object.defineProperty(window, 'webkit', {
                         value: __wkNsObj, writable: false,

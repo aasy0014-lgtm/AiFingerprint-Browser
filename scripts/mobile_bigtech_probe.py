@@ -329,6 +329,26 @@ ENGINE_JS = r"""() => {
       windowWebkit: typeof window.webkit,
       wkHandlers: (window.webkit && window.webkit.messageHandlers)
         ? Object.keys(window.webkit.messageHandlers) : null,
+      wkHandlersOwn: (window.webkit && window.webkit.messageHandlers)
+        ? Object.getOwnPropertyNames(window.webkit.messageHandlers) : null,
+      wkHandlerIn: (window.webkit && window.webkit.messageHandlers)
+        ? ('crwebinvoke' in window.webkit.messageHandlers) : null,
+      wkHandlerUnknown: (window.webkit && window.webkit.messageHandlers)
+        ? typeof window.webkit.messageHandlers.__no_such_handler__ : null,
+      wkHandlerDesc: (() => {
+        const mh = window.webkit && window.webkit.messageHandlers;
+        if (!mh) return null;
+        const d = Object.getOwnPropertyDescriptor(mh, 'crwebinvoke');
+        return d ? [d.writable, d.enumerable, d.configurable] : null;
+      })(),
+      buffersTag: (window.webkit && window.webkit.buffers)
+        ? Object.prototype.toString.call(window.webkit.buffers) : null,
+      buffersCtor: (() => {
+        const b = window.webkit && window.webkit.buffers;
+        if (!b) return null;
+        const p = Object.getPrototypeOf(b);
+        return (p && p.constructor) ? p.constructor.name : null;
+      })(),
       crwebInvoke: !!(window.webkit && window.webkit.messageHandlers
         && window.webkit.messageHandlers.crwebinvoke),
       crwebPmRet: (() => {

@@ -90,6 +90,31 @@ STATE_JS = """async () => {
         hasWK: !!(window.webkit && window.webkit.messageHandlers),
         wkHandlers: window.webkit && window.webkit.messageHandlers
             ? Object.keys(window.webkit.messageHandlers) : [],
+        // 只具名 getter 语义：通道名可读不可枚举（supportedPropertyNames 为空）
+        wkHandlerOwn: window.webkit && window.webkit.messageHandlers
+            ? Object.getOwnPropertyNames(window.webkit.messageHandlers) : [],
+        wkHandlerIn: !!(window.webkit && window.webkit.messageHandlers
+            && ('crwebinvoke' in window.webkit.messageHandlers)),
+        wkHandlerUnknown: (function () {
+            var mh = window.webkit && window.webkit.messageHandlers;
+            if (!mh) { return null; }
+            try { return typeof mh.__no_such_handler__; } catch (e) { return 'throw:' + e.name; }
+        })(),
+        wkHandlerDesc: (function () {
+            var mh = window.webkit && window.webkit.messageHandlers;
+            if (!mh) { return null; }
+            var d = Object.getOwnPropertyDescriptor(mh, 'crwebinvoke');
+            return d ? [d.writable, d.enumerable, d.configurable] : null;
+        })(),
+        wkBuffersTag: (window.webkit && window.webkit.buffers)
+            ? Object.prototype.toString.call(window.webkit.buffers) : null,
+        wkBuffersCtorName: (function () {
+            var b = window.webkit && window.webkit.buffers;
+            if (!b) { return null; }
+            var p = Object.getPrototypeOf(b);
+            return (p && p.constructor) ? p.constructor.name : null;
+        })(),
+        wkBuffersGlobal: typeof window.WebKitBufferNamespace,
         historyPatched: /invokeOnHost/.test(String(window.history.pushState)),
         printPatched: /invokeOnHost/.test(String(window.print)),
         scrollPatched: /setWebViewScrollViewIsDragging/.test(String(window.scrollTo)),
@@ -1757,9 +1782,12 @@ async def main() -> int:
                      "findPasswordForms", "dispatchPopstateEvent", "replaceWebViewURL"}
                     <= set(state["gCrWebKeys"] or [])),
                 "CriOS：window.webkit.messageHandlers 存在": state["hasWK"] is True,
-                "CriOS：messageHandlers 含已确认通道": (
-                    {"crwebinvoke", "POSTSuccessHandler", "POSTErrorHandler"}
-                    <= set(state["wkHandlers"] or [])),
+                "CriOS：messageHandlers 通道可读但不可枚举（只具名 getter 语义）": (
+                    state["wkHandlerIn"] is True
+                    and state["wkHandlers"] == []
+                    and state["wkHandlerOwn"] == []
+                    and state["wkHandlerUnknown"] == "undefined"
+                    and state["wkHandlerDesc"] == [True, True, True]),
                 # ---- window.webkit 按 WebKit 机制装配（item 13）----
                 "CriOS：window.webkit 为 WebKitNamespace 实例（ReadOnly+DontDelete / 无自有属性）": (
                     ns.get("wkType") == "object"
@@ -1768,14 +1796,18 @@ async def main() -> int:
                     and ns.get("wkOwn") == []),
                 "CriOS：messageHandlers 为 UserMessageHandlersNamespace 实例": (
                     ns.get("mhProtoOk") is True
-                    and "crwebinvoke" in (ns.get("mhKeys") or [])),
+                    and ns.get("mhKeys") == []),
                 "CriOS：crwebinvoke.postMessage 原生外观且返回 pending Promise": (
                     (ns.get("crweb") or {}).get("protoOk") is True
                     and (ns.get("crweb") or {}).get("pmLen") == 1
                     and (ns.get("crweb") or {}).get("pmNative") is True
                     and (ns.get("crweb") or {}).get("pmRet") == "promise"),
-                "CriOS：window.webkit.buffers 空命名空间": (
-                    ns.get("buffersType") == "object" and ns.get("buffersKeys") == []),
+                "CriOS：buffers 为空 WebKitBufferNamespace（LegacyNoInterfaceObject）": (
+                    ns.get("buffersType") == "object"
+                    and ns.get("buffersKeys") == []
+                    and state["wkBuffersTag"] == "[object WebKitBufferNamespace]"
+                    and state["wkBuffersCtorName"] == "WebKitBufferNamespace"
+                    and state["wkBuffersGlobal"] == "undefined"),
                 "CriOS：history.pushState toString 含 invokeOnHost": state["historyPatched"] is True,
                 "CriOS：print toString 含 invokeOnHost": state["printPatched"] is True,
                 "CriOS：scrollTo toString 含 setWebViewScrollViewIsDragging": (
