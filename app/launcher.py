@@ -17,7 +17,7 @@ from . import db, security
 from .models import LaunchConfig, ProxyConfig
 from .proxy_dns import is_ip_address, resolve_real_ip
 from .proxy_forwarder import AuthProxyForwarder, needs_forwarder
-from .proxy_test import resolve_exit_timezone
+from .proxy_test import locale_for_country, resolve_exit_geo
 from .risk_presets import apply_preset
 from .mobile_cdp_injector import MobileEmulationSession
 
@@ -128,17 +128,34 @@ class LaunchManager:
                     log.info("代理域名 %s 经 DoH 解析为真实 IP %s", proxy.host, real_ip)
                     proxy = proxy.model_copy(update={"host": real_ip})
 
-            # geoip：出口时区对齐（fp-chromium 无原生 geoip）。
-            # 显式 timezone 优先；探测结果同时用于内核 --timezone 参数与
-            # 移动端 CDP 的 Emulation.setTimezoneOverride。
-            if (launch.geoip and not launch.timezone and proxy is not None
+            # geoip：出口时区 + 语言对齐（fp-chromium 无原生 geoip）。
+            # 显式 timezone/locale 优先；探测结果用于内核 --timezone/--lang 参数
+            # 与移动端 CDP 的 Emulation.setTimezoneOverride /
+            # setUserAgentOverride.acceptLanguage。只对齐时区会让「属地欧美、
+            # 语言中文」成为跨域特征（检测站点据此判为代理环境）。
+            #
+            # 语言对齐仅限移动端：Intl 默认 locale 由内核从宿主系统取得，--lang
+            # 与 LANG/LC_ALL 都改不动它，只有 CDP Emulation.setLocaleOverride 能改
+            # （实测 Chromium 148）。桌面 fp-chromium 没有常驻 CDP 会话，只改
+            # navigator.language 会让它与 Intl 互相矛盾——那比「两者都是中文、
+            # 只有时区对不上」更容易被判定为改环境，故桌面保持原状。
+            if (launch.geoip and (not launch.timezone or not launch.locale)
+                    and proxy is not None
                     and profile["kernel"] == fp_chromium_kernel.KERNEL_NAME):
-                tz = await resolve_exit_timezone(proxy)
-                if tz:
-                    launch = launch.model_copy(update={"timezone": tz})
-                    log.info("geoip：出口时区对齐为 %s", tz)
+                mobile_target = profile.get("target_os") in ("android", "ios")
+                geo = await resolve_exit_geo(proxy)
+                updates = {}
+                if not launch.timezone and geo.get("timezone"):
+                    updates["timezone"] = geo["timezone"]
+                if mobile_target and not launch.locale:
+                    locale = locale_for_country(geo.get("country_code"))
+                    if locale:
+                        updates["locale"] = locale
+                if updates:
+                    launch = launch.model_copy(update=updates)
+                    log.info("geoip：出口属地对齐 %s", updates)
                 else:
-                    log.info("geoip：出口时区探测失败，保持系统时区")
+                    log.info("geoip：出口属地探测失败，保持系统时区与语言")
 
             # Chromium 系内核不支持带账密代理命令行：本地起认证转发器桥接
             kernel_proxy = proxy

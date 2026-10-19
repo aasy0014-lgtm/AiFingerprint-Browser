@@ -75,6 +75,57 @@ STATE_JS = """async () => {
         language: nav.language,
         languages: nav.languages,
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        intlLocale: Intl.DateTimeFormat().resolvedOptions().locale,
+        // ---- 伪造接收者防护 ----
+        // 原生 DOM getter 由 C++ 实现，会校验接收者内部槽：在 Object.create(实例)
+        // 上调用必须抛 TypeError: Illegal invocation。JS 模拟 getter 若忽略 this
+        // 直接返回闭包值就被一眼看穿（检测报告「人工 JS 模拟对象」）。
+        brandGuard: (function () {
+            var bad = Object.create(navigator);
+            var res = {};
+            var names = ['userAgent', 'appVersion', 'platform', 'vendor',
+                         'maxTouchPoints', 'deviceMemory', 'plugins', 'mimeTypes',
+                         'pdfViewerEnabled'];
+            for (var i = 0; i < names.length; i++) {
+                var d = descOf(Navigator.prototype, names[i]);
+                if (!d || typeof d.get !== 'function') { continue; }
+                try { res[names[i]] = 'LEAK:' + String(d.get.call(bad)).slice(0, 20); }
+                catch (e) { res[names[i]] = e.name + ':' + e.message; }
+            }
+            ['width', 'height', 'colorDepth'].forEach(function (p) {
+                var d = descOf(Screen.prototype, p);
+                if (!d || typeof d.get !== 'function') { return; }
+                try { res['screen.' + p] = 'LEAK:' + String(d.get.call(Object.create(screen))).slice(0, 20); }
+                catch (e) { res['screen.' + p] = e.name + ':' + e.message; }
+            });
+            ['devicePixelRatio', 'outerWidth', 'outerHeight'].forEach(function (p) {
+                var d = Object.getOwnPropertyDescriptor(window, p);
+                if (!d || typeof d.get !== 'function') { return; }
+                try { res['window.' + p] = 'LEAK:' + String(d.get.call(Object.create(window))).slice(0, 20); }
+                catch (e) { res['window.' + p] = e.name + ':' + e.message; }
+            });
+            // 方法同样校验接收者：原生 m.call({}) 亦抛 Illegal invocation。
+            // 例外见 brandLenient（Blink 有少数方法不校验接收者，加校验反而出错）。
+            [['Navigator.prototype', typeof Navigator !== 'undefined' ? Navigator.prototype : null, 'getBattery'],
+             ['Document.prototype', typeof Document !== 'undefined' ? Document.prototype : null, 'createEvent'],
+             ['SpeechSynthesis.prototype',
+              typeof SpeechSynthesis !== 'undefined' ? SpeechSynthesis.prototype : null, 'getVoices']
+            ].forEach(function (t) {
+                var fn = t[1] && t[1][t[2]];
+                if (typeof fn !== 'function') { return; }
+                try { res['fn.' + t[2]] = 'LEAK'; fn.call(Object.create({}), 'x'); }
+                catch (e) { res['fn.' + t[2]] = e.name + ':' + e.message; }
+            });
+            return res;
+        })(),
+        // 原生不校验接收者的方法：必须保持同样的「宽松」行为
+        brandLenient: (function () {
+            var P = typeof MediaDevices !== 'undefined' ? MediaDevices.prototype : null;
+            var fn = P && P.enumerateDevices;
+            if (typeof fn !== 'function') { return { enumerateDevices: 'absent' }; }
+            try { fn.call(Object.create({})); return { enumerateDevices: 'lenient' }; }
+            catch (e) { return { enumerateDevices: e.name + ':' + e.message }; }
+        })(),
         uaData: 'ABSENT',
         uaDataHigh: null,
         battery: null,
@@ -1374,6 +1425,21 @@ async def main() -> int:
         ),
         "languages 以 zh-CN 开头": bool(state["languages"]) and state["languages"][0] == "zh-CN",
         "时区覆盖生效（launch.timezone）": state.get("timezone") == "America/Los_Angeles",
+        # 内核 --lang/acceptLanguage 只改 navigator.language，改不动 ICU 默认
+        # locale；Intl 必须由 Emulation.setLocaleOverride 对齐，否则宿主中文机器
+        # 上恒为 zh-CN，与欧美出口时区并存即「属地与语言不符」的跨域特征。
+        "Intl locale 覆盖生效（launch.locale）": state.get("intlLocale") == "zh-CN",
+        # ---- 伪造接收者防护：Object.create(实例) 上调用补丁 getter 必须抛 ----
+        "伪造接收者：Navigator getter 抛 Illegal invocation": (
+            bool(state.get("brandGuard"))
+            and all(v == "TypeError:Illegal invocation"
+                    for v in state["brandGuard"].values())),
+        "伪造接收者：覆盖面齐全（含 Screen/Window）": (
+            len(state.get("brandGuard") or {}) >= 12),
+        # 反向保真：原生 enumerateDevices 不校验接收者，补丁不得画蛇添足
+        "伪造接收者：enumerateDevices 保持原生宽松": (
+            (state.get("brandLenient") or {}).get("enumerateDevices")
+            in ("lenient", "absent")),
         # ---- 竞态：新标签页首个文档（含内联脚本）必须已是补丁值 ----
         "竞态：首文档 UA 为移动端": probe.get("ua") == nav["userAgent"],
         "竞态：首文档色深 24": probe.get("colorDepth") == 24,

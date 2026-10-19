@@ -502,10 +502,36 @@ _PATCH_TEMPLATE = r"""
             return true;
         } catch (e) { return false; }
     };
-    var defineFn = function (proto, name, fn) {
+    // 原生方法同样校验接收者（Navigator.prototype.getBattery.call({}) 亦抛
+    // Illegal invocation），故对「接口原型」上的方法做同样的检查；proto 本身
+    // 不是原型对象时（挂在实例上的方法，如空 plugins 的 item）不做检查，
+    // 避免误伤。
+    var __isIfaceProto = function (proto) {
         try {
+            var c = proto.constructor;
+            return typeof c === 'function' && c.prototype === proto;
+        } catch (e) { return false; }
+    };
+    var defineFn = function (proto, name, fn, noBrand) {
+        try {
+            var impl = fn;
+            if (!noBrand && __isIfaceProto(proto)) {
+                impl = function () {
+                    if (!__slotHas(proto, this)) {
+                        throw new TypeError('Illegal invocation');
+                    }
+                    return fn.apply(this, arguments);
+                };
+                // 包装后 length 会变成 0，原生方法的 length 是方法签名的一部分
+                // （检测站点会读 postMessage.length 等），原样保留
+                try {
+                    Object.defineProperty(impl, 'length', {
+                        value: fn.length, configurable: true,
+                    });
+                } catch (e) {}
+            }
             Object.defineProperty(proto, name, {
-                value: __maskNative(fn, name),
+                value: __maskNative(impl, name),
                 writable: true, enumerable: true, configurable: true,
             });
             return true;
@@ -516,8 +542,17 @@ _PATCH_TEMPLATE = r"""
     // setWebViewScrollViewIsDragging 字样），不能伪装成 [native code]。
     var defineFnSrc = function (proto, name, fn, src) {
         try {
+            var impl = fn;
+            if (__isIfaceProto(proto)) {
+                impl = function () {
+                    if (!__slotHas(proto, this)) {
+                        throw new TypeError('Illegal invocation');
+                    }
+                    return fn.apply(this, arguments);
+                };
+            }
             Object.defineProperty(proto, name, {
-                value: __maskNative(fn, name, src),
+                value: __maskNative(impl, name, src),
                 writable: true, enumerable: true, configurable: true,
             });
             return true;
@@ -525,11 +560,18 @@ _PATCH_TEMPLATE = r"""
     };
     // window 上的 [Replaceable] 属性（devicePixelRatio/outerWidth 等）：
     // 原生是「get/set 均存在、赋值时自我替换为数据属性」，保持同样形态。
+    // 原生访问器同样校验接收者，故这里也走 __slotHas。
     var replaceable = function (obj, name, value) {
         if (!obj) { return false; }
+        var brand;
+        try { brand = Object.getPrototypeOf(obj); } catch (e) { brand = null; }
         try {
-            var getter = __maskNative(function () { return value; }, 'get ' + name);
+            var getter = __maskNative(function () {
+                if (!__slotHas(brand, this)) { throw new TypeError('Illegal invocation'); }
+                return value;
+            }, 'get ' + name);
             var setter = __maskNative(function (v) {
+                if (!__slotHas(brand, this)) { throw new TypeError('Illegal invocation'); }
                 try {
                     Object.defineProperty(obj, name, {
                         value: v, writable: true, enumerable: true, configurable: true,
@@ -1759,7 +1801,11 @@ _PATCH_TEMPLATE = r"""
                         out = out.concat(ao.length ? [ao[0]] : [makeDevice('audiooutput')]);
                         return out.concat(other);
                     });
-                });
+                    // 原生 enumerateDevices 是 Blink 里少见的「不校验接收者」实现：
+                    // MediaDevices.prototype.enumerateDevices.call({}) 返回 Promise
+                    // 而不抛 Illegal invocation（实测 Chromium 148 原始内核）。
+                    // 这里不能加校验，否则反而造出一处与原生不同的行为。
+                }, true);
             } catch (e) {}
         }
 
@@ -1918,11 +1964,26 @@ _WORKER_PATCH_TEMPLATE = r"""
             return function (fn) { return fn; };
         }
     })();
+    var __isProtoObj = function (x, proto) {
+        if (x === proto) { return true; }
+        try {
+            var c = x.constructor;
+            if (typeof c === 'function' && c.prototype === x) { return true; }
+        } catch (e) {}
+        return false;
+    };
     var __slotHas = function (proto, recv) {
         if (recv === null || recv === undefined) { return false; }
         var t = typeof recv;
         if (t !== 'object' && t !== 'function') { return false; }
-        try { return proto.isPrototypeOf(recv) === true; } catch (e) { return false; }
+        var x = recv;
+        for (var i = 0; i < 8; i++) {
+            try { x = Object.getPrototypeOf(x); } catch (e) { return false; }
+            if (x === proto) { return true; }
+            if (x === null || x === undefined) { return false; }
+            if (!__isProtoObj(x, proto)) { return false; }
+        }
+        return false;
     };
     var defineGet = function (proto, name, value) {
         try {
@@ -1938,10 +1999,36 @@ _WORKER_PATCH_TEMPLATE = r"""
             return true;
         } catch (e) { return false; }
     };
-    var defineFn = function (proto, name, fn) {
+    // 原生方法同样校验接收者（Navigator.prototype.getBattery.call({}) 亦抛
+    // Illegal invocation），故对「接口原型」上的方法做同样的检查；proto 本身
+    // 不是原型对象时（挂在实例上的方法，如空 plugins 的 item）不做检查，
+    // 避免误伤。
+    var __isIfaceProto = function (proto) {
         try {
+            var c = proto.constructor;
+            return typeof c === 'function' && c.prototype === proto;
+        } catch (e) { return false; }
+    };
+    var defineFn = function (proto, name, fn, noBrand) {
+        try {
+            var impl = fn;
+            if (!noBrand && __isIfaceProto(proto)) {
+                impl = function () {
+                    if (!__slotHas(proto, this)) {
+                        throw new TypeError('Illegal invocation');
+                    }
+                    return fn.apply(this, arguments);
+                };
+                // 包装后 length 会变成 0，原生方法的 length 是方法签名的一部分
+                // （检测站点会读 postMessage.length 等），原样保留
+                try {
+                    Object.defineProperty(impl, 'length', {
+                        value: fn.length, configurable: true,
+                    });
+                } catch (e) {}
+            }
             Object.defineProperty(proto, name, {
-                value: __maskNative(fn, name),
+                value: __maskNative(impl, name),
                 writable: true, enumerable: true, configurable: true,
             });
             return true;
@@ -2789,6 +2876,16 @@ class MobileEmulationSession:
             with contextlib.suppress(CDPError):
                 await self._send("Emulation.setTimezoneOverride",
                                  {"timezoneId": self.timezone}, session_id=sid)
+
+        # 5b. 语言：Intl 默认 locale。内核 --lang/acceptLanguage 只改
+        #     navigator.language，改不动 ICU 默认 locale——宿主中文机器上
+        #     Intl.DateTimeFormat().resolvedOptions().locale 恒为 zh-CN，
+        #     与欧美出口时区并存就是「属地与语言不符」的跨域特征。
+        #     setLocaleOverride 是唯一能改 Intl 的开关（实测）。
+        if self.locale:
+            with contextlib.suppress(CDPError):
+                await self._send("Emulation.setLocaleOverride",
+                                 {"locale": self.locale}, session_id=sid)
 
         # 6. Accept-CH：站点声明高熵提示后，对其后续请求回送 Sec-CH-UA-* 高熵头
         #    （内核完全不处理 Accept-CH；真机 Chrome 全量支持，缺回送是明显破绽）
