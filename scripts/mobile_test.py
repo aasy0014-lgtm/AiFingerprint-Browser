@@ -161,6 +161,10 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
         check(f"[{tag}] Battery API 数据存在且合法",
               isinstance(battery, dict) and 0 <= battery["level"] <= 1)
         check(f"[{tag}] hasUaCh/hasBattery 标记", extra["hasUaCh"] and extra["hasBattery"])
+        check(f"[{tag}] 抹除 Android 不存在的 WebHID（hid）",
+              extra["removeNavigatorProps"] == ["hid"])
+        check(f"[{tag}] plugins 置空标记（Android 无内置 PDF 插件）",
+              extra["emptyPlugins"] is True)
     else:
         check(f"[{tag}] platform == iPhone/iPad", nav["platform"] in ("iPhone", "iPad"))
         check(f"[{tag}] vendor == Apple Computer, Inc.", nav["vendor"] == "Apple Computer, Inc.")
@@ -171,7 +175,9 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
         check(f"[{tag}] deviceMemory 不暴露", nav.get("deviceMemory") is None)
         check(f"[{tag}] Safari 属性差异清单完整",
               {"connection", "pdfViewerEnabled", "userAgentData",
-               "getBattery", "deviceMemory"} <= set(extra["removeNavigatorProps"]))
+               "getBattery", "deviceMemory", "serial", "usb", "hid", "bluetooth",
+               "keyboard", "requestMIDIAccess", "presentation",
+               "getInstalledRelatedApps", "vibrate"} <= set(extra["removeNavigatorProps"]))
         check(f"[{tag}] plugins 置空标记", extra["emptyPlugins"] is True)
 
     # --- 通用 ---
@@ -352,10 +358,15 @@ def test_engines_compat() -> None:
     check("旧结构：CSS 由物理/DPR 推算", spec["cssWidth"] == 480 and spec["cssHeight"] == 1040)
     check("旧结构：deviceMemory 规范化为 8", spec["deviceMemory"] == 8)
     check("旧结构：视口高回退为 CSS 高", spec["viewportHeight"] == 1040)
+    check("旧结构 Android：默认抹除 WebHID", spec["removeProps"] == ["hid"])
+    check("旧结构 Android：plugins 置空（平台事实，不依赖存量标记）",
+          spec["emptyPlugins"] is True)
     spec_ios = derive_spec(legacy, "ios")
     check("旧结构 iOS：默认抹除 Safari 缺失属性",
-          set(spec_ios["removeProps"]) == {"connection", "pdfViewerEnabled", "userAgentData",
-                                           "getBattery", "deviceMemory"})
+          set(spec_ios["removeProps"]) == {
+              "connection", "pdfViewerEnabled", "userAgentData", "getBattery",
+              "deviceMemory", "serial", "usb", "hid", "bluetooth", "keyboard",
+              "requestMIDIAccess", "presentation", "getInstalledRelatedApps", "vibrate"})
 
 
 def main() -> None:

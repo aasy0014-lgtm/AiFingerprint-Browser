@@ -221,7 +221,10 @@ class LaunchManager:
                             timezone=launch.timezone or "",
                             start_url=start_url_final,
                         )
-                    elif viewport or ua:
+                    # 桌面环境不建立移动仿真会话：内核 info 的 mobile_ua 字段对
+                    # 桌面环境同样有值（通用 UA 回填），不能作为「需要移动仿真」的
+                    # 判据——否则桌面 fp-chromium 启动会因缺少屏幕尺寸而失败。
+                    elif is_mobile and (viewport or ua):
                         mobile_session = MobileEmulationSession(
                             info["ws_endpoint"],
                             viewport=viewport, dpr=dpr, ua=ua, platform=platform,

@@ -2,12 +2,12 @@
 
 支持的动作:
   navigate  {url, timeout?}          打开页面
-  click     {selector, timeout?}     点击元素
+  click     {selector, timeout?}     点击元素（移动端环境自动改用触摸点击）
   type      {selector, text, press_enter?}  清空并输入文本
   press     {key}                    按键（Enter/Tab/Escape...）
   wait      {ms}                     固定等待
   wait_for  {selector, timeout?}     等待元素出现
-  scroll    {amount}                 垂直滚动像素（可为负）
+  scroll    {amount}                 垂直滚动像素（可为负；移动端为触摸拖拽）
   screenshot {full_page?, name?}     截图留痕（保存到 data/runs/<run_id>/）
   extract   {selector, attr?, var?}  抽取元素文本/属性；var=存入变量供后续引用
   evaluate  {expression, var?}       执行 JS 并记录返回值；var=存入变量
@@ -48,6 +48,7 @@ import httpx
 from . import db
 from .config import DATA_DIR
 from .launcher import LaunchManager
+from .mobile_input import is_mobile_target, tap_locator, touch_scroll
 from .proxy_dns import is_lan_target
 
 log = logging.getLogger(__name__)
@@ -89,9 +90,10 @@ def _subst(value: Any, variables: dict) -> Any:
 class _RunContext:
     """单次 run 的执行上下文：页面列表、当前页、变量。"""
 
-    def __init__(self, context, run_id: str):
+    def __init__(self, context, run_id: str, target_os: Optional[str] = None):
         self.context = context
         self.run_id = run_id
+        self.target_os = target_os
         self.variables: dict[str, Any] = {}
         self.pages: list = []
         self.current: int = 0
@@ -182,7 +184,7 @@ class TaskEngine:
                 context = conn_browser.contexts[0] if conn_browser.contexts \
                     else await conn_browser.new_context()
 
-            ctx = _RunContext(context, run_id)
+            ctx = _RunContext(context, run_id, target_os=profile.get("target_os"))
             await ctx.init_pages()
             results, failed = await self._run_steps(ctx, task, humanize)
 
@@ -392,7 +394,12 @@ class TaskEngine:
             return None
 
         if action == "click":
-            await self._locator(ctx, step).first.click(timeout=timeout)
+            locator = self._locator(ctx, step).first
+            if is_mobile_target(ctx.target_os):
+                # 移动端：触摸点击（真机语义；鼠标序列是行为型风控的直接证据）
+                await tap_locator(page, locator, timeout=timeout)
+            else:
+                await locator.click(timeout=timeout)
             entry["detail"] = f"已点击 {step['selector']}"
             return None
 
@@ -426,8 +433,13 @@ class TaskEngine:
             return None
 
         if action == "scroll":
-            await page.mouse.wheel(0, int(step.get("amount", 500)))
-            entry["detail"] = f"滚动 {step.get('amount', 500)}px"
+            amount = int(step.get("amount", 500))
+            if is_mobile_target(ctx.target_os):
+                # 移动端：触摸拖拽（真机语义）；wheel 事件在手机上不存在
+                await touch_scroll(page, amount)
+            else:
+                await page.mouse.wheel(0, amount)
+            entry["detail"] = f"滚动 {amount}px"
             return None
 
         if action == "screenshot":

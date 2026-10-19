@@ -102,6 +102,28 @@ STATE_JS = """async () => {
         colorDepth: screen.colorDepth, pixelDepth: screen.pixelDepth,
         innerW: innerWidth, innerH: innerHeight,
         touchEvents: 'ontouchstart' in window,
+        // ---- 平台属性面：桌面 Chromium 独有 API 的保留/抹除校验 ----
+        hasSerial: 'serial' in nav,
+        hasUsb: 'usb' in nav,
+        hasHid: 'hid' in nav,
+        hasBluetooth: 'bluetooth' in nav,
+        hasKeyboard: 'keyboard' in nav,
+        hasMidiAccess: typeof nav.requestMIDIAccess === 'function',
+        hasPresentation: 'presentation' in nav,
+        hasRelatedApps: typeof nav.getInstalledRelatedApps === 'function',
+        hasVibrate: typeof nav.vibrate === 'function',
+        hasOpenFilePicker: typeof window.showOpenFilePicker === 'function',
+        hasPerfMemory: typeof performance.memory !== 'undefined',
+        pdfViewerValue: nav.pdfViewerEnabled,
+        // ---- iOS WebKit 专有手势事件家族（Chromium 全平台无）----
+        hasGestureEvent: typeof window.GestureEvent === 'function',
+        hasGestureHandler: 'ongesturestart' in window,
+        gestureProtoOk: (() => {
+            try {
+                return typeof window.GestureEvent === 'function'
+                    && Object.getPrototypeOf(window.GestureEvent.prototype) === UIEvent.prototype;
+            } catch (e) { return false; }
+        })(),
         ownProps: Object.getOwnPropertyNames(nav).filter((n) =>
             ['platform','userAgent','maxTouchPoints','mobile','deviceMemory',
              'userAgentData','vendor','getBattery','standalone','connection'].includes(n)),
@@ -375,6 +397,76 @@ MEDIA_JS = """(async () => {
 })()"""
 
 
+# 输入事件层探针：记录页面实际收到的事件类型（pointer 事件带 pointerType）。
+# 移动端自动化的真机等价路径是 CDP 触摸派发（Input.dispatchTouchEvent）：
+# 真机点击序列 = pointerdown:touch → touchstart → pointerup:touch → touchend
+# →（兼容鼠标）mousedown → mouseup → click:touch。桌面鼠标序列在手机上不存在，
+# 是行为型风控（Cloudflare/DataDome/极验等）最直接的一层证据。
+EVENT_CAPTURE_JS = r"""() => {
+  window.__ev = [];
+  const rec = (e) => window.__ev.push(e.type + (e.pointerType !== undefined ? ':' + e.pointerType : ''));
+  for (const t of ['pointerover','pointerenter','pointermove','pointerdown','mousedown','touchstart',
+                   'mousemove','touchmove','pointerup','mouseup','touchend','click']) {
+    document.addEventListener(t, rec, true);
+  }
+  let hit = document.getElementById('__mobile_input_probe');
+  if (!hit) {
+    hit = document.createElement('div');
+    hit.id = '__mobile_input_probe';
+    hit.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:transparent';
+    document.body.appendChild(hit);
+  }
+  return 'ok';
+}"""
+
+
+async def _mouse_click(page) -> None:
+    await page.mouse.move(120, 300)
+    await page.mouse.down()
+    await asyncio.sleep(0.05)
+    await page.mouse.up()
+
+
+async def input_event_probe(page) -> dict:
+    """真机输入语义探针（移动端自动化路径）。
+
+    1) CDP 触摸派发（Input.dispatchTouchEvent）——移动端自动化的真机等价
+       路径：应产生完整触摸序列 + 兼容鼠标事件 + click（pointerType=touch）。
+       注意 `page.touchscreen.tap` 在 connect_over_cdp 的默认上下文不可用
+       （无 hasTouch），CDP 原始派发才是可用路径。
+    2) Playwright 鼠标点击——应答必须正常返回：内核的
+       Emulation.setEmitTouchEventsForMouse 转换会吞掉 mousePressed/Released
+       的 CDP 应答（fp-chromium 148 实测），一旦启用，Playwright 点击永久挂起。
+       本项即该回归的守卫（详见 docs/移动端大厂检测对抗优化方案.md 事件层）。
+    """
+    out: dict = {"touch": [], "mouse": [], "mouse_ok": False}
+    await page.evaluate(EVENT_CAPTURE_JS)
+    try:
+        cdp = await page.context.new_cdp_session(page)
+        await cdp.send("Input.dispatchTouchEvent", {
+            "type": "touchStart",
+            "touchPoints": [{"x": 160, "y": 420, "radiusX": 1, "radiusY": 1,
+                             "force": 1, "id": 1}],
+        })
+        await cdp.send("Input.dispatchTouchEvent",
+                       {"type": "touchEnd", "touchPoints": []})
+        await asyncio.sleep(0.3)
+        out["touch"] = await page.evaluate("() => (window.__ev || []).splice(0)")
+    except Exception as exc:  # noqa: BLE001
+        out["touch_error"] = f"{type(exc).__name__}: {exc}"[:160]
+    try:
+        await asyncio.wait_for(_mouse_click(page), 5)
+        out["mouse_ok"] = True
+    except Exception as exc:  # noqa: BLE001
+        out["mouse_error"] = type(exc).__name__
+    await asyncio.sleep(0.25)
+    out["mouse"] = await page.evaluate("() => (window.__ev || []).splice(0)")
+    await page.evaluate(
+        "() => { const el = document.getElementById('__mobile_input_probe');"
+        " if (el) el.remove(); }")
+    return out
+
+
 async def race_test(ws_endpoint: str) -> dict:
     """模拟用户新开标签页：目标被本会话门控 → 首个文档必须在补丁生效后执行。
 
@@ -546,6 +638,7 @@ async def main() -> int:
     accept_ch_state: dict = {}
     webgpu_state: dict = {}
     media_state: dict = {}
+    event_state: dict = {}
 
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
@@ -573,6 +666,11 @@ async def main() -> int:
         print(json.dumps(state, ensure_ascii=False, indent=1))
         print("\n== 实际请求头（ua-ch 相关）==")
         print(json.dumps(seen_headers, ensure_ascii=False, indent=1))
+
+        # ---- 输入事件层：触摸派发（真机路径）/ 鼠标派发（应答守卫）----
+        event_state = await input_event_probe(page)
+        print("\n== 输入事件层（触摸派发 / 鼠标派发）==")
+        print(json.dumps(event_state, ensure_ascii=False))
 
         # ---- 跨域 iframe（OOPIF）+ Worker：与主文档同一套信号 ----
         # 本地服务器双栈监听：127.0.0.1（父页）与 localhost（子帧）分属不同
@@ -684,6 +782,8 @@ async def main() -> int:
 
     gl = state.get("webgl") or {}
     is_android = target_os == "android"
+    ev_touch = [str(e) for e in (event_state.get("touch") or [])]
+    ev_mouse = [str(e) for e in (event_state.get("mouse") or [])]
 
     checks: dict[str, bool] = {
         "已按 start_url 导航": "example.com" in (state["url"] or ""),
@@ -697,6 +797,16 @@ async def main() -> int:
         "innerWidth == CSS 宽度": state["innerW"] == css_w,
         "innerHeight == 首屏视口高（非屏幕全高）": state["innerH"] == vp_h,
         "触控事件可用": state["touchEvents"] is True,
+        # ---- 输入事件层（行为型风控）：触摸派发 = 移动端自动化的真机路径 ----
+        "事件层：触摸派发 → touchstart/touchend": (
+            "touchstart" in ev_touch and "touchend" in ev_touch),
+        "事件层：触摸派发 → pointerdown:touch": "pointerdown:touch" in ev_touch,
+        "事件层：触摸派发 → 兼容鼠标事件 + click:touch": (
+            "mousedown" in ev_touch and "mouseup" in ev_touch
+            and any(s.startswith("click") for s in ev_touch)),
+        "事件层：鼠标点击应答正常（未启用 emit-touch 转换）": (
+            event_state.get("mouse_ok") is True
+            and any(s.split(":", 1)[0] == "mousedown" for s in ev_mouse)),
         "navigator 无 own-property 泄漏": len(state["ownProps"]) == 0,
         "colorDepth/pixelDepth == 24": state["colorDepth"] == 24 and state["pixelDepth"] == 24,
         "navigator.vendor 一致": state["vendor"] == nav.get("vendor"),
@@ -794,7 +904,18 @@ async def main() -> int:
                 seen_headers.get("sec-ch-ua-mobile") == sec_ch_headers(ua_ch or {}).get("Sec-CH-UA-Mobile")
                 and seen_headers.get("sec-ch-ua-platform") == sec_ch_headers(ua_ch or {}).get("Sec-CH-UA-Platform")),
             "请求头 User-Agent == 指纹 UA": seen_headers.get("user-agent") == nav["userAgent"],
-            "plugins 非空（Chrome Android 有内置插件）": state["pluginsLen"] > 0,
+            "plugins/mimeTypes 为空（Android Chrome 无内置 PDF 插件）": (
+                state["pluginsLen"] == 0 and state["mimeTypesLen"] == 0),
+            "pdfViewerEnabled == false（Android 构建口径）": state["pdfViewerValue"] is False,
+            "WebHID 不存在（Android Chrome 未实现）": state["hasHid"] is False,
+            "WebUSB 存在（Chrome Android 148 支持）": state["hasUsb"] is True,
+            "Web Serial 存在（Chrome Android 148 支持）": state["hasSerial"] is True,
+            "Web Bluetooth 存在（Chrome Android 支持）": state["hasBluetooth"] is True,
+            "Web MIDI 存在（Chrome Android 支持）": state["hasMidiAccess"] is True,
+            "performance.memory 存在（Chrome 非标准扩展，Android 亦有）": (
+                state["hasPerfMemory"] is True),
+            "无 GestureEvent/ongesturestart（Chromium 无 WebKit 手势面）": (
+                state["hasGestureEvent"] is False and state["hasGestureHandler"] is False),
             "connection 存在（Chrome Android 特性）": state["hasConnection"] is True,
             "standalone 不存在（iOS 专有属性）": state["hasStandalone"] is False,
             "竞态：首文档 UA-CH/内存已注入": bool(probe.get("hasUaData"))
@@ -857,6 +978,22 @@ async def main() -> int:
             "connection 不存在（Safari/CriOS 均无该 API）": state["hasConnection"] is False,
             "pdfViewerEnabled 不存在（Safari/CriOS 均无该 API）": state["hasPdfViewer"] is False,
             "plugins/mimeTypes 为空（WKWebView 行为）": state["pluginsLen"] == 0 and state["mimeTypesLen"] == 0,
+            # ---- 桌面 Chromium 独有 API 的抹除（一条 `'serial' in navigator` 即可判假）----
+            "Web Serial/USB/WebHID 均不存在（Safari 未实现）": (
+                state["hasSerial"] is False and state["hasUsb"] is False
+                and state["hasHid"] is False),
+            "Web Bluetooth 不存在（Safari 未实现）": state["hasBluetooth"] is False,
+            "Keyboard 不存在（Safari 未实现）": state["hasKeyboard"] is False,
+            "Web MIDI 不存在（Safari 未实现）": state["hasMidiAccess"] is False,
+            "Presentation 不存在（Safari 未实现）": state["hasPresentation"] is False,
+            "getInstalledRelatedApps 不存在（Safari 未实现）": state["hasRelatedApps"] is False,
+            "navigator.vibrate 不存在（Safari 未实现）": state["hasVibrate"] is False,
+            "showOpenFilePicker 不存在（Safari 未实现）": state["hasOpenFilePicker"] is False,
+            "performance.memory 不存在（WebKit 未实现 MemoryInfo）": state["hasPerfMemory"] is False,
+            # ---- iOS WebKit 专有手势事件家族（Chromium 装 iOS 的最快反证）----
+            "GestureEvent 构造器存在（iOS WebKit 专有）": state["hasGestureEvent"] is True,
+            "ongesturestart 处理属性存在": state["hasGestureHandler"] is True,
+            "GestureEvent 原型链 == UIEvent": state["gestureProtoOk"] is True,
             "无 Sec-CH-UA 请求头（WKWebView 不发）": not any(k.startswith("sec-ch") for k in seen_headers),
             "请求头 User-Agent == 指纹 UA": seen_headers.get("user-agent") == nav["userAgent"],
             "竞态：首文档无 UA-CH（WKWebView 行为）": probe.get("hasUaData") is False,

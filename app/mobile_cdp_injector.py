@@ -49,11 +49,14 @@ import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
+from .mobile_fingerprints import _ANDROID_REMOVE_NAV_PROPS, _IOS_REMOVE_NAV_PROPS
+
 log = logging.getLogger(__name__)
 
-# iOS Safari 不存在、需从桌面 Chromium 上抹掉的 Navigator 属性
-# （getBattery/deviceMemory 是桌面 Chrome 的原生 API，Safari 两者都没有）
-_IOS_REMOVE_PROPS = ["connection", "pdfViewerEnabled", "userAgentData", "getBattery", "deviceMemory"]
+# iOS Safari / Android Chrome 不存在、需从桌面 Chromium 上抹掉的 Navigator 属性。
+# 清单唯一来源在指纹库（mobile_fingerprints），运行期与数据层共享，避免两处漂移。
+_IOS_REMOVE_PROPS = list(_IOS_REMOVE_NAV_PROPS)
+_ANDROID_REMOVE_PROPS = list(_ANDROID_REMOVE_NAV_PROPS)
 
 
 class CDPError(RuntimeError):
@@ -191,9 +194,14 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
 
     remove_props = extra.get("removeNavigatorProps")
     if remove_props is None:
-        # 旧版 iOS 指纹无该字段：按 iOS Safari 的真实属性差异兜底
-        remove_props = list(_IOS_REMOVE_PROPS) if target_os == "ios" else []
-    empty_plugins = bool(extra.get("emptyPlugins", target_os == "ios"))
+        # 旧版指纹无该字段：按真机属性差异兜底（iOS Safari / Android Chrome）
+        remove_props = (list(_IOS_REMOVE_PROPS) if target_os == "ios"
+                        else list(_ANDROID_REMOVE_PROPS))
+    # plugins/mimeTypes 恒为空：Android Chrome（构建开关 enable_pdf=!is_android）
+    # 与 iOS WKWebView 都没有内置 PDF 插件体系。旧 Android 指纹里的
+    # emptyPlugins=False 是历史遗留标记，不改变平台事实——运行期按平台收敛，
+    # 存量指纹无需重建即可获得真机 PDF 面。
+    empty_plugins = True
 
     color_depth = screen.get("colorDepth")
     try:
@@ -404,6 +412,81 @@ _PATCH_TEMPLATE = r"""
             // 赋值 undefined 后 typeof/truthiness 检查通过；'chrome' in window
             // 与 getOwnPropertyDescriptor 的残余暴露属内核层限制（已知边界）。
             try { window.chrome = undefined; } catch (e) {}
+
+            // ---- iOS WebKit 与桌面 Chromium 的页面/窗口级属性差 ----
+            // removeProp 只覆盖 navigator；以下两项在 Window / Performance 原型上。
+            // 1) File System Access（showOpenFilePicker）：Safari 从未实现；
+            try { delete Window.prototype.showOpenFilePicker; } catch (e) {}
+            try { delete window.showOpenFilePicker; } catch (e) {}
+            // 2) performance.memory（MemoryInfo）：WebKit 未实现；桌面内核携带，
+            //    不抹除时 'memory' in performance 一行即可判「不是 Safari」。
+            try { delete Performance.prototype.memory; } catch (e) {}
+            try { delete performance.memory; } catch (e) {}
+            if ('memory' in performance) {
+                defineGet(Performance.prototype, 'memory', undefined);
+            }
+            // 3) iOS WebKit 专有手势事件家族：GestureEvent + ongesturestart 面。
+            //    MDN BCD：chrome/chrome_android=false、safari_ios=2 —— 这是
+            //    「Chromium 内核装 iOS」在事件层最直接的证据之一。按真机形态
+            //    补最小完备面：构造器为 UIEvent 子类（原型链/instanceof 成立），
+            //    rotation/scale 为原型访问器，处理属性挂在 Window.prototype
+            //    （enumerable，与原生事件处理属性一致）。
+            if (typeof window.GestureEvent === 'undefined') {
+                try {
+                    var __geState = new WeakMap();
+                    var __GE = __maskNative(function GestureEvent(type, init) {
+                        init = init || {};
+                        var e = new UIEvent(type, {
+                            bubbles: !!init.bubbles,
+                            cancelable: !!init.cancelable,
+                            view: init.view || null,
+                            detail: init.detail || 0,
+                        });
+                        try { Object.setPrototypeOf(e, __GE.prototype); } catch (e2) {}
+                        __geState.set(e, {
+                            rotation: init.rotation || 0,
+                            scale: init.scale === undefined ? 1 : init.scale,
+                        });
+                        return e;
+                    }, 'GestureEvent');
+                    __GE.prototype = Object.create(UIEvent.prototype, {
+                        constructor: { value: __GE, writable: true, configurable: true },
+                    });
+                    Object.defineProperty(__GE.prototype, 'rotation', {
+                        get: __maskNative(function () {
+                            var s = __geState.get(this);
+                            return s ? s.rotation : 0;
+                        }, 'get rotation'),
+                        enumerable: true, configurable: true,
+                    });
+                    Object.defineProperty(__GE.prototype, 'scale', {
+                        get: __maskNative(function () {
+                            var s = __geState.get(this);
+                            return s ? s.scale : 1;
+                        }, 'get scale'),
+                        enumerable: true, configurable: true,
+                    });
+                    Object.defineProperty(window, 'GestureEvent', {
+                        value: __GE, writable: true, enumerable: false, configurable: true,
+                    });
+                    var __geHandlers = ['ongesturestart', 'ongesturechange', 'ongestureend'];
+                    var __geDefineHandler = function (__hn) {
+                        try {
+                            Object.defineProperty(Window.prototype, __hn, {
+                                get: __maskNative(function () {
+                                    return null;
+                                }, 'get ' + __hn),
+                                set: __maskNative(function (v) {
+                                }, 'set ' + __hn),
+                                enumerable: true, configurable: true,
+                            });
+                        } catch (e3) {}
+                    };
+                    for (var __gi = 0; __gi < __geHandlers.length; __gi++) {
+                        __geDefineHandler(__geHandlers[__gi]);
+                    }
+                } catch (e) {}
+            }
         }
 
         // ---- 抹掉该平台不存在的桌面 Chromium 属性（如 iOS 的 connection）----
@@ -412,7 +495,9 @@ _PATCH_TEMPLATE = r"""
             removeProp(drops[i]);
         }
 
-        // ---- iOS Safari：plugins / mimeTypes 为空 ----
+        // ---- 无内置 PDF 插件的平台（iOS WKWebView / Android Chrome）----
+        // iOS：Safari 的 plugins/mimeTypes 恒为空（无水印 PDF 插件体系）。
+        // Android：Chrome 构建开关 enable_pdf=!is_android，同样为空。
         if (D.emptyPlugins && typeof PluginArray !== 'undefined') {
             try {
                 var emptyPlugins = Object.create(PluginArray.prototype);
@@ -431,6 +516,14 @@ _PATCH_TEMPLATE = r"""
                     defineGet(N, 'mimeTypes', emptyMimes);
                 }
             } catch (e) {}
+        }
+
+        // ---- Android Chrome：PDF 面（构建口径 enable_pdf=!is_android）----
+        // 真机 Android Chrome：plugins/mimeTypes 为空（上方已统一置空），
+        // pdfViewerEnabled 属性存在且恒为 false。与 iOS 的「属性不存在」形态
+        // 不同（桌面内核是 5 个 PDF 插件 + true，单行即可判「桌面装手机」）。
+        if (D.emptyPlugins && !D.ios) {
+            defineGet(N, 'pdfViewerEnabled', false);
         }
 
         // ---- iOS Chrome（CriOS）：页面世界检测面 ----
@@ -839,6 +932,19 @@ _WORKER_PATCH_TEMPLATE = r"""
             try { delete N[drops[i]]; } catch (e) {}
             try { delete navigator[drops[i]]; } catch (e) {}
             if (drops[i] in navigator) { defineGet(N, drops[i], undefined); }
+        }
+
+        // ---- iOS Safari：Worker 侧同样没有 performance.memory ----
+        // （WebKit 未实现 MemoryInfo；内核在 Worker 的 performance 上同样暴露）
+        if (D.ios) {
+            try {
+                if (typeof Performance !== 'undefined' && Performance.prototype) {
+                    delete Performance.prototype.memory;
+                    if ('memory' in performance) {
+                        defineGet(Performance.prototype, 'memory', undefined);
+                    }
+                }
+            } catch (e) {}
         }
 
         if (D.platform) { defineGet(N, 'platform', D.platform); }
@@ -1274,6 +1380,11 @@ class MobileEmulationSession:
                     "enabled": True,
                     "maxTouchPoints": self.max_touch_points,
                 }, session_id=session_id)
+            # 不启用 Emulation.setEmitTouchEventsForMouse：实测（fp-chromium 148）
+            # 该转换会吞掉 mousePressed/Released 的 CDP 应答 → Playwright 点击
+            # 永久挂起，且产出序列缺兼容鼠标事件与 click。移动端自动化应改用
+            # Input.dispatchTouchEvent 派发（见 docs/移动端大厂检测对抗优化方案.md
+            # §事件层）。
             # UA-CH 低熵请求头：iframe 发出的请求与主文档一致
             # （真机 Chrome 对全站发送；内核不发送任何 Sec-CH-UA* 头）
             ua_ch = self.spec.get("uaCh")
@@ -1472,6 +1583,7 @@ class MobileEmulationSession:
                 "enabled": True,
                 "maxTouchPoints": self.max_touch_points,
             }, session_id=sid)
+        # 不启用 setEmitTouchEventsForMouse（会吞鼠标命令应答，见主路径注释）
 
         # 3. UA 覆盖（内核层只会按桌面平台拼 UA，必须显式覆盖为移动端 UA）
         if self.ua:

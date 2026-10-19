@@ -29,6 +29,7 @@ from .config import (APP_NAME, BASE_DIR, DATA_DIR, DETECT_LINKS, PHASE,
                      PROFILE_ROOT, ROLE_ADMIN, ROLE_OPERATOR, VERSION)
 from .fingerprint_engine import create_fingerprint, summarize
 from .launcher import LaunchError, LaunchManager
+from .mobile_input import is_mobile_profile, tap_locator, touch_scroll
 from .models import (
     BatchStartRequest,
     BrowserStartRequest,
@@ -1145,7 +1146,13 @@ async def browser_evaluate(request: Request, profile_id: str, body: EvaluateRequ
 @app.post("/api/v1/browser/{profile_id}/click")
 async def browser_click(request: Request, profile_id: str, body: ClickRequest) -> dict:
     async with _require_context(request, profile_id) as page:
-        await page.locator(body.selector).first.click(timeout=body.timeout)
+        locator = page.locator(body.selector).first
+        if is_mobile_profile(db.get_profile(profile_id)):
+            # 移动端：触摸点击（真机语义）。鼠标序列（pointerdown:mouse /
+            # mousedown）在手机上不存在，是行为型风控的直接证据。
+            await tap_locator(page, locator, timeout=body.timeout)
+        else:
+            await locator.click(timeout=body.timeout)
     return ok({"detail": f"已点击 {body.selector}"})
 
 
@@ -1189,7 +1196,11 @@ async def browser_wait_for(request: Request, profile_id: str, body: WaitForReque
 @app.post("/api/v1/browser/{profile_id}/scroll")
 async def browser_scroll(request: Request, profile_id: str, body: ScrollRequest) -> dict:
     async with _require_context(request, profile_id) as page:
-        await page.mouse.wheel(0, body.amount)
+        if is_mobile_profile(db.get_profile(profile_id)):
+            # 移动端：触摸拖拽滚动（真机语义）；wheel 事件在手机上不存在
+            await touch_scroll(page, body.amount)
+        else:
+            await page.mouse.wheel(0, body.amount)
     return ok({"detail": f"滚动 {body.amount}px"})
 
 

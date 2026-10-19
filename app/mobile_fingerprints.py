@@ -271,8 +271,22 @@ _MOBILE_WEBRTC = {
     },
 }
 
-# iOS Safari 不存在、运行期需要从内核（桌面 Chromium）上抹掉的 Navigator 属性
-_IOS_REMOVE_NAV_PROPS = ["connection", "pdfViewerEnabled", "userAgentData", "getBattery", "deviceMemory"]
+# iOS Safari 不存在、运行期需要从内核（桌面 Chromium）上抹掉的 Navigator 属性。
+# 前 5 项是早期的 Safari/桌面差异（connection/pdfViewerEnabled 等）；其余为
+# WebKit 从未实现的桌面 Chromium API（MDN BCD，2026-10 核实）：Web Serial /
+# WebUSB / WebHID / Web Bluetooth / Keyboard Lock / Web MIDI / Presentation /
+# getInstalledRelatedApps / navigator.vibrate。桌面内核全部携带，不抹除时
+# `'serial' in navigator` 这类一行探测即可判定「Chromium 装 iOS」。
+_IOS_REMOVE_NAV_PROPS = [
+    "connection", "pdfViewerEnabled", "userAgentData", "getBattery", "deviceMemory",
+    "serial", "usb", "hid", "bluetooth", "keyboard", "requestMIDIAccess",
+    "presentation", "getInstalledRelatedApps", "vibrate",
+]
+
+# Android Chrome 不存在、需从桌面内核上抹掉的 Navigator 属性（WebHID 仅桌面，
+# 见 BCD chrome_android=false；WebUSB/Web Serial 在 Chrome Android 148 已支持，
+# 不可误删——版本相关差异必须逐项核对，不能按「桌面 API」一概而论）。
+_ANDROID_REMOVE_NAV_PROPS = ["hid"]
 
 
 # ------------------------------------------------------------------ 指纹生成
@@ -324,8 +338,11 @@ def generate_mobile_fingerprint(
         platform_version_ch = f"{os_version}.0.0"
         battery: Optional[Dict[str, Any]] = _generate_battery_api()
         device_memory: Optional[int] = memory_class
-        remove_props: List[str] = []
-        empty_plugins = False
+        remove_props: List[str] = list(_ANDROID_REMOVE_NAV_PROPS)
+        # Android 构建无内置 PDF 插件（Chromium 构建开关 enable_pdf=!is_android）：
+        # 真机 Chrome Android 的 plugins/mimeTypes 为空、pdfViewerEnabled 恒 false。
+        # 宿主桌面内核是 5 个 PDF 插件 + true，是「桌面装手机」的单行级证据。
+        empty_plugins = True
     else:
         os_token = os_version.replace(".", "_")
         safari_version = ".".join(os_version.split(".")[:2])  # iOS 27.0.1 → Safari 27.0
