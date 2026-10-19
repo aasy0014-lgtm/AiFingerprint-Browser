@@ -289,6 +289,75 @@ _IOS_REMOVE_NAV_PROPS = [
 _ANDROID_REMOVE_NAV_PROPS = ["hid"]
 
 
+# --------------------------------------------------------------------------
+# 平台 API 差集（窗口 / 文档 / navigator 三处统一按名删除）
+# --------------------------------------------------------------------------
+# 桌面内核会暴露一批「所属平台真机没有」的 API，属一行判假面。逐项证据 =
+# MDN BCD（/bcd/api/v0/current/）的 safari_ios / chrome_android 支持值；
+# WebKit 从未实现的家族（传感器 / 隐私沙盒）同时有 WebKit 源码面佐证。
+# 删除时同步清 window / Window.prototype / Document.prototype / document /
+# Navigator.prototype / navigator，并按需在原型上兜底 defineGet(undefined)。
+#
+# ---- iOS（Safari 与 CriOS 同为 WebKit 内核，口径一致）----
+_IOS_REMOVE_GLOBALS = [
+    # 通用传感器 API：WebKit 从未实现（BCD api.Accelerometer /
+    # api.Gyroscope / api.GravitySensor / api.LinearAccelerationSensor /
+    # api.AbsoluteOrientationSensor / api.RelativeOrientationSensor /
+    # api.SensorErrorEvent / api.Sensor: safari_ios=false）。
+    # Chrome Android 自 67 起具备，Android 侧保持（注入层由 CDP 虚拟
+    # 传感器喂数，读数与事件流同源）。
+    "Sensor", "SensorErrorEvent", "Accelerometer", "Gyroscope",
+    "LinearAccelerationSensor", "GravitySensor",
+    "AbsoluteOrientationSensor", "RelativeOrientationSensor",
+    # Chromium 专有、Safari 无（BCD 逐项 safari_ios=false）：
+    # EyeDropper(95/desktop-only) / IdleDetector(94) / WebSocketStream(124) /
+    # ImageDecoder(94) / FileSystemObserver(133) / queryLocalFonts(103) /
+    # documentPictureInPicture(116) / launchQueue(102) / Scheduler(94) /
+    # OTPCredential(93) / Ink(94) / MediaStreamTrackGenerator(94)
+    "EyeDropper", "IdleDetector", "WebSocketStream", "ImageDecoder",
+    "FileSystemObserver", "queryLocalFonts", "documentPictureInPicture",
+    "launchQueue", "Scheduler", "scheduler", "OTPCredential", "Ink",
+    "MediaStreamTrackGenerator",
+    # 隐私沙盒（WebKit 明确拒绝实现）：Shared Storage / Fenced Frames /
+    # Topics / Protected Audience（BCD api.Window.sharedStorage /
+    # api.Window.fence / api.HTMLFencedFrameElement / api.Document.browsingTopics
+    # / api.Navigator.runAdAuction 等：safari_ios=false）
+    "sharedStorage", "SharedStorage", "fence", "Fence",
+    "HTMLFencedFrameElement", "browsingTopics",
+    "runAdAuction", "joinAdInterestGroup", "leaveAdInterestGroup",
+    "deprecatedReplaceInURN", "updateAdInterestGroups", "protectedAudience",
+    # File System Access 的「选择器」面：Safari 只实现 OPFS
+    # （FileSystemHandle 家族 Safari 15.2+ 具备、不可误删），
+    # show{,Open,Save}FilePicker / showDirectoryPicker 三项均为
+    # Chromium 专有（BCD safari_ios=false）
+    "showSaveFilePicker", "showDirectoryPicker",
+    # navigator 成员：WebXR / VirtualKeyboard / Ink（BCD safari_ios=false）
+    "xr", "virtualKeyboard", "ink",
+]
+
+# ---- Android Chrome（真实 Chrome Android 无、桌面内核有）----
+# BCD chrome_android=false：EyeDropper / FileSystemObserver（133）/
+# queryLocalFonts（103）/ documentPictureInPicture（116）/ launchQueue（102）。
+# 注意反向：WebHID 已由 _ANDROID_REMOVE_NAV_PROPS 处理；WebUSB/Web Serial/
+# FSA 选择器（chrome_android=132）/ 传感器家族 / IdleDetector / OTPCredential /
+# Ink 等在 Chrome Android 真实存在，不得误删（回归断言锁定）。
+_ANDROID_REMOVE_GLOBALS = [
+    "EyeDropper", "FileSystemObserver", "queryLocalFonts",
+    "documentPictureInPicture", "launchQueue",
+]
+
+# ---- Worker 全局作用域内的同名差集 ----
+# 内核在 Worker 里同样暴露（实测）：IdleDetector / WebSocketStream /
+# ImageDecoder / FileSystemObserver / Scheduler / scheduler（对象）。
+# WebKit 全部未实现（BCD safari_ios=false）；Chrome Android 侧除
+# FileSystemObserver 外均存在（chrome_android=false → Android 也删）。
+_IOS_REMOVE_WORKER_GLOBALS = [
+    "IdleDetector", "WebSocketStream", "ImageDecoder", "FileSystemObserver",
+    "Scheduler", "scheduler",
+]
+_ANDROID_REMOVE_WORKER_GLOBALS = ["FileSystemObserver"]
+
+
 # ------------------------------------------------------------------ 指纹生成
 def generate_mobile_fingerprint(
     target_os: str,

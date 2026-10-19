@@ -448,6 +448,60 @@ SENSOR_JS = r"""async () => {
 }"""
 
 
+PLATFORM_JS = r"""async () => {
+  // 平台 API 差集读数（真机口径对比用）：窗口级 / document / navigator 三处
+  // 的 [typeof, 名字是否仍 in 对象] + Worker 全局同名读数。
+  const t = (obj, n) => { try { return typeof obj[n]; } catch (e) { return 'ERR'; } };
+  const has = (obj, n) => { try { return n in obj; } catch (e) { return 'ERR'; } };
+  const read = (obj, names) => {
+    const o = {};
+    for (const n of names) { o[n] = [t(obj, n), has(obj, n)]; }
+    return o;
+  };
+  const out = {
+    win: read(window, ['Sensor', 'SensorErrorEvent', 'Accelerometer', 'Gyroscope',
+      'LinearAccelerationSensor', 'GravitySensor', 'AbsoluteOrientationSensor',
+      'RelativeOrientationSensor', 'EyeDropper', 'IdleDetector', 'WebSocketStream',
+      'ImageDecoder', 'FileSystemObserver', 'queryLocalFonts',
+      'documentPictureInPicture', 'launchQueue', 'Scheduler', 'scheduler',
+      'OTPCredential', 'Ink', 'MediaStreamTrackGenerator', 'sharedStorage',
+      'SharedStorage', 'fence', 'Fence', 'HTMLFencedFrameElement',
+      'showSaveFilePicker', 'showDirectoryPicker']),
+    doc: read(document, ['browsingTopics']),
+    nav: read(navigator, ['xr', 'virtualKeyboard', 'ink', 'runAdAuction',
+      'joinAdInterestGroup', 'leaveAdInterestGroup', 'deprecatedReplaceInURN',
+      'updateAdInterestGroups', 'protectedAudience']),
+    kept: read(window, ['VideoDecoder', 'VideoFrame', 'AudioDecoder',
+      'EncodedAudioChunk', 'URLPattern', 'Highlight', 'BarcodeDetector',
+      'ImageCapture', 'MediaStreamTrackProcessor', 'navigation', 'GPU',
+      'FileSystemHandle', 'FileSystemFileHandle', 'FileSystemDirectoryHandle',
+      'FileSystemWritableFileStream']),
+    keptDoc: read(document, ['startViewTransition', 'hasStorageAccess',
+      'requestStorageAccess', 'fragmentDirective']),
+    keptNav: read(navigator, ['share', 'canShare', 'wakeLock', 'gpu']),
+    worker: null,
+  };
+  try {
+    const names = ['IdleDetector', 'WebSocketStream', 'ImageDecoder',
+      'FileSystemObserver', 'Scheduler', 'scheduler', 'VideoDecoder',
+      'BarcodeDetector', 'URLPattern', 'WebGL2RenderingContext'];
+    const src = 'self.onmessage = () => { const t = (n) => {'
+      + ' try { return typeof self[n]; } catch (e) { return "ERR"; } };'
+      + ' const names = ' + JSON.stringify(names) + '; const o = {};'
+      + ' for (const n of names) { o[n] = t(n); } postMessage(o); };';
+    const w = new Worker(URL.createObjectURL(new Blob([src])));
+    out.worker = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), 5000);
+      w.onmessage = (e) => { clearTimeout(timer); resolve(e.data); };
+      w.onerror = () => { clearTimeout(timer); reject(new Error('worker-error')); };
+      w.postMessage(1);
+    });
+    w.terminate();
+  } catch (e) { out.worker = 'ERR:' + e.name + ':' + e.message; }
+  return out;
+}"""
+
+
 async def main() -> int:
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
@@ -552,6 +606,8 @@ async def main() -> int:
             sensor = await page.evaluate(SENSOR_JS)
             # 引擎面读数（全屏 / 视频 webkit 全屏 / WebKit CSS / 传感器构造器）
             engine = await page.evaluate(ENGINE_JS)
+            # 平台 API 差集读数（窗口/文档/navigator + Worker 全局）
+            platform = await page.evaluate(PLATFORM_JS)
 
             out = {
                 "target_os": target_os,
@@ -559,6 +615,7 @@ async def main() -> int:
                 "signals": signals,
                 "sensor": sensor,
                 "engine": engine,
+                "platform": platform,
                 "input_mouse_click_events": events_mouse,
                 "input_playwright_touchscreen_tap": tap_api,
                 "input_touch_tap_events": events_touch,

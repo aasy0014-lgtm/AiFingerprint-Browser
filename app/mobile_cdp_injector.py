@@ -51,7 +51,14 @@ import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
-from .mobile_fingerprints import _ANDROID_REMOVE_NAV_PROPS, _IOS_REMOVE_NAV_PROPS
+from .mobile_fingerprints import (
+    _ANDROID_REMOVE_GLOBALS,
+    _ANDROID_REMOVE_NAV_PROPS,
+    _ANDROID_REMOVE_WORKER_GLOBALS,
+    _IOS_REMOVE_GLOBALS,
+    _IOS_REMOVE_NAV_PROPS,
+    _IOS_REMOVE_WORKER_GLOBALS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +66,12 @@ log = logging.getLogger(__name__)
 # 清单唯一来源在指纹库（mobile_fingerprints），运行期与数据层共享，避免两处漂移。
 _IOS_REMOVE_PROPS = list(_IOS_REMOVE_NAV_PROPS)
 _ANDROID_REMOVE_PROPS = list(_ANDROID_REMOVE_NAV_PROPS)
+# 平台 API 差集（窗口/文档/navigator 按名删除）+ Worker 全局差集；
+# 清单与逐项 BCD 证据见 mobile_fingerprints 同名常量注释。
+_IOS_GLOBAL_DROPS = list(_IOS_REMOVE_GLOBALS)
+_ANDROID_GLOBAL_DROPS = list(_ANDROID_REMOVE_GLOBALS)
+_IOS_WORKER_DROPS = list(_IOS_REMOVE_WORKER_GLOBALS)
+_ANDROID_WORKER_DROPS = list(_ANDROID_REMOVE_WORKER_GLOBALS)
 
 # ---------------- 传感器面（Android 真机口径）----------------
 # 真机 Chrome Android 在注册 devicemotion/deviceorientation 监听后会收到持续
@@ -287,6 +300,23 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
         # 旧版指纹无该字段：按真机属性差异兜底（iOS Safari / Android Chrome）
         remove_props = (list(_IOS_REMOVE_PROPS) if target_os == "ios"
                         else list(_ANDROID_REMOVE_PROPS))
+    # 平台 API 差集：窗口/文档/navigator 三处按名删除 + Worker 全局差集。
+    # 同样支持指纹侧覆盖（mobileExtra.removeGlobals / removeWorkerGlobals），
+    # 缺省按平台事实展开；存量指纹无需重建。
+    if target_os == "ios":
+        remove_globals = extra.get("removeGlobals")
+        if remove_globals is None:
+            remove_globals = _IOS_GLOBAL_DROPS
+        remove_worker_globals = extra.get("removeWorkerGlobals")
+        if remove_worker_globals is None:
+            remove_worker_globals = _IOS_WORKER_DROPS
+    else:
+        remove_globals = extra.get("removeGlobals")
+        if remove_globals is None:
+            remove_globals = _ANDROID_GLOBAL_DROPS
+        remove_worker_globals = extra.get("removeWorkerGlobals")
+        if remove_worker_globals is None:
+            remove_worker_globals = _ANDROID_WORKER_DROPS
     # plugins/mimeTypes 恒为空：Android Chrome（构建开关 enable_pdf=!is_android）
     # 与 iOS WKWebView 都没有内置 PDF 插件体系。旧 Android 指纹里的
     # emptyPlugins=False 是历史遗留标记，不改变平台事实——运行期按平台收敛，
@@ -317,6 +347,8 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
         "uaCh": ua_ch,
         "battery": battery,
         "removeProps": list(remove_props),
+        "removeGlobals": list(remove_globals),
+        "removeWorkerGlobals": list(remove_worker_globals),
         "emptyPlugins": empty_plugins,
         "connectionType": connection_type,
         "ios": target_os == "ios",
@@ -423,10 +455,47 @@ _PATCH_TEMPLATE = r"""
         }
     })();
 
+    // 原生 DOM 属性 getter 由 C++ 实现，会校验接收者的内部槽（wrapper type）：
+    // 在缺少该槽的对象上调用——典型如
+    //   Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent')
+    //         .get.call(Object.create(navigator))
+    // ——必须抛 TypeError: Illegal invocation。JS 模拟 getter 若忽略 this 直接返回
+    // 闭包值，检测站点一眼就能看出这是人工模拟对象。
+    //
+    // JS 读不到内部槽，这里用原型链做等价判定：recv 合格 ⇔ proto 在其原型链上，
+    // 且 recv 到 proto 之间没有任何「实例」——中间每一环都必须是原型对象。
+    // （注意不能用 isPrototypeOf / instanceof：Object.create(navigator) 的原型链
+    //  经过 navigator 本身，两者都会误判为真。）
+    // 「X 是原型对象」⇔ X === proto，或 X.constructor.prototype === X。
+    var __isProtoObj = function (x, proto) {
+        if (x === proto) { return true; }
+        try {
+            var c = x.constructor;
+            if (typeof c === 'function' && c.prototype === x) { return true; }
+        } catch (e) {}
+        return false;
+    };
+    var __slotHas = function (proto, recv) {
+        if (recv === null || recv === undefined) { return false; }
+        var t = typeof recv;
+        if (t !== 'object' && t !== 'function') { return false; }
+        var x = recv;
+        for (var i = 0; i < 8; i++) {
+            try { x = Object.getPrototypeOf(x); } catch (e) { return false; }
+            if (x === proto) { return true; }
+            if (x === null || x === undefined) { return false; }
+            if (!__isProtoObj(x, proto)) { return false; }
+        }
+        return false;
+    };
     var defineGet = function (proto, name, value) {
         try {
+            var getter = __maskNative(function () {
+                if (!__slotHas(proto, this)) { throw new TypeError('Illegal invocation'); }
+                return value;
+            }, 'get ' + name);
             Object.defineProperty(proto, name, {
-                get: __maskNative(function () { return value; }, 'get ' + name),
+                get: getter,
                 enumerable: true,
                 configurable: true,
             });
@@ -1419,6 +1488,32 @@ _PATCH_TEMPLATE = r"""
             removeProp(drops[i]);
         }
 
+        // ---- 平台 API 差集：窗口/文档/navigator 三处按名删除 ----
+        // 桌面内核暴露、所属平台真机没有的整族 API（iOS 的通用传感器/
+        // 隐私沙盒/JS 专有面，Android 的桌面独有面）。逐项 BCD 证据见
+        // app/mobile_fingerprints.py 的 _*_REMOVE_GLOBALS；删除点覆盖
+        // window / Window.prototype / Document.prototype / document /
+        // Navigator.prototype / navigator，仍残留时按类兜底 getter=undefined。
+        var dropsG = D.removeGlobals || [];
+        for (var gi = 0; gi < dropsG.length; gi++) {
+            var gn = dropsG[gi];
+            try { delete window[gn]; } catch (e) {}
+            try { delete Window.prototype[gn]; } catch (e) {}
+            try { delete Document.prototype[gn]; } catch (e) {}
+            try { delete document[gn]; } catch (e) {}
+            try { delete Navigator.prototype[gn]; } catch (e) {}
+            try { delete navigator[gn]; } catch (e) {}
+            try {
+                if (gn in window) { defineGet(Window.prototype, gn, undefined); }
+            } catch (e) {}
+            try {
+                if (gn in document) { defineGet(Document.prototype, gn, undefined); }
+            } catch (e) {}
+            try {
+                if (gn in navigator) { defineGet(Navigator.prototype, gn, undefined); }
+            } catch (e) {}
+        }
+
         // ---- 无内置 PDF 插件的平台（iOS WKWebView / Android Chrome）----
         // iOS：Safari 的 plugins/mimeTypes 恒为空（无水印 PDF 插件体系）。
         // Android：Chrome 构建开关 enable_pdf=!is_android，同样为空。
@@ -1766,6 +1861,8 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "uaCh": spec.get("uaCh"),
         "battery": spec.get("battery"),
         "removeProps": list(spec.get("removeProps") or []),
+        "removeGlobals": list(spec.get("removeGlobals") or []),
+        "removeWorkerGlobals": list(spec.get("removeWorkerGlobals") or []),
         "emptyPlugins": bool(spec.get("emptyPlugins")),
         "connectionType": str(spec.get("connectionType") or ""),
         "ios": bool(spec.get("ios")),
@@ -1821,10 +1918,20 @@ _WORKER_PATCH_TEMPLATE = r"""
             return function (fn) { return fn; };
         }
     })();
+    var __slotHas = function (proto, recv) {
+        if (recv === null || recv === undefined) { return false; }
+        var t = typeof recv;
+        if (t !== 'object' && t !== 'function') { return false; }
+        try { return proto.isPrototypeOf(recv) === true; } catch (e) { return false; }
+    };
     var defineGet = function (proto, name, value) {
         try {
+            var getter = __maskNative(function () {
+                if (!__slotHas(proto, this)) { throw new TypeError('Illegal invocation'); }
+                return value;
+            }, 'get ' + name);
             Object.defineProperty(proto, name, {
-                get: __maskNative(function () { return value; }, 'get ' + name),
+                get: getter,
                 enumerable: true,
                 configurable: true,
             });
@@ -1855,6 +1962,33 @@ _WORKER_PATCH_TEMPLATE = r"""
             try { delete N[drops[i]]; } catch (e) {}
             try { delete navigator[drops[i]]; } catch (e) {}
             if (drops[i] in navigator) { defineGet(N, drops[i], undefined); }
+        }
+
+        // ---- 平台 API 差集（Worker 全局）：IdleDetector / WebSocketStream /
+        // ImageDecoder / FileSystemObserver / Scheduler 等内核 Worker 侧同样
+        // 暴露、但所属平台真机没有的构造器与命名空间对象 ----
+        // 实测（探针）：暂停态注入时全局对象上还没有这些接口对象，它们是在
+        // Worker 首脚本开始执行时才安装的——所以这里的删除只对「已运行后才
+        // 挂载」的 Worker（晚期挂载）生效；首脚本前的抹除由 _attach_worker 的
+        // beforeScriptExecution 插桩断点 + build_worker_drop_patch 完成。
+        var dropsW = D.removeWorkerGlobals || [];
+        var wsP = null;
+        try {
+            wsP = (typeof WorkerGlobalScope !== 'undefined' && WorkerGlobalScope.prototype)
+                ? WorkerGlobalScope.prototype : null;
+        } catch (e) {}
+        for (var wi = 0; wi < dropsW.length; wi++) {
+            var wn = dropsW[wi];
+            try { delete self[wn]; } catch (e) {}
+            if (wsP) { try { delete wsP[wn]; } catch (e) {} }
+            try {
+                if (wn in self) {
+                    Object.defineProperty(self, wn, {
+                        value: undefined, writable: true,
+                        enumerable: false, configurable: true,
+                    });
+                }
+            } catch (e) {}
         }
 
         // ---- iOS Safari：Worker 侧同样没有 performance.memory ----
@@ -1955,11 +2089,48 @@ def build_worker_patch(spec: Dict[str, Any]) -> str:
         "deviceMemory": spec.get("deviceMemory"),
         "uaCh": spec.get("uaCh"),
         "removeProps": list(spec.get("removeProps") or []),
+        "removeGlobals": list(spec.get("removeGlobals") or []),
+        "removeWorkerGlobals": list(spec.get("removeWorkerGlobals") or []),
         "connectionType": str(spec.get("connectionType") or ""),
         "ios": bool(spec.get("ios")),
         "webgpu": spec.get("webgpu"),
     }
     return _WORKER_PATCH_TEMPLATE.replace("__SPEC__", json.dumps(payload, ensure_ascii=False))
+
+
+def build_worker_drop_patch(drops: List[str]) -> str:
+    """Worker 全局差集的补删脚本（在「首脚本执行前」的插桩断点处执行）。
+
+    实测（探针 worker_global_probe.py）：Worker 全局对象上的接口对象
+    （FileSystemObserver / IdleDetector / WebSocketStream / ImageDecoder /
+    Scheduler / scheduler）在「暂停态注入」与「注入侧定时器」阶段都还不存在
+    —— 它们是在 Worker 首脚本开始执行时才安装的，此刻删除会落空、随后被
+    装回。因此：暂停态注入后挂 beforeScriptExecution 插桩断点，断点命中时
+    用本脚本补删（此刻接口已安装、脚本首行未执行），再放行。
+    """
+    return (
+        "(function () {\n"
+        "    var names = " + json.dumps(list(drops), ensure_ascii=False) + ";\n"
+        "    var wsP = null;\n"
+        "    try {\n"
+        "        wsP = (typeof WorkerGlobalScope !== 'undefined' && WorkerGlobalScope.prototype)\n"
+        "            ? WorkerGlobalScope.prototype : null;\n"
+        "    } catch (e) {}\n"
+        "    for (var i = 0; i < names.length; i++) {\n"
+        "        var n = names[i];\n"
+        "        try { delete self[n]; } catch (e) {}\n"
+        "        if (wsP) { try { delete wsP[n]; } catch (e) {} }\n"
+        "        try {\n"
+        "            if (n in self) {\n"
+        "                Object.defineProperty(self, n, {\n"
+        "                    value: undefined, writable: true,\n"
+        "                    enumerable: false, configurable: true,\n"
+        "                });\n"
+        "            }\n"
+        "        } catch (e) {}\n"
+        "    }\n"
+        "})();\n"
+    )
 
 
 class MobileEmulationSession:
@@ -2015,6 +2186,10 @@ class MobileEmulationSession:
                 # 只服务 Android/iOS，PDF 面与桌面独有 API 都要收敛）
                 "removeProps": (list(_IOS_REMOVE_PROPS) if target_os == "ios"
                                 else list(_ANDROID_REMOVE_PROPS)),
+                "removeGlobals": (list(_IOS_GLOBAL_DROPS) if target_os == "ios"
+                                  else list(_ANDROID_GLOBAL_DROPS)),
+                "removeWorkerGlobals": (list(_IOS_WORKER_DROPS) if target_os == "ios"
+                                        else list(_ANDROID_WORKER_DROPS)),
                 "emptyPlugins": True,
                 "connectionType": "wifi" if target_os == "android" else None,
                 "ios": target_os == "ios", "iosChrome": None, "webgl": None, "webgpu": None,
@@ -2037,6 +2212,9 @@ class MobileEmulationSession:
         self._ids = itertools.count(1)
         self._pending: dict[int, asyncio.Future] = {}
         self._applied_targets: set[str] = set()
+        # Worker 全局差集补删：sessionId → 待补删名单（客户端问 beforeScriptExecution
+        # 断点命中后消费）。见 _attach_worker / _worker_drop_apply。
+        self._worker_drop_waiters: dict[str, list] = {}
         self._attach_tasks: dict[str, asyncio.Task] = {}
         self._first_page_session: Optional[str] = None
         # Accept-CH：CDP session → {源: 该源已声明的高熵提示}（Fetch 域回送）
@@ -2152,6 +2330,16 @@ class MobileEmulationSession:
                                 err.get("data")))
                         else:
                             fut.set_result(msg.get("result") or {})
+                elif msg.get("method") == "Debugger.paused":
+                    # Worker 全局差集补删的插桩断点（脚本执行前）：
+                    # 只消费我们自己下的 beforeScriptExecution；
+                    # 其它来源的暂停（用户断点）一概不介入。
+                    params = msg.get("params") or {}
+                    sid_evt = msg.get("sessionId") or ""
+                    drops = self._worker_drop_waiters.get(sid_evt)
+                    if drops is not None and params.get("reason") == "instrumentation":
+                        self._worker_drop_waiters.pop(sid_evt, None)
+                        asyncio.create_task(self._worker_drop_apply(sid_evt, drops))
                 elif msg.get("method") == "Target.attachedToTarget":
                     params = msg.get("params") or {}
                     info = params.get("targetInfo") or {}
@@ -2366,6 +2554,12 @@ class MobileEmulationSession:
         内存桶）、userAgentData（桌面 Linux 元数据）全部穿帮。Worker 无法
         使用 Page.addScriptToEvaluateOnNewDocument；目标正被门控暂停时，
         Runtime.evaluate 即为「首行代码执行前」的注入点（实测 1-2ms）。
+
+        平台 API 差集（removeWorkerGlobals）另需一条链路：Worker 全局对象上
+        的接口对象在「首脚本开始执行」时才安装（暂停态与注入侧定时器阶段实测
+        都读不到），暂停态删除会落空、随后被装回。因此额外挂
+        beforeScriptExecution 插桩断点，断点在脚本首行前命中时补删（见
+        build_worker_drop_patch），补删完成后立即关闭 Debugger 并放行。
         """
         if not target_id or not session_id:
             return
@@ -2374,6 +2568,7 @@ class MobileEmulationSession:
             return
         self._applied_targets.add(target_id)
         patch = build_worker_patch(self.spec)
+        drops = list(self.spec.get("removeWorkerGlobals") or [])
         injected = False
         try:
             await self._send("Runtime.evaluate", {"expression": patch},
@@ -2381,14 +2576,40 @@ class MobileEmulationSession:
             injected = True
         except (CDPError, asyncio.TimeoutError):
             pass
-        finally:
-            await self._resume(session_id)
+        if drops and injected:
+            # 插桩断点：命中「脚本执行前」再补删一次全局差集。
+            try:
+                await self._send("Debugger.enable", {},
+                                 session_id=session_id, timeout=3.0)
+                await self._send("Debugger.setInstrumentationBreakpoint",
+                                 {"instrumentation": "beforeScriptExecution"},
+                                 session_id=session_id, timeout=3.0)
+                self._worker_drop_waiters[session_id] = drops
+            except (CDPError, asyncio.TimeoutError):
+                # 断点链路不可用（老内核）：退回暂停态补删（已在上面的补丁里执行）。
+                # 极小竞态窗口（首行可能读到未抹除的构造器）记入边界。
+                with contextlib.suppress(CDPError, asyncio.TimeoutError):
+                    await self._send("Debugger.disable", {},
+                                     session_id=session_id, timeout=3.0)
+        await self._resume(session_id)
         if not injected:
             # 暂停态不受理 Runtime 命令时（理论上不会）：放行后补一次，
             # 极小竞态窗口（Worker 首行可能已读取原生值）
             with contextlib.suppress(CDPError, asyncio.TimeoutError):
                 await self._send("Runtime.evaluate", {"expression": patch},
                                  session_id=session_id, timeout=3.0)
+
+    async def _worker_drop_apply(self, session_id: str, drops: list) -> None:
+        """插桩断点命中（Worker 首脚本执行前）时补删全局差集，然后放行脚本。"""
+        with contextlib.suppress(CDPError, asyncio.TimeoutError):
+            await self._send("Runtime.evaluate",
+                             {"expression": build_worker_drop_patch(drops)},
+                             session_id=session_id, timeout=3.0)
+        # 关掉 Debugger（释放暂停）后不再介入该 Worker 的后续脚本。
+        with contextlib.suppress(CDPError, asyncio.TimeoutError):
+            await self._send("Debugger.disable", {}, session_id=session_id, timeout=3.0)
+        with contextlib.suppress(CDPError, asyncio.TimeoutError):
+            await self._send("Debugger.resume", {}, session_id=session_id, timeout=3.0)
 
     # ---------------- Accept-CH 高熵头回送 ----------------
 

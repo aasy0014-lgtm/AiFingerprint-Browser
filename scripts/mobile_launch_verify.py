@@ -462,6 +462,44 @@ STATE_JS = """async () => {
                     nodeSnapshotGlobal: typeof window.WebKitNodeSnapshot,
                 };
             })(),
+            // ---- 平台 API 差集（桌面内核会暴露、所属平台真机没有的 API）----
+            // 读数 = [typeof, 名字是否仍 in 对象]；断言在下方按平台裁定。
+            plat: (() => {
+                const t = (obj, n) => { try { return typeof obj[n]; } catch (e) { return 'ERR'; } };
+                const has = (obj, n) => { try { return n in obj; } catch (e) { return 'ERR'; } };
+                const read = (obj, names) => {
+                    const o = {};
+                    for (const n of names) { o[n] = [t(obj, n), has(obj, n)]; }
+                    return o;
+                };
+                return {
+                    // iOS 差集清单（同时用于 Android 的「必须保留」断言）
+                    win: read(window, ['Sensor', 'SensorErrorEvent', 'Accelerometer',
+                        'Gyroscope', 'LinearAccelerationSensor', 'GravitySensor',
+                        'AbsoluteOrientationSensor', 'RelativeOrientationSensor',
+                        'EyeDropper', 'IdleDetector', 'WebSocketStream', 'ImageDecoder',
+                        'FileSystemObserver', 'queryLocalFonts',
+                        'documentPictureInPicture', 'launchQueue', 'Scheduler',
+                        'scheduler', 'OTPCredential', 'Ink', 'MediaStreamTrackGenerator',
+                        'sharedStorage', 'SharedStorage', 'fence', 'Fence',
+                        'HTMLFencedFrameElement', 'showSaveFilePicker',
+                        'showDirectoryPicker']),
+                    doc: read(document, ['browsingTopics']),
+                    nav: read(navigator, ['xr', 'virtualKeyboard', 'ink',
+                        'runAdAuction', 'joinAdInterestGroup', 'leaveAdInterestGroup',
+                        'deprecatedReplaceInURN', 'updateAdInterestGroups',
+                        'protectedAudience']),
+                    // 双平台真机都存在、必须保持的面（防误删）
+                    kept: read(window, ['VideoDecoder', 'VideoFrame', 'AudioDecoder',
+                        'EncodedAudioChunk', 'URLPattern', 'Highlight', 'BarcodeDetector',
+                        'ImageCapture', 'MediaStreamTrackProcessor', 'navigation', 'GPU',
+                        'FileSystemHandle', 'FileSystemFileHandle',
+                        'FileSystemDirectoryHandle', 'FileSystemWritableFileStream']),
+                    keptDoc: read(document, ['startViewTransition', 'hasStorageAccess',
+                        'requestStorageAccess', 'fragmentDirective']),
+                    keptNav: read(navigator, ['share', 'canShare', 'wakeLock', 'gpu']),
+                };
+            })(),
         },
         ownProps: Object.getOwnPropertyNames(nav).filter((n) =>
             ['platform','userAgent','maxTouchPoints','mobile','deviceMemory',
@@ -618,7 +656,9 @@ try {
   var code = 'postMessage({early: navigator.platform, uaP: navigator.userAgentData ? navigator.userAgentData.platform : null});'
     + 'setTimeout(function () { postMessage({late: navigator.platform, devMem: navigator.deviceMemory,'
     + ' connType: (navigator.connection && ("type" in navigator.connection)) ? navigator.connection.type : "<none>",'
-    + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null}); }, 300);';
+    + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null'
+    + ' , platW: (function () { var ns = ["IdleDetector","WebSocketStream","ImageDecoder","FileSystemObserver","Scheduler","scheduler","VideoDecoder","BarcodeDetector","URLPattern","WebGL2RenderingContext"];'
+    + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()}); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.workerData = {};
   w.onmessage = function (ev) { for (var k in ev.data) { window.workerData[k] = ev.data[k]; } };
@@ -661,7 +701,9 @@ try {
   var code = 'postMessage({early: navigator.platform});'
     + 'setTimeout(function () { postMessage({late: navigator.platform, devMem: navigator.deviceMemory,'
     + ' connType: (navigator.connection && ("type" in navigator.connection)) ? navigator.connection.type : "<none>",'
-    + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null}); }, 300);';
+    + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null'
+    + ' , platW: (function () { var ns = ["IdleDetector","WebSocketStream","ImageDecoder","FileSystemObserver","Scheduler","scheduler","VideoDecoder","BarcodeDetector","URLPattern","WebGL2RenderingContext"];'
+    + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()}); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.__workerData = {};
   w.onmessage = function (ev) { for (var k in ev.data) { window.__workerData[k] = ev.data[k]; } };
@@ -1402,6 +1444,7 @@ async def main() -> int:
     # ---- 引擎面「一行判假」信号（iOS 批次）----
     eng = state.get("engine") or {}
     ns = eng.get("ns") or {}
+    plat = eng.get("plat") or {}
     aig_mag = _sensor_magnitude(last_motion.get("aig"))
     lin_mag = _sensor_magnitude(last_motion.get("acc"))
     gyro_mag = _sensor_magnitude(last_motion.get("rr"))
@@ -1564,6 +1607,43 @@ async def main() -> int:
             "引擎面：无 WebKitNamespace 家族接口对象": (
                 ns.get("WN") is None and ns.get("UH") is None and ns.get("UM") is None
                 and ns.get("wkType") == "undefined"),
+            # ---- 平台 API 差集（桌面独有面收敛；BCD chrome_android=false）----
+            "平台API：桌面独有面缺席（EyeDropper/queryLocalFonts/documentPiP/launchQueue/FileSystemObserver）": (
+                all((plat.get("win") or {}).get(n) == ["undefined", False]
+                    for n in ("EyeDropper", "FileSystemObserver", "queryLocalFonts",
+                              "documentPictureInPicture", "launchQueue"))),
+            "平台API：Android 真机存在面保持（传感器家族）": (
+                all((plat.get("win") or {}).get(n) == ["function", True]
+                    for n in ("Sensor", "SensorErrorEvent", "Accelerometer", "Gyroscope",
+                              "LinearAccelerationSensor", "GravitySensor",
+                              "AbsoluteOrientationSensor", "RelativeOrientationSensor"))),
+            "平台API：Android 真机存在面保持（Chromium 专有族与 FSA 选择器）": (
+                all((plat.get("win") or {}).get(n) == ["function", True]
+                    for n in ("IdleDetector", "WebSocketStream", "ImageDecoder",
+                              "OTPCredential", "Ink", "MediaStreamTrackGenerator",
+                              "Fence", "HTMLFencedFrameElement",
+                              "showSaveFilePicker", "showDirectoryPicker"))
+                and (plat.get("win") or {}).get("sharedStorage") == ["object", True]
+                and (plat.get("win") or {}).get("Scheduler") == ["function", True]
+                and (plat.get("win") or {}).get("scheduler") == ["object", True]
+                and (plat.get("doc") or {}).get("browsingTopics") == ["function", True]
+                and all((plat.get("nav") or {}).get(n) == ["function", True]
+                        for n in ("runAdAuction", "joinAdInterestGroup",
+                                  "leaveAdInterestGroup", "deprecatedReplaceInURN",
+                                  "updateAdInterestGroups"))
+                and all((plat.get("nav") or {}).get(n) == ["object", True]
+                        for n in ("xr", "virtualKeyboard", "ink"))
+                and (plat.get("nav") or {}).get("protectedAudience") == ["object", True]),
+            "平台API：Worker 侧同名差集（FileSystemObserver 缺席、其余保持）": (
+                (wk_main.get("platW") or {}).get("FileSystemObserver") == "undefined"
+                and all((wk_main.get("platW") or {}).get(n) == "function"
+                        for n in ("IdleDetector", "WebSocketStream", "ImageDecoder",
+                                  "Scheduler", "VideoDecoder", "BarcodeDetector",
+                                  "URLPattern", "WebGL2RenderingContext"))
+                and (wk_main.get("platW") or {}).get("scheduler") == "object"),
+            "平台API：跨域 iframe Worker 同口径": (
+                (fr_worker.get("platW") or {}).get("FileSystemObserver") == "undefined"
+                and (fr_worker.get("platW") or {}).get("IdleDetector") == "function"),
         })
     else:
         is_ios_chrome = extra.get("browser") == "chrome_ios"
@@ -1609,6 +1689,59 @@ async def main() -> int:
                 wg.get("hasGpu") is True and wg.get("vendor") == "apple"),
             # ---- iOS 两口径通用：普通页面无 window.chrome（报告 §4.4 / B1-5）----
             "window.chrome 为 undefined（iOS 普通页面无该对象）": state["hasChromeObj"] is False,
+            # ---- 平台 API 差集（Chromium 专有面收敛；BCD safari_ios=false）----
+            # 通用传感器 API：WebKit 从未实现（真机一行判假面）
+            "平台API：传感器家族整块缺席（WebKit 无通用传感器 API）": (
+                all((plat.get("win") or {}).get(n) == ["undefined", False]
+                    for n in ("Sensor", "SensorErrorEvent", "Accelerometer", "Gyroscope",
+                              "LinearAccelerationSensor", "GravitySensor",
+                              "AbsoluteOrientationSensor", "RelativeOrientationSensor"))),
+            "平台API：Chromium 专有族缺席（EyeDropper/IdleDetector/WebSocketStream/ImageDecoder/…）": (
+                all((plat.get("win") or {}).get(n) == ["undefined", False]
+                    for n in ("EyeDropper", "IdleDetector", "WebSocketStream", "ImageDecoder",
+                              "FileSystemObserver", "queryLocalFonts",
+                              "documentPictureInPicture", "launchQueue", "Scheduler",
+                              "scheduler", "OTPCredential", "Ink",
+                              "MediaStreamTrackGenerator"))),
+            "平台API：隐私沙盒与 FSA 选择器缺席（sharedStorage/fence/Topics/PA 面）": (
+                all((plat.get("win") or {}).get(n) == ["undefined", False]
+                    for n in ("sharedStorage", "SharedStorage", "fence", "Fence",
+                              "HTMLFencedFrameElement", "showSaveFilePicker",
+                              "showDirectoryPicker"))),
+            "平台API：document.browsingTopics 与 navigator 广告/XR/VirtualKeyboard 面缺席": (
+                (plat.get("doc") or {}).get("browsingTopics") == ["undefined", False]
+                and all((plat.get("nav") or {}).get(n) == ["undefined", False]
+                        for n in ("xr", "virtualKeyboard", "ink", "runAdAuction",
+                                  "joinAdInterestGroup", "leaveAdInterestGroup",
+                                  "deprecatedReplaceInURN", "updateAdInterestGroups",
+                                  "protectedAudience"))),
+            "平台API：真机存在面保持（WebCodecs/URLPattern/BarcodeDetector/全屏外引擎面）": (
+                all((plat.get("kept") or {}).get(n) == ["function", True]
+                    for n in ("VideoDecoder", "VideoFrame", "AudioDecoder",
+                              "EncodedAudioChunk", "URLPattern", "Highlight",
+                              "BarcodeDetector", "ImageCapture",
+                              "MediaStreamTrackProcessor", "GPU",
+                              "FileSystemHandle", "FileSystemFileHandle",
+                              "FileSystemDirectoryHandle", "FileSystemWritableFileStream"))
+                and (plat.get("kept") or {}).get("navigation") == ["object", True]
+                and all((plat.get("keptDoc") or {}).get(n) == ["function", True]
+                        for n in ("startViewTransition", "hasStorageAccess",
+                                  "requestStorageAccess"))
+                and all((plat.get("keptNav") or {}).get(n) == ["function", True]
+                        for n in ("share", "canShare"))
+                and all((plat.get("keptNav") or {}).get(n) == ["object", True]
+                        for n in ("wakeLock", "gpu"))),
+            "平台API：Worker 侧差集（IdleDetector/WebSocketStream/ImageDecoder/Scheduler 缺席）": (
+                all((wk_main.get("platW") or {}).get(n) == "undefined"
+                    for n in ("IdleDetector", "WebSocketStream", "ImageDecoder",
+                              "FileSystemObserver", "Scheduler", "scheduler"))
+                and all((wk_main.get("platW") or {}).get(n) == "function"
+                        for n in ("VideoDecoder", "BarcodeDetector", "URLPattern",
+                                  "WebGL2RenderingContext"))),
+            "平台API：跨域 iframe Worker 同口径": (
+                (fr_worker.get("platW") or {}).get("IdleDetector") == "undefined"
+                and (fr_worker.get("platW") or {}).get("Scheduler") == "undefined"
+                and (fr_worker.get("platW") or {}).get("VideoDecoder") == "function"),
             # ---- 传感器权限面（WebKit 专有）：requestPermission 与授权语义 ----
             "传感器：requestPermission 存在（iOS 14.5+ 专有静态方法）": (
                 rp.get("motion") == "function" and rp.get("orientation") == "function"),
