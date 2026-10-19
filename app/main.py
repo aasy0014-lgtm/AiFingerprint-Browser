@@ -262,6 +262,7 @@ def _serialize_profile(p: dict, full: bool = False) -> dict:
         "launch": p["launch"],
         "fingerprint_summary": summarize(p["fingerprint"]),
         "running": manager.is_running(p["id"]),
+        "emulation": manager.emulation_state(p["id"]),
         "owner": p.get("owner", "admin"),
         "start_count": p.get("start_count", 0),
         "last_started_at": p.get("last_started_at"),

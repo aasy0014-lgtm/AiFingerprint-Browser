@@ -194,6 +194,96 @@ STATE_JS = """async () => {
         pdfViewerValue: nav.pdfViewerEnabled,
         connTypeIn: !!(nav.connection && ('type' in nav.connection)),
         connType: (nav.connection && ('type' in nav.connection)) ? nav.connection.type : null,
+        // ---- NetworkInformation 值域（P2-6）：downlinkMax 与 ontypechange ----
+        connDownlinkMax: (nav.connection && ('downlinkMax' in nav.connection))
+            ? nav.connection.downlinkMax : '<absent>',
+        connDownlinkMaxType: (nav.connection && ('downlinkMax' in nav.connection))
+            ? typeof nav.connection.downlinkMax : '<absent>',
+        connOnTypeIn: !!(nav.connection && ('ontypechange' in nav.connection)),
+        connOnTypeDefault: (nav.connection && ('ontypechange' in nav.connection))
+            ? nav.connection.ontypechange : '<absent>',
+        connOnTypeDesc: (function () {
+            if (!nav.connection || !('ontypechange' in nav.connection)) { return null; }
+            var d = Object.getOwnPropertyDescriptor(NetworkInformation.prototype, 'ontypechange');
+            return d ? {get: !!d.get, set: !!d.set, enum: d.enumerable, cfg: d.configurable} : null;
+        })(),
+        connOnTypeRoundTrip: (function () {
+            if (!nav.connection || !('ontypechange' in nav.connection)) { return null; }
+            var fn = function () {};
+            try {
+                nav.connection.ontypechange = fn;
+                var ok = nav.connection.ontypechange === fn;
+                nav.connection.ontypechange = null;
+                return ok && nav.connection.ontypechange === null;
+            } catch (e) { return false; }
+        })(),
+        // ---- 媒体编解码能力表（P1-3）：真机 iOS 无 ogg/webm，HEVC 走 hvc1 ----
+        canPlay: (function () {
+            var a = document.createElement('audio');
+            var v = document.createElement('video');
+            var probe = function (t) {
+                try { return (/^audio\//i.test(t) ? a : v).canPlayType(t); }
+                catch (e) { return 'ERR'; }
+            };
+            return {
+                ogg: probe('audio/ogg'),
+                oggVorbis: probe('audio/ogg; codecs="vorbis"'),
+                oggOpus: probe('audio/ogg; codecs="opus"'),
+                webm: probe('video/webm'),
+                webmVp8: probe('video/webm; codecs="vp8"'),
+                webmVp9: probe('video/webm; codecs="vp09.00.10.08"'),
+                videoOgg: probe('video/ogg'),
+                hvc1: probe('video/mp4; codecs="hvc1"'),
+                hvc1Full: probe('video/mp4; codecs="hvc1.1.6.L93.B0"'),
+                hev1: probe('video/mp4; codecs="hev1"'),
+                mp4Avc: probe('video/mp4; codecs="avc1.42E01E"'),
+                upperCase: probe('AUDIO/OGG; CODECS="Vorbis"'),
+                native: nativeStr(HTMLMediaElement.prototype.canPlayType),
+                length: HTMLMediaElement.prototype.canPlayType.length,
+                illegal: (function () {
+                    try { HTMLMediaElement.prototype.canPlayType.call({}, 'audio/mp4'); return 'no-throw'; }
+                    catch (e) { return e.name; }
+                })(),
+            };
+        })(),
+        // ---- WebGL 参数上限与扩展集（P2-1）：桌面专属扩展必须缺席 ----
+        webglSurface: (function () {
+            var o = {extCount: null, exts: null, limits: {}, getExtS3tc: null,
+                     getExtCaseInsensitive: null, unknownEnum: '<n/a>',
+                     getParamLength: null, badReceiver: null};
+            try {
+                var g = document.createElement('canvas').getContext('webgl');
+                if (!g) { return o; }
+                var exts = g.getSupportedExtensions() || [];
+                o.extCount = exts.length;
+                o.exts = exts;
+                o.getExtS3tc = g.getExtension('WEBGL_compressed_texture_s3tc');
+                o.getExtCaseInsensitive = g.getExtension('webgl_compressed_texture_S3TC');
+                o.getExtAstc = !!g.getExtension('WEBGL_compressed_texture_astc');
+                var P = function (n) {
+                    try { var v = g.getParameter(g[n]); return (v && v.length !== undefined) ? Array.from(v) : v; }
+                    catch (e) { return 'ERR'; }
+                };
+                ['MAX_TEXTURE_SIZE', 'MAX_RENDERBUFFER_SIZE', 'MAX_VIEWPORT_DIMS',
+                 'MAX_VERTEX_ATTRIBS', 'ALIASED_POINT_SIZE_RANGE'].forEach(function (n) {
+                    o.limits[n] = P(n);
+                });
+                o.unknownEnum = g.getParameter(0x1234);
+                o.getParamLength = WebGLRenderingContext.prototype.getParameter.length;
+                o.getExtListLength = WebGLRenderingContext.prototype.getSupportedExtensions.length;
+                o.badReceiver = (function () {
+                    try { WebGLRenderingContext.prototype.getParameter.call({}, 3379); return 'no-throw'; }
+                    catch (e) { return e.name; }
+                })();
+                var g2 = document.createElement('canvas').getContext('webgl2');
+                if (g2) {
+                    var e2 = g2.getSupportedExtensions() || [];
+                    o.gl2ExtCount = e2.length;
+                    o.gl2HasS3tc = e2.some(function (x) { return /s3tc/i.test(x); });
+                }
+            } catch (e) { o.error = String(e); }
+            return o;
+        })(),
         // ---- iOS WebKit 专有手势事件家族（Chromium 全平台无）----
         hasGestureEvent: typeof window.GestureEvent === 'function',
         hasGestureHandler: 'ongesturestart' in window,
@@ -666,6 +756,31 @@ STATE_JS = """async () => {
         } catch (e) { return { error: String(e) }; }
     })();
     out.webgl = gl;
+    // ---- 媒体查询面（全平台）：CDP setDeviceMetricsOverride(mobile=True) 的
+    // 触控/悬停语义。仿真通道断开（内核还原全部 Emulation 覆盖）时立即回落
+    // 宿主桌面值 pointer:fine / hover:hover —— 检测报告 12 项的共同根因。----
+    out.mediaQueries = (function () {
+        var q = function (s) { try { return matchMedia(s).matches; } catch (e) { return null; } };
+        return {
+            pointerCoarse: q('(pointer: coarse)'),
+            pointerFine: q('(pointer: fine)'),
+            hoverNone: q('(hover: none)'),
+            hoverHover: q('(hover: hover)'),
+            anyPointerCoarse: q('(any-pointer: coarse)'),
+            anyHoverNone: q('(any-hover: none)'),
+        };
+    })();
+    // ---- 音频采样率：真机 OfflineAudioContext 采样率恒为精确整数；内核
+    // audio 伪装会按种子微扰（实测宿主 44100 → 伪装 44100.01171875），
+    // 移动端已强制 --disable-spoofing=audio 回到真机口径。----
+    out.audioSampleRate = (function () {
+        var r = {};
+        try { r.s44100 = new OfflineAudioContext(1, 64, 44100).sampleRate; }
+        catch (e) { r.s44100 = null; }
+        try { r.s48000 = new OfflineAudioContext(1, 64, 48000).sampleRate; }
+        catch (e) { r.s48000 = null; }
+        return r;
+    })();
     return out;
 }"""
 
@@ -708,6 +823,19 @@ try {
     + 'setTimeout(function () { postMessage({late: navigator.platform, devMem: navigator.deviceMemory,'
     + ' connType: (navigator.connection && ("type" in navigator.connection)) ? navigator.connection.type : "<none>",'
     + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null'
+    + ' , connDlMax: (navigator.connection && ("downlinkMax" in navigator.connection)) ? navigator.connection.downlinkMax : "<absent>"'
+    + ' , connOnType: (navigator.connection && ("ontypechange" in navigator.connection)) ? (navigator.connection.ontypechange === null ? "null" : typeof navigator.connection.ontypechange) : "<absent>"'
+    + ' , glRenderer: (function () { try { var g = new OffscreenCanvas(8, 8).getContext("webgl");'
+    + ' var d = g && g.getExtension("WEBGL_debug_renderer_info");'
+    + ' return d ? [g.getParameter(d.UNMASKED_VENDOR_WEBGL), g.getParameter(d.UNMASKED_RENDERER_WEBGL)] : null;'
+    + ' } catch (e) { return "ERR"; } })()'
+    + ' , glExt: (function () { try { var g = new OffscreenCanvas(8, 8).getContext("webgl");'
+    + ' if (!g) { return null; } var e = g.getSupportedExtensions() || [];'
+    + ' return {count: e.length, s3tc: e.some(function (x) { return /s3tc/i.test(x); }),'
+    + ' bptc: e.some(function (x) { return /bptc/i.test(x); }),'
+    + ' polygon: e.some(function (x) { return /polygon_mode/i.test(x); }),'
+    + ' timer: e.some(function (x) { return /disjoint_timer_query/i.test(x); }),'
+    + ' maxTex: g.getParameter(g.MAX_TEXTURE_SIZE)}; } catch (e) { return "ERR"; } })()'
     + ' , platW: (function () { var ns = ["IdleDetector","WebSocketStream","ImageDecoder","FileSystemObserver","Scheduler","scheduler","VideoDecoder","BarcodeDetector","URLPattern","WebGL2RenderingContext"];'
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()}); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
@@ -753,6 +881,19 @@ try {
     + 'setTimeout(function () { postMessage({late: navigator.platform, devMem: navigator.deviceMemory,'
     + ' connType: (navigator.connection && ("type" in navigator.connection)) ? navigator.connection.type : "<none>",'
     + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null'
+    + ' , connDlMax: (navigator.connection && ("downlinkMax" in navigator.connection)) ? navigator.connection.downlinkMax : "<absent>"'
+    + ' , connOnType: (navigator.connection && ("ontypechange" in navigator.connection)) ? (navigator.connection.ontypechange === null ? "null" : typeof navigator.connection.ontypechange) : "<absent>"'
+    + ' , glRenderer: (function () { try { var g = new OffscreenCanvas(8, 8).getContext("webgl");'
+    + ' var d = g && g.getExtension("WEBGL_debug_renderer_info");'
+    + ' return d ? [g.getParameter(d.UNMASKED_VENDOR_WEBGL), g.getParameter(d.UNMASKED_RENDERER_WEBGL)] : null;'
+    + ' } catch (e) { return "ERR"; } })()'
+    + ' , glExt: (function () { try { var g = new OffscreenCanvas(8, 8).getContext("webgl");'
+    + ' if (!g) { return null; } var e = g.getSupportedExtensions() || [];'
+    + ' return {count: e.length, s3tc: e.some(function (x) { return /s3tc/i.test(x); }),'
+    + ' bptc: e.some(function (x) { return /bptc/i.test(x); }),'
+    + ' polygon: e.some(function (x) { return /polygon_mode/i.test(x); }),'
+    + ' timer: e.some(function (x) { return /disjoint_timer_query/i.test(x); }),'
+    + ' maxTex: g.getParameter(g.MAX_TEXTURE_SIZE)}; } catch (e) { return "ERR"; } })()'
     + ' , platW: (function () { var ns = ["IdleDetector","WebSocketStream","ImageDecoder","FileSystemObserver","Scheduler","scheduler","VideoDecoder","BarcodeDetector","URLPattern","WebGL2RenderingContext"];'
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()}); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
@@ -1160,6 +1301,115 @@ async def race_test(ws_endpoint: str) -> dict:
     return probe
 
 
+HEAL_PROBE_JS = (
+    "(() => ({ touch: navigator.maxTouchPoints,"
+    " uaMobile: /Android|iPhone/.test(navigator.userAgent),"
+    " coarse: matchMedia('(pointer: coarse)').matches,"
+    " plat: (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform }))()"
+)
+
+
+async def heal_test(manager, profile_id: str, ws_endpoint: str) -> dict:
+    """断线自愈回归：仿真通道静默断开 → 看门狗自动重连 → 全页面重放。
+
+    复现事故形态（检测站 12 项失真的共同根因）：CDP 连接断开后内核会还原
+    全部 Emulation 覆盖、文档起点补丁脚本随之失效，此后打开的标签页完全
+    裸奔（宿主 GPU / maxTouchPoints=0 / pointer:fine）；已存在文档只剩 JS
+    层补丁，媒体查询回落宿主值。看门狗必须在秒级自动重连，并把仿真与补丁
+    重新覆盖到所有已存在页面（含断线期间新开的标签页）。
+    """
+    import itertools
+
+    import websockets
+
+    out: dict = {"state_before": manager.emulation_state(profile_id)}
+    inst = manager.get_instance(profile_id)
+    sess = (getattr(inst, "extra", None) or {}).get("mobile_session") if inst else None
+    if sess is None or not hasattr(sess, "_watchdog"):
+        out["error"] = "未找到带看门狗的移动仿真会话"
+        return out
+
+    # 断开：模拟通道静默死亡。读循环立即标记不健康（看门狗 1s 内进入重连）
+    await sess._ws.close()
+    await asyncio.sleep(0.1)
+    out["state_down"] = manager.emulation_state(profile_id)
+
+    async with websockets.connect(ws_endpoint, max_size=64 * 1024 * 1024,
+                                  ping_interval=None) as ws:
+        ids = itertools.count(1)
+        pending: dict = {}
+
+        async def reader():
+            async for raw in ws:
+                msg = json.loads(raw)
+                mid = msg.get("id")
+                fut = pending.pop(mid, None) if mid is not None else None
+                if fut and not fut.done():
+                    fut.set_result(msg)
+
+        rt = asyncio.create_task(reader())
+
+        async def send(method: str, params: dict | None = None,
+                       sid: str | None = None, timeout: float = 6.0) -> dict:
+            mid = next(ids)
+            msg: dict = {"id": mid, "method": method}
+            if params:
+                msg["params"] = params
+            if sid:
+                msg["sessionId"] = sid
+            fut = asyncio.get_running_loop().create_future()
+            pending[mid] = fut
+            await ws.send(json.dumps(msg))
+            try:
+                return await asyncio.wait_for(fut, timeout)
+            except asyncio.TimeoutError:
+                return {"__timeout__": True}
+
+        async def read_page(target_id: str) -> dict:
+            at = await send("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+            sid = (at.get("result") or {}).get("sessionId")
+            if not sid:
+                return {}
+            try:
+                # 其他客户端（Playwright / 会话）可能把新目标门控在暂停态
+                await send("Runtime.runIfWaitingForDebugger", {}, sid=sid, timeout=2.0)
+                r = await send("Runtime.evaluate",
+                               {"expression": HEAL_PROBE_JS, "returnByValue": True},
+                               sid=sid, timeout=3.0)
+                return (((r.get("result") or {}).get("result")) or {}).get("value") or {}
+            finally:
+                await send("Target.detachFromTarget", {"sessionId": sid}, timeout=2.0)
+
+        try:
+            # 断线期间新开标签页：此刻无门控、无补丁 → 裸奔（事故形态）
+            res = await send("Target.createTarget", {"url": "about:blank"})
+            outage_tid = (res.get("result") or {}).get("targetId") or ""
+            out["outage_bare"] = await read_page(outage_tid) if outage_tid else {}
+
+            # 等看门狗重连（探活间隔 10s 上限 + 连接耗时）
+            for _ in range(40):
+                await asyncio.sleep(0.5)
+                if sess.healthy:
+                    break
+            out["healthy"] = bool(sess.healthy)
+            out["reconnects"] = int(getattr(sess, "reconnect_count", 0))
+            out["state_after"] = manager.emulation_state(profile_id)
+            await asyncio.sleep(0.5)
+            out["outage_healed"] = await read_page(outage_tid) if outage_tid else {}
+            tl = (await send("Target.getTargets")).get("result", {}).get("targetInfos", [])
+            healed_main: dict = {}
+            for t in tl:
+                if t.get("type") == "page" and t.get("targetId") != outage_tid:
+                    healed_main = await read_page(t["targetId"])
+                    break
+            out["main_healed"] = healed_main
+            if outage_tid:
+                await send("Target.closeTarget", {"targetId": outage_tid}, timeout=2.0)
+        finally:
+            rt.cancel()
+    return out
+
+
 async def main() -> int:
     target_os = (sys.argv[1] if len(sys.argv) > 1 else "android").lower()
     mode = (sys.argv[2] if len(sys.argv) > 2 else "generate").lower()
@@ -1239,6 +1489,7 @@ async def main() -> int:
     media_state: dict = {}
     event_state: dict = {}
     sensor_state: dict = {}
+    heal_state: dict = {}
 
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
@@ -1381,6 +1632,11 @@ async def main() -> int:
             sensor_state = await sensor_probe(page)
             print("\n== 传感器面（devicemotion / deviceorientation）==")
             print(json.dumps(sensor_state, ensure_ascii=False))
+
+            # ---- 断线自愈回归：仿真通道静默断开 → 看门狗自动重连 → 全页面重放 ----
+            print("\n== 断线自愈回归（看门狗：断开 → 自动重连 → 重放）==")
+            heal_state = await heal_test(manager, profile["id"], res["ws_endpoint"])
+            print(json.dumps(heal_state, ensure_ascii=False))
         finally:
             oopif_server.shutdown()
     finally:
@@ -1567,6 +1823,67 @@ async def main() -> int:
                 state["connTypeIn"] is True and state["connType"] == "wifi"),
             "Worker（页面）：connection.type == 'wifi'": wk_main.get("connType") == "wifi",
             "Worker（跨域 iframe）：connection.type == 'wifi'": fr_worker.get("connType") == "wifi",
+            # ---- P2-6：downlinkMax 值域 + ontypechange 空实现 ----
+            "connection.downlinkMax == 1300（LTE 档，非 Infinity）": (
+                state.get("connDownlinkMax") == 1300
+                and state.get("connDownlinkMaxType") == "number"),
+            "connection.ontypechange 存在且默认 null": (
+                state.get("connOnTypeIn") is True and state.get("connOnTypeDefault") is None),
+            "ontypechange 为 get/set 访问器（与 onchange 同形）": (
+                isinstance(state.get("connOnTypeDesc"), dict)
+                and state["connOnTypeDesc"].get("get") is True
+                and state["connOnTypeDesc"].get("set") is True
+                and state["connOnTypeDesc"].get("enum") is True
+                and state["connOnTypeDesc"].get("cfg") is True),
+            "ontypechange 赋值回环 + 置 null": state.get("connOnTypeRoundTrip") is True,
+            "Worker（页面）：downlinkMax == 1300": wk_main.get("connDlMax") == 1300,
+            "Worker（页面）：ontypechange 存在且为 null": wk_main.get("connOnType") == "null",
+            # ---- P1-3：Android 只校准 HEVC（hvc1 有、hev1 无），ogg/webm 保持内核原生 ----
+            "canPlayType：hvc1 == 'probably'": (state.get("canPlay") or {}).get("hvc1") == "probably",
+            "canPlayType：hev1 == ''": (state.get("canPlay") or {}).get("hev1") == "",
+            "canPlayType：原生外观 + 坏 receiver 抛 TypeError": (
+                (state.get("canPlay") or {}).get("native") is True
+                and (state.get("canPlay") or {}).get("length") == 1
+                and (state.get("canPlay") or {}).get("illegal") == "TypeError"),
+            # ---- P2-1：WebGL 扩展集剔除桌面专属项（Android 保留 disjoint_timer）----
+            "WebGL：S3TC/BPTC/polygon_mode 缺席": (
+                (state.get("webglSurface") or {}).get("getExtS3tc") is None
+                and not any(re.search(r"s3tc|bptc|polygon_mode", x, re.I)
+                            for x in ((state.get("webglSurface") or {}).get("exts") or []))),
+            "WebGL：getExtension 大小写不敏感同样返回 null": (
+                (state.get("webglSurface") or {}).get("getExtCaseInsensitive") is None),
+            "WebGL：移动纹理扩展保留（ASTC/ETC）": (
+                (state.get("webglSurface") or {}).get("getExtAstc") is True),
+            "WebGL：Android 保留 EXT_disjoint_timer_query": any(
+                re.search(r"disjoint_timer_query", x, re.I)
+                for x in ((state.get("webglSurface") or {}).get("exts") or [])),
+            "WebGL：扩展数 ≤ 30（桌面宿主 39）": (
+                ((state.get("webglSurface") or {}).get("extCount") or 99) <= 30),
+            "WebGL：MAX_* 为移动档且未知枚举仍为 null": (
+                (state.get("webglSurface") or {}).get("limits", {}).get("MAX_TEXTURE_SIZE") == 16384
+                and (state.get("webglSurface") or {}).get("limits", {}).get("MAX_VIEWPORT_DIMS") == [16384, 16384]
+                and (state.get("webglSurface") or {}).get("unknownEnum") is None),
+            "WebGL：getParameter 原生形态 + 坏 receiver 抛 TypeError": (
+                (state.get("webglSurface") or {}).get("getParamLength") == 1
+                and (state.get("webglSurface") or {}).get("getExtListLength") == 0
+                and (state.get("webglSurface") or {}).get("badReceiver") == "TypeError"),
+            "WebGL2：同样剔除 S3TC": (
+                (state.get("webglSurface") or {}).get("gl2HasS3tc") is False),
+            "Worker（页面）：WebGL 渲染器 == 主文档（OffscreenCanvas 同口径）": (
+                isinstance(wk_main.get("glRenderer"), list)
+                and wk_main["glRenderer"] == [gl.get("vendor"), gl.get("renderer")]),
+            "Worker（跨域 iframe）：WebGL 渲染器 == 主文档": (
+                isinstance(fr_worker.get("glRenderer"), list)
+                and fr_worker["glRenderer"] == [gl.get("vendor"), gl.get("renderer")]),
+            "Worker（页面）：WebGL 扩展集与主文档同口径（无 S3TC/BPTC）": (
+                isinstance(wk_main.get("glExt"), dict)
+                and wk_main["glExt"].get("s3tc") is False
+                and wk_main["glExt"].get("bptc") is False
+                and wk_main["glExt"].get("count") == (state.get("webglSurface") or {}).get("extCount")),
+            "Worker（跨域 iframe）：WebGL 扩展集同口径": (
+                isinstance(fr_worker.get("glExt"), dict)
+                and fr_worker["glExt"].get("s3tc") is False
+                and fr_worker["glExt"].get("bptc") is False),
             "standalone 不存在（iOS 专有属性）": state["hasStandalone"] is False,
             "竞态：首文档 UA-CH/内存已注入": bool(probe.get("hasUaData"))
                 and probe.get("memory") == mem_class,
@@ -1721,6 +2038,64 @@ async def main() -> int:
             "deviceMemory 不暴露（WKWebView 无该 API）": state["deviceMemory"] is None,
             "connection 不存在（Safari/CriOS 均无该 API）": state["hasConnection"] is False,
             "Worker（页面）：无 connection.type（WKWebView 行为）": wk_main.get("connType") == "<none>",
+            "Worker（页面）：无 downlinkMax/ontypechange（整块缺席）": (
+                wk_main.get("connDlMax") == "<absent>"
+                and wk_main.get("connOnType") == "<absent>"),
+            # ---- P1-3：iOS 真机口径（ogg/webm 整族不可播、HEVC 仅 hvc1）----
+            "canPlayType：ogg/webm 全族 == ''（AVFoundation 容器表无此项）": all(
+                (state.get("canPlay") or {}).get(k) == ""
+                for k in ("ogg", "oggVorbis", "oggOpus", "webm", "webmVp8",
+                          "webmVp9", "videoOgg")),
+            "canPlayType：hvc1 两档 == 'probably'，hev1 == ''": (
+                (state.get("canPlay") or {}).get("hvc1") == "probably"
+                and (state.get("canPlay") or {}).get("hvc1Full") == "probably"
+                and (state.get("canPlay") or {}).get("hev1") == ""),
+            "canPlayType：MP4/AVC 仍可播（未误伤原生面）": (
+                (state.get("canPlay") or {}).get("mp4Avc") == "probably"),
+            "canPlayType：大小写不敏感命中同一表项": (
+                (state.get("canPlay") or {}).get("upperCase") == ""),
+            "canPlayType：原生外观 + 坏 receiver 抛 TypeError": (
+                (state.get("canPlay") or {}).get("native") is True
+                and (state.get("canPlay") or {}).get("length") == 1
+                and (state.get("canPlay") or {}).get("illegal") == "TypeError"),
+            # ---- P2-1：iOS 额外剔除计时扩展（Apple 物理封禁 Spectre 侧信道）----
+            "WebGL：S3TC/BPTC/polygon_mode 缺席": (
+                (state.get("webglSurface") or {}).get("getExtS3tc") is None
+                and not any(re.search(r"s3tc|bptc|polygon_mode", x, re.I)
+                            for x in ((state.get("webglSurface") or {}).get("exts") or []))),
+            "WebGL：EXT_disjoint_timer_query 缺席（iOS）": not any(
+                re.search(r"disjoint_timer_query", x, re.I)
+                for x in ((state.get("webglSurface") or {}).get("exts") or [])),
+            "WebGL：移动纹理扩展保留（ASTC/ETC）": (
+                (state.get("webglSurface") or {}).get("getExtAstc") is True),
+            "WebGL：扩展数 ≤ 27（桌面宿主 39）": (
+                ((state.get("webglSurface") or {}).get("extCount") or 99) <= 27),
+            "WebGL：MAX_* 为移动档且未知枚举仍为 null": (
+                (state.get("webglSurface") or {}).get("limits", {}).get("MAX_TEXTURE_SIZE") == 16384
+                and (state.get("webglSurface") or {}).get("limits", {}).get("MAX_VIEWPORT_DIMS") == [16384, 16384]
+                and (state.get("webglSurface") or {}).get("unknownEnum") is None),
+            "WebGL：getParameter 原生形态 + 坏 receiver 抛 TypeError": (
+                (state.get("webglSurface") or {}).get("getParamLength") == 1
+                and (state.get("webglSurface") or {}).get("getExtListLength") == 0
+                and (state.get("webglSurface") or {}).get("badReceiver") == "TypeError"),
+            "WebGL2：同样剔除 S3TC": (
+                (state.get("webglSurface") or {}).get("gl2HasS3tc") is False),
+            "Worker（页面）：WebGL 渲染器 == 主文档（OffscreenCanvas 同口径）": (
+                isinstance(wk_main.get("glRenderer"), list)
+                and wk_main["glRenderer"] == [gl.get("vendor"), gl.get("renderer")]),
+            "Worker（跨域 iframe）：WebGL 渲染器 == 主文档": (
+                isinstance(fr_worker.get("glRenderer"), list)
+                and fr_worker["glRenderer"] == [gl.get("vendor"), gl.get("renderer")]),
+            "Worker（页面）：WebGL 扩展集与主文档同口径（无 S3TC/BPTC/计时）": (
+                isinstance(wk_main.get("glExt"), dict)
+                and wk_main["glExt"].get("s3tc") is False
+                and wk_main["glExt"].get("bptc") is False
+                and wk_main["glExt"].get("timer") is False
+                and wk_main["glExt"].get("count") == (state.get("webglSurface") or {}).get("extCount")),
+            "Worker（跨域 iframe）：WebGL 扩展集同口径": (
+                isinstance(fr_worker.get("glExt"), dict)
+                and fr_worker["glExt"].get("s3tc") is False
+                and fr_worker["glExt"].get("bptc") is False),
             "pdfViewerEnabled 不存在（Safari/CriOS 均无该 API）": state["hasPdfViewer"] is False,
             "plugins/mimeTypes 为空（WKWebView 行为）": state["pluginsLen"] == 0 and state["mimeTypesLen"] == 0,
             # ---- 桌面 Chromium 独有 API 的抹除（一条 `'serial' in navigator` 即可判假）----
@@ -2051,6 +2426,44 @@ async def main() -> int:
                     and fr_live.get("hist") is False
                     and fr_live.get("chromeType") == "undefined"),
             })
+
+    # ---- 媒体查询面（全平台）：CDP 触控仿真的语义断言 ----
+    # 声明同步：app/mobile_cdp_injector.py::_apply_device_emulation 的
+    # setDeviceMetricsOverride(mobile=True)；仿真通道断开时这些查询回落宿主
+    # 桌面值（pointer:fine / hover:hover）——检测报告 12 项的共同根因。
+    mq = state.get("mediaQueries") or {}
+    asr = state.get("audioSampleRate") or {}
+    hs = heal_state or {}
+    h_new = hs.get("outage_healed") or {}
+    h_main = hs.get("main_healed") or {}
+    checks.update({
+        "媒体查询：pointer:coarse 且无 fine（触控设备语义）": (
+            mq.get("pointerCoarse") is True and mq.get("pointerFine") is False),
+        "媒体查询：hover:none 且无 hover（无悬停设备语义）": (
+            mq.get("hoverNone") is True and mq.get("hoverHover") is False),
+        "媒体查询：any-pointer:coarse / any-hover:none 一致": (
+            mq.get("anyPointerCoarse") is True and mq.get("anyHoverNone") is True),
+        # 真机口径：内核 --disable-spoofing=audio 已关闭「按种子微扰采样率」的
+        # 伪装（实测宿主 44100 → 伪装 44100.01171875），采样率必须精确整数。
+        "音频：OfflineAudioContext 采样率为精确整数（44100/48000）": (
+            isinstance(asr.get("s44100"), (int, float))
+            and abs(asr["s44100"] - 44100) < 1e-6
+            and isinstance(asr.get("s48000"), (int, float))
+            and abs(asr["s48000"] - 48000) < 1e-6),
+        # ---- 断线自愈（看门狗）：事故形态复现 + 自动恢复 ----
+        "自愈：通道断开即标记重连中（面板状态可见）": (
+            hs.get("state_down") == "reconnecting"),
+        "自愈：看门狗自动重连（计数递增，状态回 ok）": (
+            hs.get("healthy") is True
+            and hs.get("state_after") == "ok"
+            and int(hs.get("reconnects") or 0) >= 1),
+        "自愈：断线期间新标签页已重放（触控/媒体查询/移动 UA）": (
+            int(h_new.get("touch") or 0) >= 5
+            and h_new.get("coarse") is True
+            and h_new.get("uaMobile") is True),
+        "自愈：断线前已存在页面已重放（触控/媒体查询）": (
+            int(h_main.get("touch") or 0) >= 5 and h_main.get("coarse") is True),
+    })
 
     print("\n== 检查项 ==")
     ok_all = True

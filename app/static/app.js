@@ -145,7 +145,7 @@ function renderRows() {
         <span class="tag ${(p.fingerprint_summary?.mode || "").includes("预设") ? "preset" : "generate"}" style="margin-top:2px">${esc(mode)}</span>
       </td>
       <td>${healthCell(p.fingerprint_summary)}</td>
-      <td><span class="status ${p.running ? "running" : ""}"><span class="dot"></span>${p.running ? "运行中" : "已停止"}</span></td>
+      <td><span class="status ${p.running ? "running" : ""}"><span class="dot"></span>${p.running ? "运行中" : "已停止"}</span>${p.running && p.emulation === "reconnecting" ? '<span class="emu-warn" title="移动端仿真通道正在自动重连：期间新建标签页会裸奔（宿主 GPU/触屏/桌面媒体查询）">⚠ 仿真重连中</span>' : ""}</td>
       <td>
         <button class="btn small primary" data-act="start" ${p.running ? "disabled" : ""}>启动</button>
         <button class="btn small" data-act="stop" ${p.running ? "" : "disabled"}>停止</button>

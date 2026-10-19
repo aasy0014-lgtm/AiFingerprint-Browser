@@ -48,7 +48,7 @@ import logging
 import math
 import random
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlsplit
 
 from .mobile_fingerprints import (
@@ -58,6 +58,9 @@ from .mobile_fingerprints import (
     _IOS_REMOVE_GLOBALS,
     _IOS_REMOVE_NAV_PROPS,
     _IOS_REMOVE_WORKER_GLOBALS,
+    _ANDROID_DOWNLINK_MAX_MBPS,
+    _codec_capability,
+    _webgl_profile,
 )
 
 log = logging.getLogger(__name__)
@@ -331,6 +334,27 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
     if connection_type is None and target_os == "android":
         connection_type = "wifi"
 
+    # NetworkInformation.downlinkMax：与 type 同属 NetInfoDownlinkMax 开关，
+    # 仅 Android 实现（BCD chrome_android=38；桌面仅 ChromeOS）。旧指纹无该
+    # 字段时按平台事实兜底，存量档案无需重建。
+    downlink_max = extra.get("downlinkMax")
+    if downlink_max is None and target_os == "android":
+        downlink_max = _ANDROID_DOWNLINK_MAX_MBPS
+
+    # canPlayType 能力表：iOS 目标必须关掉内核 FFmpeg 的 ogg/webm 面（真机
+    # AVFoundation 无这两个容器解码器），并补齐 hvc1。旧指纹无该字段时按平台
+    # 事实兜底，存量档案无需重建（与 empty_plugins / connection_type 同理）。
+    codec_capability = extra.get("codecCapability")
+    if not isinstance(codec_capability, dict) or not codec_capability:
+        codec_capability = _codec_capability(target_os)
+
+    # WebGL 参数上限 / 扩展集：宿主是 Apple M 系列（16384 上限 + 桌面专属
+    # 纹理扩展），与声明的 Adreno/Mali/Apple GPU 三元组不符。旧指纹无该字段
+    # 时按平台兜底，存量档案无需重建。
+    webgl_profile = extra.get("webglProfile")
+    if not isinstance(webgl_profile, dict) or not webgl_profile:
+        webgl_profile = _webgl_profile(target_os)
+
     color_depth = screen.get("colorDepth")
     try:
         color_depth = int(color_depth)
@@ -351,6 +375,9 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
         "removeWorkerGlobals": list(remove_worker_globals),
         "emptyPlugins": empty_plugins,
         "connectionType": connection_type,
+        "downlinkMax": downlink_max,
+        "codecCapability": codec_capability,
+        "webglProfile": webgl_profile,
         "ios": target_os == "ios",
         "iosChrome": ios_chrome,
         "webgl": webgl,
@@ -1596,6 +1623,38 @@ _PATCH_TEMPLATE = r"""
             defineGet(NetworkInformation.prototype, 'type', D.connectionType);
         }
 
+        // ---- Android Chrome：downlinkMax / ontypechange（同属 NetInfoDownlinkMax）----
+        // 与 type 同一运行期开关（BCD：chrome_android=38，桌面 chrome 仅
+        // ChromeOS）——桌面内核上这两个成员同样缺席，也是「桌面装 Android」
+        // 的单行判据。取值见指纹库 _ANDROID_DOWNLINK_MAX_MBPS（内核连接
+        // 子类型表的 Wi-Fi 值域，非编造常量）。
+        // ontypechange 是 EventHandler 属性：真机有该属性、默认 null、可由赋值
+        // + dispatchEvent 驱动，故装配为 get/set 访问器对（与 onchange 形态
+        // 一致），而不是只读空值。
+        if (!D.ios && D.downlinkMax !== null && D.downlinkMax !== undefined
+                && typeof NetworkInformation !== 'undefined') {
+            defineGet(NetworkInformation.prototype, 'downlinkMax', D.downlinkMax);
+            try {
+                var __niHandlers = new WeakMap();
+                var __niGet = __maskNative(function () {
+                    if (!__slotHas(NetworkInformation.prototype, this)) {
+                        throw new TypeError('Illegal invocation');
+                    }
+                    var h = __niHandlers.get(this);
+                    return h === undefined ? null : h;
+                }, 'get ontypechange');
+                var __niSet = __maskNative(function (v) {
+                    if (!__slotHas(NetworkInformation.prototype, this)) {
+                        throw new TypeError('Illegal invocation');
+                    }
+                    __niHandlers.set(this, (typeof v === 'function') ? v : null);
+                }, 'set ontypechange');
+                Object.defineProperty(NetworkInformation.prototype, 'ontypechange', {
+                    get: __niGet, set: __niSet, enumerable: true, configurable: true,
+                });
+            } catch (e) {}
+        }
+
         // ---- iOS Chrome（CriOS）：页面世界检测面 ----
         // 真机 Chrome iOS 是 WKWebView 壳：web_bundle.js 等用户脚本注入页面
         // 世界，网站 JS 可见 window.__gCrWeb（约 30 成员）、被改写的 history/
@@ -1849,9 +1908,71 @@ _PATCH_TEMPLATE = r"""
             }
         } catch (e) {}
 
-        // ---- WebGL：非遮蔽厂商/渲染器（内核原生 GPU 伪装不含移动平台）----
-        if (D.webgl && D.webgl.renderer) {
+        // ---- 媒体可播放能力：canPlayType 按真机能力表校准 ----
+        // 内核是桌面 Chromium（FFmpeg 管线），ogg/webm/opus 一律 "probably"；
+        // 真机 iOS Safari 走 AVFoundation，容器白名单里没有 ogg/webm ——
+        // 单行 canPlayType('audio/ogg; codecs="vorbis"') 即可判「不是 iOS」。
+        // 表见指纹库 _CODEC_CAPABILITY_IOS（附 WebKit 源码取证）；未列入的
+        // MIME 回退原生结果（mp4/aac/mpeg 上 safari 与 Chromium 本就一致）。
+        // 匹配顺序：剥离参数后整串 → 完整串 → 逐个 codecs 标签，均大小写不敏感。
+        if (D.codecCapability && typeof HTMLMediaElement !== 'undefined') {
             try {
+                var __cptTable = (function () {
+                    var t = {};
+                    for (var k in D.codecCapability) {
+                        if (Object.prototype.hasOwnProperty.call(D.codecCapability, k)) {
+                            t[String(k).toLowerCase()] = D.codecCapability[k];
+                        }
+                    }
+                    return t;
+                })();
+                var __cptLookup = function (type) {
+                    var s = String(type).toLowerCase();
+                    var i = s.indexOf(';');
+                    var bare = i >= 0 ? s.slice(0, i) : s;
+                    var hit = __cptTable[s];
+                    if (hit === undefined) { hit = __cptTable[bare]; }
+                    if (hit === undefined) {
+                        // codecs 标签逐个匹配（"vp8, vorbis" → 分别查）
+                        var ci = s.indexOf('codecs=');
+                        if (ci >= 0) {
+                            var raw = s.slice(ci + 7).replace(/^["']|["']$/g, '');
+                            var parts = raw.split(',');
+                            for (var j = 0; j < parts.length; j++) {
+                                var tag = parts[j].replace(/^\s+|\s+$/g, '');
+                                if (!tag) { continue; }
+                                var v = __cptTable[bare + '; codecs="' + tag + '"'];
+                                if (v !== undefined) { return v; }
+                            }
+                        }
+                    }
+                    return hit;
+                };
+                var __cptOrig = HTMLMediaElement.prototype.canPlayType;
+                defineFn(HTMLMediaElement.prototype, 'canPlayType', function (type) {
+                    var v = __cptLookup(type);
+                    if (v !== undefined) { return v; }
+                    return __cptOrig.apply(this, arguments);
+                });
+            } catch (e) {}
+        }
+
+        // ---- WebGL：非遮蔽厂商/渲染器 + 参数上限/扩展集 ----
+        // 内核原生 GPU 伪装不含移动平台：宿主是 Apple M 系列（Metal/ANGLE），
+        // 渲染器字符串必须换成声明的 Adreno/Mali；同时「渲染器 × 参数上限 ×
+        // 扩展集」三元组也要自洽——宿主扩展集带桌面专属的 S3TC/BPTC/RGTC/
+        // polygon_mode（移动 GPU 驱动不导出），检测站按 gpuinfo.org 数据集
+        // 比对可直接命中。上限/剔除清单见指纹库 _GL_LIMITS_MOBILE /
+        // _GL_EXT_DESKTOP_ONLY（按 GPU 家族，非按机型）。
+        if ((D.webgl && D.webgl.renderer) || D.webglProfile) {
+            try {
+                var __glLimits = (D.webglProfile && D.webglProfile.limits) || {};
+                var __glDrop = (D.webglProfile && D.webglProfile.dropExtensions) || [];
+                // 枚举值 → 名称：直接取构造器上的同名常量，避免手抄魔数出错
+                var __glEnumOf = function (Ctor, name) {
+                    try { var v = Ctor[name]; return (typeof v === 'number') ? v : null; }
+                    catch (e) { return null; }
+                };
                 var patchGL = function (Ctor) {
                     if (!Ctor || !Ctor.prototype || !Ctor.prototype.getParameter) { return; }
                     var orig = Ctor.prototype.getParameter;
@@ -1866,11 +1987,53 @@ _PATCH_TEMPLATE = r"""
                             try { orig.apply(this, arguments); } catch (e) {}
                             return p === 37445 ? D.webgl.vendor : D.webgl.renderer;
                         }
+                        // 上限覆盖：先走一遍原生路径（耗时/状态机对齐），
+                        // 原生返回 null（非法枚举）时保持 null——移动驱动对
+                        // 未知枚举同样返回 null，不能凭空造值。
+                        if (typeof p === 'number') {
+                            var nat = orig.apply(this, arguments);
+                            for (var ln in __glLimits) {
+                                if (!Object.prototype.hasOwnProperty.call(__glLimits, ln)) { continue; }
+                                var en = __glEnumOf(Ctor, ln);
+                                if (en !== null && en === p && nat !== null && nat !== undefined) {
+                                    var lv = __glLimits[ln];
+                                    return (lv && lv.length !== undefined) ? new Int32Array(lv) : lv;
+                                }
+                            }
+                            return nat;
+                        }
                         return orig.apply(this, arguments);
                     }, 'getParameter');
                     Object.defineProperty(Ctor.prototype, 'getParameter', {
                         value: wrapped, writable: true, enumerable: true, configurable: true,
                     });
+
+                    // 扩展集剔除：getSupportedExtensions 过滤 + getExtension 返回 null。
+                    // 注意用 toLowerCase 比较：getExtension 对大小写不敏感。
+                    if (__glDrop.length && Ctor.prototype.getSupportedExtensions) {
+                        var __dropSet = {};
+                        for (var di = 0; di < __glDrop.length; di++) {
+                            __dropSet[String(__glDrop[di]).toLowerCase()] = true;
+                        }
+                        var origList = Ctor.prototype.getSupportedExtensions;
+                        var origGetExt = Ctor.prototype.getExtension;
+                        defineFn(Ctor.prototype, 'getSupportedExtensions', function () {
+                            var all = origList.apply(this, arguments);
+                            if (!all) { return all; }
+                            var out = [];
+                            for (var ai = 0; ai < all.length; ai++) {
+                                if (!__dropSet[String(all[ai]).toLowerCase()]) { out.push(all[ai]); }
+                            }
+                            return out;
+                        });
+                        defineFn(Ctor.prototype, 'getExtension', function (name) {
+                            if (name !== undefined && name !== null
+                                    && __dropSet[String(name).toLowerCase()]) {
+                                return null;
+                            }
+                            return origGetExt.apply(this, arguments);
+                        });
+                    }
                 };
                 patchGL(window.WebGLRenderingContext);
                 patchGL(window.WebGL2RenderingContext);
@@ -1911,6 +2074,9 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "removeWorkerGlobals": list(spec.get("removeWorkerGlobals") or []),
         "emptyPlugins": bool(spec.get("emptyPlugins")),
         "connectionType": str(spec.get("connectionType") or ""),
+        "downlinkMax": spec.get("downlinkMax"),
+        "codecCapability": dict(spec.get("codecCapability") or {}),
+        "webglProfile": spec.get("webglProfile"),
         "ios": bool(spec.get("ios")),
         "iosChrome": spec.get("iosChrome"),
         "webgl": spec.get("webgl"),
@@ -2107,6 +2273,34 @@ _WORKER_PATCH_TEMPLATE = r"""
             defineGet(NetworkInformation.prototype, 'type', D.connectionType);
         }
 
+        // ---- Android Chrome：Worker 内 downlinkMax / ontypechange ----
+        // NetworkInformation 的 Exposed=(Window,Worker)：真机 Android Worker
+        // 与主文档同面（BCD worker_support 同 chrome_android=38）。形态与
+        // 页面模板一致：downlinkMax 只读、ontypechange 为 get/set 访问器对。
+        if (!D.ios && D.downlinkMax !== null && D.downlinkMax !== undefined
+                && typeof NetworkInformation !== 'undefined') {
+            defineGet(NetworkInformation.prototype, 'downlinkMax', D.downlinkMax);
+            try {
+                var __niHandlers = new WeakMap();
+                var __niGet = __maskNative(function () {
+                    if (!__slotHas(NetworkInformation.prototype, this)) {
+                        throw new TypeError('Illegal invocation');
+                    }
+                    var h = __niHandlers.get(this);
+                    return h === undefined ? null : h;
+                }, 'get ontypechange');
+                var __niSet = __maskNative(function (v) {
+                    if (!__slotHas(NetworkInformation.prototype, this)) {
+                        throw new TypeError('Illegal invocation');
+                    }
+                    __niHandlers.set(this, (typeof v === 'function') ? v : null);
+                }, 'set ontypechange');
+                Object.defineProperty(NetworkInformation.prototype, 'ontypechange', {
+                    get: __niGet, set: __niSet, enumerable: true, configurable: true,
+                });
+            } catch (e) {}
+        }
+
         // ---- UA-CH：Worker 内 navigator.userAgentData 与主文档一致 ----
         // （安全上下文下内核原生提供一份桌面 Linux 元数据：platform "Linux"、
         //   mobile false；真机 Android Worker 的 UA-CH 与主文档相同）
@@ -2156,6 +2350,70 @@ _WORKER_PATCH_TEMPLATE = r"""
             defineGet(N, 'userAgentData', uaData);
         }
 
+        // ---- WebGL：Worker 内（OffscreenCanvas）与主文档同口径 ----
+        // 实测：Worker 里 WebGLRenderingContext 与 OffscreenCanvas 都可用，
+        // 扩展集与主文档完全相同（宿主 39 项，含 S3TC/BPTC/polygon_mode），
+        // 且 UNMASKED_RENDERER 直接报宿主机型（Apple M2）。只补主文档不补
+        // Worker，等于把「页面是 Adreno、Worker 是 Apple M」的跨上下文矛盾
+        // 留在原地——检测站起一个 Worker 读一次即可命中。
+        if ((D.webgl && D.webgl.renderer) || D.webglProfile) {
+            try {
+                var __wglDrop = (D.webglProfile && D.webglProfile.dropExtensions) || [];
+                var __wglLimits = (D.webglProfile && D.webglProfile.limits) || {};
+                var __wglPatch = function (Ctor) {
+                    if (!Ctor || !Ctor.prototype || !Ctor.prototype.getParameter) { return; }
+                    var __wglEnum = function (name) {
+                        try { var v = Ctor[name]; return (typeof v === 'number') ? v : null; }
+                        catch (e) { return null; }
+                    };
+                    var __wglOrigP = Ctor.prototype.getParameter;
+                    defineFn(Ctor.prototype, 'getParameter', function (p) {
+                        var nat = __wglOrigP.apply(this, arguments);
+                        if (p === 37445 || p === 37446) {
+                            if (!D.webgl || !D.webgl.renderer) { return nat; }
+                            return p === 37445 ? D.webgl.vendor : D.webgl.renderer;
+                        }
+                        if (typeof p === 'number') {
+                            for (var ln in __wglLimits) {
+                                if (!Object.prototype.hasOwnProperty.call(__wglLimits, ln)) { continue; }
+                                var en = __wglEnum(ln);
+                                if (en !== null && en === p && nat !== null && nat !== undefined) {
+                                    var lv = __wglLimits[ln];
+                                    return (lv && lv.length !== undefined) ? new Int32Array(lv) : lv;
+                                }
+                            }
+                        }
+                        return nat;
+                    });
+                    if (!__wglDrop.length || !Ctor.prototype.getSupportedExtensions) { return; }
+                    var __wglSet = {};
+                    for (var wi = 0; wi < __wglDrop.length; wi++) {
+                        __wglSet[String(__wglDrop[wi]).toLowerCase()] = true;
+                    }
+                    var __wglList = Ctor.prototype.getSupportedExtensions;
+                    var __wglGet = Ctor.prototype.getExtension;
+                    defineFn(Ctor.prototype, 'getSupportedExtensions', function () {
+                        var all = __wglList.apply(this, arguments);
+                        if (!all) { return all; }
+                        var out = [];
+                        for (var ai = 0; ai < all.length; ai++) {
+                            if (!__wglSet[String(all[ai]).toLowerCase()]) { out.push(all[ai]); }
+                        }
+                        return out;
+                    });
+                    defineFn(Ctor.prototype, 'getExtension', function (name) {
+                        if (name !== undefined && name !== null
+                                && __wglSet[String(name).toLowerCase()]) {
+                            return null;
+                        }
+                        return __wglGet.apply(this, arguments);
+                    });
+                };
+                __wglPatch((typeof WebGLRenderingContext !== 'undefined') ? WebGLRenderingContext : null);
+                __wglPatch((typeof WebGL2RenderingContext !== 'undefined') ? WebGL2RenderingContext : null);
+            } catch (e) {}
+        }
+
         // ---- WebGPU：Worker 内 GPUAdapterInfo 与主文档同口径 ----
         // （Dedicated Worker 可用 navigator.gpu；宿主 Apple 适配器信息在这里
         //   同样泄漏，真机 Android Worker 报与主文档相同的 Dawn 代际口径）
@@ -2179,8 +2437,11 @@ def build_worker_patch(spec: Dict[str, Any]) -> str:
         "removeGlobals": list(spec.get("removeGlobals") or []),
         "removeWorkerGlobals": list(spec.get("removeWorkerGlobals") or []),
         "connectionType": str(spec.get("connectionType") or ""),
+        "downlinkMax": spec.get("downlinkMax"),
         "ios": bool(spec.get("ios")),
         "webgpu": spec.get("webgpu"),
+        "webgl": spec.get("webgl"),
+        "webglProfile": spec.get("webglProfile"),
     }
     return _WORKER_PATCH_TEMPLATE.replace("__SPEC__", json.dumps(payload, ensure_ascii=False))
 
@@ -2279,6 +2540,9 @@ class MobileEmulationSession:
                                         else list(_ANDROID_WORKER_DROPS)),
                 "emptyPlugins": True,
                 "connectionType": "wifi" if target_os == "android" else None,
+                "downlinkMax": _ANDROID_DOWNLINK_MAX_MBPS if target_os == "android" else None,
+                "codecCapability": _codec_capability(target_os),
+                "webglProfile": _webgl_profile(target_os),
                 "ios": target_os == "ios", "iosChrome": None, "webgl": None, "webgpu": None,
                 "mediaVideoInputs": 0,
                 "cssWidth": css_w, "cssHeight": css_h,
@@ -2312,12 +2576,52 @@ class MobileEmulationSession:
         self._sensor_task: Optional[asyncio.Task] = None
         self._sensor_session: Optional[str] = None
         self._closed = False
+        # 通道健康看门狗：CDP 连接是「仿真是否生效」的唯一凭据——客户端断开
+        # 时内核会还原全部 Emulation 覆盖，文档起点补丁脚本也随会话失效：
+        # 此后打开的标签页连 JS 补丁都没有（实测检测站直接读到宿主 GPU /
+        # maxTouchPoints=0 / pointer:fine / UA-CH 桌面值），已存在的文档则
+        # 只剩 JS 层补丁，媒体查询回落宿主值。看门狗定期探活，断开后自动
+        # 重连并重新覆盖所有已存在页面（自愈），供工作台展示与审计。
+        self._watchdog: Optional[asyncio.Task] = None
+        self._emu_ok = False
+        self._reconnects = 0
+        self._last_error = ""
+        self.profile_id = ""
+        self.profile_name = ""
+        self.on_session_event: Optional[Callable[[str, int], None]] = None
 
     # ---------------- 生命周期 ----------------
 
     async def start(self) -> None:
-        """连接浏览器调试端口并应用仿真；失败会自行清理。"""
+        """连接浏览器调试端口并应用仿真；失败会自行清理。
+
+        连接建立后同时启动通道看门狗：CDP 连接静默断开（实例长期空闲时
+        实测发生）会由看门狗自动重连并重新覆盖所有页面，避免「标签页逐步
+        裸奔」——新开标签页读到宿主 GPU/触屏/桌面媒体查询的典型事故。
+        """
+        await self._connect(navigate=True)
+        if self._watchdog is None:
+            self._watchdog = asyncio.create_task(self._watchdog_loop())
+
+    async def _connect(self, *, navigate: bool) -> None:
+        """建立一条新的 CDP 连接并应用仿真（首次连接与断线重连共用）。
+
+        navigate=False（重连路径）时不重复导航 start_url，只补仿真。
+        """
         import websockets
+
+        # 新连接 = 全新会话上下文：上一连接的 session/target 标识全部失效，
+        # 必须清空去重与暂存状态，才能对已存在页面重新应用（自愈的关键）。
+        if self._sensor_task is not None:
+            self._sensor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._sensor_task
+            self._sensor_task = None
+        self._applied_targets.clear()
+        self._accept_ch.clear()
+        self._worker_drop_waiters.clear()
+        self._sensor_supported = None
+        self._sensor_session = None
 
         self._ws = await websockets.connect(
             self.ws_endpoint, max_size=64 * 1024 * 1024, ping_interval=None,
@@ -2342,7 +2646,7 @@ class MobileEmulationSession:
         with contextlib.suppress(CDPError):
             await self._send("Target.setDiscoverTargets", {"discover": True})
 
-        # 已存在的页面
+        # 已存在的页面（重连时即「因断线而裸奔」的标签页，逐个重新覆盖）
         targets = (await self._send("Target.getTargets")).get("targetInfos", [])
         for info in targets:
             if info.get("type") == "page":
@@ -2351,11 +2655,19 @@ class MobileEmulationSession:
                 asyncio.create_task(self._attach_frame(info.get("targetId", "")))
 
         # 应用完成后导航到目标页（首个真实页面加载前指纹已生效）
-        if self.start_url and self.start_url != "about:blank":
+        if navigate and self.start_url and self.start_url != "about:blank":
             await self._navigate_start_url()
+        self._emu_ok = True
 
     async def close(self) -> None:
         self._closed = True
+        # 看门狗先停：避免关闭流程与重连竞态（否则可能出现「关闭后重连成功」
+        # 把仿真重新挂上，浏览器已无人回收）
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._watchdog
+            self._watchdog = None
         # 传感器噪声任务（每 50ms 一次 CDP 下发）：先取消并回收，避免
         # 「Task was destroyed but it is pending」与关闭竞态
         if self._sensor_task is not None:
@@ -2379,6 +2691,82 @@ class MobileEmulationSession:
     def connected(self) -> bool:
         return self._ws is not None and not self._closed
 
+    @property
+    def healthy(self) -> bool:
+        """仿真通道当前是否在线（工作台展示用：断线期间标签页逐步裸奔）。"""
+        return bool(self._emu_ok and not self._closed)
+
+    @property
+    def reconnect_count(self) -> int:
+        return self._reconnects
+
+    # ---------------- 通道看门狗 ----------------
+
+    # 探活间隔与命令超时（秒）：Target.getTargets 极轻，内核无感；
+    # 断开后 1s 起步、指数退避（上限 30s）重连，恢复后 10s 一次继续探活。
+    _WATCHDOG_INTERVAL = 10.0
+    _WATCHDOG_TIMEOUT = 5.0
+
+    async def _watchdog_loop(self) -> None:
+        """定期探活；发现通道断开自动重连并重新覆盖所有页面。
+
+        覆盖三种断线形态：对端关闭（send/recv 抛 ConnectionClosed）、
+        半开连接（探活命令超时）、连接被替换。重连失败按指数退避重试，
+        浏览器被关闭后连接会持续失败，由工作台停止流程回收本会话。
+        """
+        backoff = 1.0
+        while not self._closed:
+            try:
+                await asyncio.sleep(
+                    self._WATCHDOG_INTERVAL if self._emu_ok else backoff)
+                if self._closed:
+                    return
+                if self._emu_ok:
+                    await self._send("Target.getTargets", {},
+                                     timeout=self._WATCHDOG_TIMEOUT)
+                    continue
+                if await self._reconnect():
+                    backoff = 1.0
+                else:
+                    backoff = min(backoff * 2, 30.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                self._last_error = f"{type(e).__name__}: {e}"
+                if self._emu_ok:
+                    self._emu_ok = False
+                    log.warning(
+                        "移动端仿真通道断开（%s）[%s]，自动重连中……",
+                        e, self.profile_name or self.profile_id or "?")
+                backoff = 1.0
+
+    async def _reconnect(self) -> bool:
+        """重建 CDP 连接；成功后对所有已存在页面重新应用仿真与补丁。"""
+        if self._reader:
+            self._reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._reader
+            self._reader = None
+        if self._ws is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._ws.close()
+            self._ws = None
+        try:
+            await self._connect(navigate=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._last_error = f"{type(e).__name__}: {e}"
+            return False
+        self._reconnects += 1
+        log.warning(
+            "移动端仿真已自动重连（第 %d 次）[%s]：已打开页面全部重新应用仿真与补丁",
+            self._reconnects, self.profile_name or self.profile_id or "?")
+        if self.on_session_event is not None:
+            with contextlib.suppress(Exception):
+                self.on_session_event("reconnect", self._reconnects)
+        return True
+
     # ---------------- CDP 传输层 ----------------
 
     async def _send(self, method: str, params: Optional[dict] = None,
@@ -2393,7 +2781,12 @@ class MobileEmulationSession:
             msg["params"] = params
         if session_id:
             msg["sessionId"] = session_id
-        await self._ws.send(json.dumps(msg))
+        try:
+            await self._ws.send(json.dumps(msg))
+        except Exception:
+            # 发送失败（连接已断）也要回收 pending 槽位，避免句柄泄漏
+            self._pending.pop(mid, None)
+            raise
         try:
             return await asyncio.wait_for(fut, timeout)
         finally:
@@ -2461,9 +2854,19 @@ class MobileEmulationSession:
                 elif msg.get("method") == "Fetch.requestPaused":
                     # Accept-CH：Document 响应解析声明；已声明源的请求回送高熵头
                     asyncio.create_task(self._on_fetch_paused(msg))
-        except Exception:
-            pass  # 连接关闭/取消
+        except Exception as e:  # noqa: BLE001
+            # 连接关闭/取消：不在此处恢复（交给看门狗统一探活/重连），
+            # 但必须留痕——静默断开是「标签页逐步裸奔」类事故的根因线索。
+            if not self._closed:
+                self._last_error = f"{type(e).__name__}: {e}"
+                # 立即标记不健康：看门狗无需等下一次探活，1s 内进入重连
+                self._emu_ok = False
+                log.warning("移动端仿真 CDP 读取循环结束（连接断开）: %s", e)
         finally:
+            # 正常结束（对端干净关闭）与异常结束都要标记通道失效：
+            # 看门狗据此在 1s 内进入重连，而不是等下一次探活超时。
+            if not self._closed:
+                self._emu_ok = False
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(CDPError(-1, "CDP 连接已断开"))

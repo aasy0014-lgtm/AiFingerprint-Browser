@@ -167,6 +167,19 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
               extra["emptyPlugins"] is True)
         check(f"[{tag}] NetworkInformation.type 标记（仅 Android 实现）",
               extra.get("connectionType") == "wifi")
+        check(f"[{tag}] downlinkMax == 1300（LTE 档，非 Infinity）",
+              extra.get("downlinkMax") == 1300.0)
+        check(f"[{tag}] WebGL 规格剔除桌面专属扩展",
+              "WEBGL_compressed_texture_s3tc" in (extra.get("webglProfile") or {}).get("dropExtensions", [])
+              and "EXT_texture_compression_bptc" in extra["webglProfile"]["dropExtensions"])
+        check(f"[{tag}] WebGL 规格保留计时扩展（Android 驱动导出）",
+              "EXT_disjoint_timer_query" not in extra["webglProfile"]["dropExtensions"])
+        check(f"[{tag}] WebGL 上限为移动档",
+              extra["webglProfile"]["limits"]["MAX_TEXTURE_SIZE"] == 16384
+              and extra["webglProfile"]["limits"]["MAX_SAMPLES"] == 4)
+        check(f"[{tag}] 编解码表只校准 HEVC（ogg/webm 内核原生已可播）",
+              set(extra.get("codecCapability") or {})
+              == {'video/mp4; codecs="hvc1"', 'video/mp4; codecs="hvc1.1.6.l93.b0"'})
     else:
         check(f"[{tag}] platform == iPhone/iPad", nav["platform"] in ("iPhone", "iPad"))
         check(f"[{tag}] vendor == Apple Computer, Inc.", nav["vendor"] == "Apple Computer, Inc.")
@@ -181,6 +194,18 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
                "keyboard", "requestMIDIAccess", "presentation",
                "getInstalledRelatedApps", "vibrate"} <= set(extra["removeNavigatorProps"]))
         check(f"[{tag}] plugins 置空标记", extra["emptyPlugins"] is True)
+        check(f"[{tag}] 无 downlinkMax（Safari 无 NetworkInformation）",
+              extra.get("downlinkMax") is None)
+        check(f"[{tag}] WebGL 规格额外剔除计时扩展（Apple 物理封禁）",
+              "EXT_disjoint_timer_query" in (extra.get("webglProfile") or {}).get("dropExtensions", [])
+              and "EXT_disjoint_timer_query_webgl2" in extra["webglProfile"]["dropExtensions"])
+        codecs = extra.get("codecCapability") or {}
+        check(f"[{tag}] 编解码表：ogg/webm 整族为空串（AVFoundation 容器表无此项）",
+              all(codecs.get(k) == "" for k in
+                  ("audio/ogg", "audio/webm", "video/webm", "video/ogg")))
+        check(f"[{tag}] 编解码表：HEVC 仅 hvc1 可播，hev1 为空串",
+              codecs.get('video/mp4; codecs="hvc1"') == "probably"
+              and codecs.get('video/mp4; codecs="hev1"') == "")
 
     # --- 通用 ---
     check(f"[{tag}] navigator.mobile 未伪造", "mobile" not in nav)

@@ -191,10 +191,16 @@ async def start(
     # 被 BrowserScan 的「纯红三角形 R 应恒等于 A」零知识检查捕获 →
     # "WebGL exception"（实测：3 个噪声像素 [254,1,0,255]）。
     # 真机 readPixels 输出纯净，移动端必须关闭该类别；与用户显式配置合并。
+    # audio 同理：内核音频伪装在渲染输出上叠加宽带噪声，检测站的
+    # 「IIR 截止频带能量」探针直接判定为防关联浏览器人工加噪
+    # （实测低通滤波器截止带能量 -11.8dB > -75dB 阈值）；真机 Chromium
+    # 的 Web Audio DSP 是纯软件实现，同引擎跨设备近一致，直接关闭
+    # 加噪即回到真机口径（详见 docs/移动端大厂检测对抗优化方案.md §2.9）。
     disabled_spoofing = [s for s in (launch.fp_disable_spoofing or "").split(",") if s]
     if mobile_mode or mobile_target_os in ("android", "ios"):
-        if "canvas" not in disabled_spoofing:
-            disabled_spoofing.append("canvas")
+        for forced in ("canvas", "audio"):
+            if forced not in disabled_spoofing:
+                disabled_spoofing.append(forced)
     if disabled_spoofing:
         args.append(f"--disable-spoofing={','.join(disabled_spoofing)}")
     hw = nav.get("hardwareConcurrency")

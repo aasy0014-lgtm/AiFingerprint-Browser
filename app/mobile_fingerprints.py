@@ -290,6 +290,165 @@ _ANDROID_REMOVE_NAV_PROPS = ["hid"]
 
 
 # --------------------------------------------------------------------------
+# 媒体可播放能力表（HTMLMediaElement.prototype.canPlayType）
+# --------------------------------------------------------------------------
+# 内核是桌面 Chromium（自建 FFmpeg 管线），canPlayType 对 ogg/webm/opus 一律
+# "probably"；真机 iOS Safari 走系统 AVFoundation，容器白名单里**没有** ogg/webm，
+# 单行 `canPlayType('audio/ogg; codecs="vorbis"')` 即可判「不是 iOS」。
+#
+# 机制取证（WebKit main，2026-10）：
+#   Source/WebCore/platform/graphics/avfoundation/objc/AVAssetMIMETypeCache.mm
+#   的 isStaticContainerType 白名单仅 30 项（3gpp/aac/aiff/basic/mp3/mp4/mpeg/
+#   wav/x-m4a/x-wav/mpegurl/mp2t… + video/3gpp/3gpp2/mp4/mpeg/quicktime/x-m4v），
+#   无平台条件分支——ogg/webm 不在其中，故 iOS 上落到 AVFoundation 扩展查询并
+#   被拒；macOS AVFoundation 自带 WebM/ogg 解码器，同一份 WebKit 会返回
+#   "probably"（实测 Playwright WebKit 26.5：ogg/webm 全 "probably"）——
+#   macOS WebKit **不能**当作 iOS 基线，本表按 iOS 真机口径写死。
+#   hvc1 在 iOS 走 VideoToolbox 硬件解码（A10 起）→ "probably"；hev1 不被接受
+#   → ""。内核 ffmpeg 的 hvc1 支持与容器串形态相关（'hvc1' → ""、
+#   'hvc1.1.6.L93.B0' → "probably"），一并收敛为 iOS 口径。
+#
+# 未列入本表的 MIME 一律回退宿主原生结果（safari 与桌面 Chromium 在 mp4/aac/
+# mpeg 容器上本就一致，无需伪造——表越小越不容易自相矛盾）。
+# 判定顺序：先剥离 `; codecs=` 后按整串匹配，再按 codecs 逐个匹配（大小写不敏感）。
+#
+# Android Chrome 侧为**显式豁免**：内核 ffmpeg 对 hvc1 的返回值形态不一致
+# （裸 'hvc1' 为 ""），真机 Android Chrome 有 HEVC 硬件解码（芯片级），
+# 故 hvc1 家族单列校准为 "probably"；ogg/webm/opus 内核已与真机同口径，不动。
+_CODEC_CAPABILITY_IOS: Dict[str, str] = {
+    # --- AVFoundation 容器白名单外：拒绝 ---
+    "audio/ogg": "",
+    'audio/ogg; codecs="vorbis"': "",
+    'audio/ogg; codecs="opus"': "",
+    "audio/webm": "",
+    'audio/webm; codecs="opus"': "",
+    'audio/webm; codecs="vorbis"': "",
+    "video/webm": "",
+    'video/webm; codecs="vp8"': "",
+    'video/webm; codecs="vp8, vorbis"': "",
+    'video/webm; codecs="vp9"': "",
+    'video/webm; codecs="vp09.00.10.08"': "",
+    "video/ogg": "",
+    'video/ogg; codecs="theora"': "",
+    # --- Apple VideoToolbox：HEVC 硬件解码 ---
+    'video/mp4; codecs="hvc1"': "probably",
+    'video/mp4; codecs="hvc1.1.6.L93.B0"': "probably",
+    'video/mp4; codecs="hev1"': "",
+}
+_CODEC_CAPABILITY_ANDROID: Dict[str, str] = {
+    # --- 真机 Android Chrome：HEVC 硬件解码（内核裸 'hvc1' 形态不一致）---
+    'video/mp4; codecs="hvc1"': "probably",
+    'video/mp4; codecs="hvc1.1.6.L93.B0"': "probably",
+}
+
+
+def _codec_capability(target_os: str) -> Dict[str, str]:
+    """目标平台相对宿主内核需要校准的 canPlayType 返回值（键为小写 MIME）。"""
+    table = _CODEC_CAPABILITY_IOS if target_os == "ios" else _CODEC_CAPABILITY_ANDROID
+    return {k.lower(): v for k, v in table.items()}
+
+
+# --------------------------------------------------------------------------
+# NetworkInformation.downlinkMax（仅 Android，单位 Mbps）
+# --------------------------------------------------------------------------
+# 与 type / ontypechange 同属 NetInfoDownlinkMax 运行期开关，BCD
+# api.NetworkInformation.downlinkMax：chrome_android=38，桌面 chrome 仅
+# ChromeOS（partial）→ 桌面内核上 'downlinkMax' in navigator.connection 为
+# false，是与 type 同源的「桌面装 Android」判据。
+#
+# 取值不是编造的常量，而是内核自己的连接子类型表（net/base/
+# network_change_notifier.cc: GetMaxBandwidthMbpsForConnectionSubtype）：
+# 真机 Android 的 subtype 来自 ConnectivityManager（WiFi/Ethernet 走
+# NetworkInfo.getSubtype，蜂窝走 cellularSubtypeFromKbps(下行带宽)），
+# 再按该表折算。type 已声明 wifi，故取该表的 Wi-Fi 条目值域——
+# 11 / 54 / 600 / 1300 / 7000（b/g/n/ac/ad），真机取值落在这个集合内。
+# 取 1300（Wi-Fi 5 / 802.11ac）：2023 年后的主流机型与路由器均为 ac，
+# 且与「5G 手机」的代数口径一致；ax 机型该值仍是常见读数（内核表未区分 ax）。
+_ANDROID_DOWNLINK_MAX_MBPS = 1300.0
+
+
+# --------------------------------------------------------------------------
+# WebGL 参数上限与扩展集（按 GPU 家族，非按机型）
+# --------------------------------------------------------------------------
+# 宿主是 Apple M 系列（Metal/ANGLE）：MAX_TEXTURE_SIZE=16384、
+# MAX_VIEWPORT_DIMS=[16384,16384]、MAX_SAMPLES=4，扩展集带桌面专属
+# EXT_texture_compression_bptc / rgtc / WEBGL_polygon_mode /
+# EXT_clip_control / WEBGL_blend_func_extended 等——「渲染器字符串是
+# Adreno 710、参数上限却是 M 系列」的三元组矛盾，gpuinfo.org 数据集比对
+# 可直接命中（方案 P2-1）。
+#
+# 取值依据：移动 GPU 的 OpenGL ES 上限受硬件约束，且各家族长期稳定——
+#   * Adreno（Qualcomm，A6xx/A7xx/A8xx 全系）：MAX_TEXTURE_SIZE 16384、
+#     MAX_VIEWPORT_DIMS 16384×16384、MAX_RENDERBUFFER_SIZE 16384、
+#     MAX_CUBE_MAP_TEXTURE_SIZE 16384、MAX_SAMPLES 4、MAX_DRAW_BUFFERS 8
+#   * Mali（ARM，Valhall/5th Gen）：MAX_TEXTURE_SIZE 16384（G715/G615 段），
+#     MAX_SAMPLES 4
+#   * Xclipse（Samsung/RDNA）、PowerVR（ImgTec）：同为 16384 档
+# 这些上限与桌面 Apple M 系列**数值相同**，所以单看 MAX_TEXTURE_SIZE 并不
+# 穿帮；真正穿帮的是**扩展集**——S3TC/BPTC/RGTC/polygon_mode 是桌面
+# OpenGL/D3D 纹理与光栅化扩展，移动 GPU 驱动不导出（iOS Metal 更是绝不
+# 支持 S3TC，检测站对 iOS 目标直接按 15 分计）。故本表的核心是扩展集
+# 白名单，MAX_* 只覆盖确有家族差异的项。
+#
+# 扩展集来源：内核在移动 GPU 上会导出的 WebGL1 扩展（Chrome 148 实测集
+# 合中剔除桌面专属项）。缺失项由注入层从 getSupportedExtensions() 过滤，
+# getExtension() 对过滤项返回 null（与「驱动不导出」同语义）。
+_GL_EXT_DESKTOP_ONLY = (
+    # 桌面 D3D/OpenGL 纹理压缩（DXT/BC 家族）——移动 GPU 不导出
+    "WEBGL_compressed_texture_s3tc",
+    "WEBGL_compressed_texture_s3tc_srgb",
+    "EXT_texture_compression_bptc",
+    "EXT_texture_compression_rgtc",
+    # 桌面光栅化/着色器扩展
+    "WEBGL_polygon_mode",
+    "EXT_clip_control",
+    "EXT_depth_clamp",
+    "EXT_polygon_offset_clamp",
+    "WEBGL_blend_func_extended",
+    "NV_shader_noperspective_interpolation",
+    "EXT_texture_mirror_clamp_to_edge",
+    "EXT_render_snorm",
+    "EXT_texture_norm16",
+)
+# iOS（Metal/ANGLE-Metal）额外：Spectre 侧信道计时扩展在 Apple 物理封禁，
+# 且移动 Safari 从不导出 WebGL1 的 draw_buffers/depth_texture 之外的桌面面。
+_GL_EXT_DESKTOP_ONLY_IOS = _GL_EXT_DESKTOP_ONLY + (
+    "EXT_disjoint_timer_query",
+    "EXT_disjoint_timer_query_webgl2",
+    "WEBGL_debug_shaders",
+    "WEBGL_multi_draw",
+)
+
+_GL_LIMITS_MOBILE: Dict[str, Any] = {
+    # 各家族一致的移动端上限（覆盖宿主同值项，语义上仍是「声明值」）
+    "MAX_TEXTURE_SIZE": 16384,
+    "MAX_RENDERBUFFER_SIZE": 16384,
+    "MAX_CUBE_MAP_TEXTURE_SIZE": 16384,
+    "MAX_VIEWPORT_DIMS": [16384, 16384],
+    "MAX_SAMPLES": 4,
+    "MAX_DRAW_BUFFERS": 8,
+    "MAX_VERTEX_ATTRIBS": 16,
+    "MAX_TEXTURE_IMAGE_UNITS": 16,
+    "MAX_VERTEX_TEXTURE_IMAGE_UNITS": 16,
+    "MAX_COMBINED_TEXTURE_IMAGE_UNITS": 32,
+    "MAX_VERTEX_UNIFORM_VECTORS": 1024,
+    "MAX_FRAGMENT_UNIFORM_VECTORS": 1024,
+    "MAX_VARYING_VECTORS": 30,
+    "ALIASED_POINT_SIZE_RANGE": [1, 511],
+    "ALIASED_LINE_WIDTH_RANGE": [1, 1],
+}
+
+
+def _webgl_profile(target_os: str) -> Dict[str, Any]:
+    """目标平台 WebGL 面校准规格：上限覆盖 + 扩展集剔除（按 GPU 家族）。"""
+    drop = list(_GL_EXT_DESKTOP_ONLY_IOS if target_os == "ios" else _GL_EXT_DESKTOP_ONLY)
+    return {
+        "limits": dict(_GL_LIMITS_MOBILE),
+        "dropExtensions": drop,
+    }
+
+
+# --------------------------------------------------------------------------
 # 平台 API 差集（窗口 / 文档 / navigator 三处统一按名删除）
 # --------------------------------------------------------------------------
 # 桌面内核会暴露一批「所属平台真机没有」的 API，属一行判假面。逐项证据 =
@@ -417,6 +576,9 @@ def generate_mobile_fingerprint(
         # 为 false，同样是单行级证据。真机取值 wifi/cellular/ethernet/…（枚举）。
         # 环境经代理出网、无蜂窝信息，取最常见且稳定的 'wifi'。
         connection_type: Optional[str] = "wifi"
+        # downlinkMax 与 type 同属 NetInfoDownlinkMax 开关，仅 Android 实现；
+        # 取值见 _ANDROID_DOWNLINK_MAX_MBPS（内核子类型表的 Wi-Fi 值域）。
+        downlink_max: Optional[float] = _ANDROID_DOWNLINK_MAX_MBPS
     else:
         os_token = os_version.replace(".", "_")
         safari_version = ".".join(os_version.split(".")[:2])  # iOS 27.0.1 → Safari 27.0
@@ -456,6 +618,7 @@ def generate_mobile_fingerprint(
         remove_props = list(_IOS_REMOVE_NAV_PROPS)
         empty_plugins = True
         connection_type = None  # Safari / CriOS 均无 navigator.connection（含 type）
+        downlink_max = None
 
     app_version = user_agent.split("Mozilla/", 1)[-1]
 
@@ -566,6 +729,9 @@ def generate_mobile_fingerprint(
             "hasBattery": battery is not None,
             "emptyPlugins": empty_plugins,
             "connectionType": connection_type,
+            "downlinkMax": downlink_max,
+            "codecCapability": _codec_capability(target_os),
+            "webglProfile": _webgl_profile(target_os),
             "removeNavigatorProps": remove_props,
             "uaCh": ua_ch,
             "maxTouchPoints": max_touch_points,

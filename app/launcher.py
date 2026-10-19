@@ -91,6 +91,21 @@ class LaunchManager:
         self._close_soon([inst])
         return False
 
+    def emulation_state(self, profile_id: str) -> Optional[str]:
+        """移动端仿真通道状态：ok / reconnecting；None = 非移动端或未运行。
+
+        通道断开期间内核会还原全部 CDP 覆盖，已打开页面退化为仅 JS 补丁
+        （媒体查询回落宿主值）、新标签页完全裸奔；看门狗会自动重连自愈，
+        面板据此提示用户。
+        """
+        inst = self._running.get(profile_id)
+        if inst is None:
+            return None
+        sess = inst.extra.get("mobile_session")
+        if sess is None:
+            return None
+        return "ok" if sess.healthy else "reconnecting"
+
     async def start(
         self,
         profile: dict[str, Any],
@@ -250,6 +265,23 @@ class LaunchManager:
                             timezone=launch.timezone or "",
                             start_url=start_url_final,
                         )
+
+                    # 工作台可见性/审计：看门狗断线重连事件写入审计日志，
+                    # 仿真通道状态经 LaunchManager.emulation_state 暴露给面板
+                    if mobile_session is not None:
+                        mobile_session.profile_id = profile_id
+                        mobile_session.profile_name = profile.get("name") or ""
+
+                        def _emu_event(_kind: str, count: int,
+                                       _name: str = mobile_session.profile_name,
+                                       _pid: str = profile_id) -> None:
+                            with contextlib.suppress(Exception):
+                                db.audit_log(
+                                    "browser.emu_reconnect", _name or _pid,
+                                    f"第 {count} 次自动重连（仿真通道断开自愈）",
+                                )
+
+                        mobile_session.on_session_event = _emu_event
 
                     async def _setup_mobile_context():
                         """建立移动端 CDP 仿真会话（常驻到环境停止）。
