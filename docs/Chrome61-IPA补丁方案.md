@@ -3,7 +3,7 @@
 > **依据**：[`Chrome61-IPA检测机制分析.md`](Chrome61-IPA检测机制分析.md)（2026-10-18；样本 `Chrome-v61-3163-73.ipa`，SHA-256 `5f901179…a041c`，官方原版、FairPlay 加密）
 > **目的**：把报告的检测面结论整理为可执行的补丁清单，分两条路线——**A：真机 / 云机（IPA 二次开发）**；**B：本项目仿真层（桌面 CDP 补齐 CriOS 检测面）**。
 > **结论先行**（报告 §8.1）：该 IPA 是原版 Chrome，本身不含任何伪装逻辑；"防关联/指纹"能力无论走哪条线都必须在外围补——A 线在设备侧（解密/重签/注入），B 线在本仓库（注入器 + 指纹库）。
-> **B 线状态（2026-10-19）**：P0 已落地并验证——`mobileExtra.browser = "chrome_ios"`、CriOS UA、`derive_spec.iosChrome`、`__gCrWeb` / `webkit.messageHandlers` / history·print·scrollTo 改写痕迹、iOS 两口径 `window.chrome = undefined`。P1 的面板/API 浏览器口径也已落地（创建/更新/MCP/面板）。同日加固：移动端平台属性面（Android 抹 WebHID + PDF 插件面收敛；iOS 抹 serial/usb/hid/bluetooth/keyboard/MIDI/presentation/relatedApps/vibrate/showOpenFilePicker/performance.memory + 补 GestureEvent 家族）与输入事件层触摸语义（API/RPA 的 click/scroll，见 [`移动端大厂检测对抗优化方案.md`](移动端大厂检测对抗优化方案.md)）。数据层 221 项、iOS Chrome 真机级 91 项、iOS Safari 79 项、Android 84 项全绿。未做：B1-7（`__crPostRequestWorkaround`，真机仅在 POST 导航时暴露，需按导航状态条件注入，留待校准）、B1-8（PaymentRequest）、真机抓取校准、`window.chrome` 深掩。
+> **B 线状态（2026-10-19）**：P0 已落地并验证——`mobileExtra.browser = "chrome_ios"`、CriOS UA、`derive_spec.iosChrome`、`__gCrWeb` / `webkit.messageHandlers` / history·print·scrollTo 改写痕迹、iOS 两口径 `window.chrome = undefined`。P1 的面板/API 浏览器口径也已落地（创建/更新/MCP/面板）。同日加固：移动端平台属性面（Android 抹 WebHID + PDF 插件面收敛 + 补 `NetworkInformation.type='wifi'`；iOS 抹 serial/usb/hid/bluetooth/keyboard/MIDI/presentation/relatedApps/vibrate/showOpenFilePicker/performance.memory + 补 GestureEvent 家族）与输入事件层触摸语义（API/RPA 的 click/scroll，见 [`移动端大厂检测对抗优化方案.md`](移动端大厂检测对抗优化方案.md)）。数据层 225 项、iOS Chrome 真机级 92 项、iOS Safari 80 项、Android 87 项全绿。未做：B1-7（`__crPostRequestWorkaround`，真机仅在 POST 导航时暴露，需按导航状态条件注入，留待校准）、B1-8（PaymentRequest）、真机抓取校准、`window.chrome` 深掩。
 
 ---
 
@@ -135,7 +135,7 @@
    | `maxTouchPoints / devicePixelRatio / screen / tz / languages` | 沿用既有断言 |
    | `pr`（PaymentRequest 来源） | 仅记录现状（形态差异边界，不断言） |
 
-2. 回归：iOS Safari 79 项、Android 84 项（`mobile_launch_verify.py`）、数据层 221 项（`mobile_test.py`）零回退——两模式互斥，不得污染 Safari 口径。
+2. 回归：iOS Safari 80 项、Android 87 项（`mobile_launch_verify.py`）、数据层 225 项（`mobile_test.py`）零回退——两模式互斥，不得污染 Safari 口径。
 3. 真实站点冒烟：BrowserScan / CreepJS（iOS-Chrome profile 与 Safari profile 各跑一轮，观察无新增红旗）。
 4. （可选）真机对照：在越狱真机 CriOS 上跑同一探针取基准，校准通道名 / 挂载层级 / 文本细节（报告 §7 路线图）。
 

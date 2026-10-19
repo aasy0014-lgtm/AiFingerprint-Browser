@@ -165,6 +165,8 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
               extra["removeNavigatorProps"] == ["hid"])
         check(f"[{tag}] plugins 置空标记（Android 无内置 PDF 插件）",
               extra["emptyPlugins"] is True)
+        check(f"[{tag}] NetworkInformation.type 标记（仅 Android 实现）",
+              extra.get("connectionType") == "wifi")
     else:
         check(f"[{tag}] platform == iPhone/iPad", nav["platform"] in ("iPhone", "iPad"))
         check(f"[{tag}] vendor == Apple Computer, Inc.", nav["vendor"] == "Apple Computer, Inc.")
@@ -361,12 +363,15 @@ def test_engines_compat() -> None:
     check("旧结构 Android：默认抹除 WebHID", spec["removeProps"] == ["hid"])
     check("旧结构 Android：plugins 置空（平台事实，不依赖存量标记）",
           spec["emptyPlugins"] is True)
+    check("旧结构 Android：NetworkInformation.type 兜底", spec["connectionType"] == "wifi")
     spec_ios = derive_spec(legacy, "ios")
     check("旧结构 iOS：默认抹除 Safari 缺失属性",
           set(spec_ios["removeProps"]) == {
               "connection", "pdfViewerEnabled", "userAgentData", "getBattery",
               "deviceMemory", "serial", "usb", "hid", "bluetooth", "keyboard",
               "requestMIDIAccess", "presentation", "getInstalledRelatedApps", "vibrate"})
+    check("旧结构 iOS：无 NetworkInformation.type（Safari 无该 API）",
+          spec_ios["connectionType"] is None)
 
 
 def main() -> None:

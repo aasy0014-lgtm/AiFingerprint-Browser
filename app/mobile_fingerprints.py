@@ -343,6 +343,11 @@ def generate_mobile_fingerprint(
         # 真机 Chrome Android 的 plugins/mimeTypes 为空、pdfViewerEnabled 恒 false。
         # 宿主桌面内核是 5 个 PDF 插件 + true，是「桌面装手机」的单行级证据。
         empty_plugins = True
+        # NetworkInformation.type：仅 Android 实现（MDN BCD chrome_android=38；
+        # 桌面 chrome 仅 ChromeOS 有）——桌面内核 'type' in navigator.connection
+        # 为 false，同样是单行级证据。真机取值 wifi/cellular/ethernet/…（枚举）。
+        # 环境经代理出网、无蜂窝信息，取最常见且稳定的 'wifi'。
+        connection_type: Optional[str] = "wifi"
     else:
         os_token = os_version.replace(".", "_")
         safari_version = ".".join(os_version.split(".")[:2])  # iOS 27.0.1 → Safari 27.0
@@ -381,6 +386,7 @@ def generate_mobile_fingerprint(
         device_memory = None
         remove_props = list(_IOS_REMOVE_NAV_PROPS)
         empty_plugins = True
+        connection_type = None  # Safari / CriOS 均无 navigator.connection（含 type）
 
     app_version = user_agent.split("Mozilla/", 1)[-1]
 
@@ -490,6 +496,7 @@ def generate_mobile_fingerprint(
             "hasUaCh": ua_ch is not None,
             "hasBattery": battery is not None,
             "emptyPlugins": empty_plugins,
+            "connectionType": connection_type,
             "removeNavigatorProps": remove_props,
             "uaCh": ua_ch,
             "maxTouchPoints": max_touch_points,

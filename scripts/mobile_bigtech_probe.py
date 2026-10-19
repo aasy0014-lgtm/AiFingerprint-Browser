@@ -104,7 +104,9 @@ BATTERY_JS = r"""(async () => {
   out.connection = safe(() => {
     const c = navigator.connection;
     if (!c) return '<missing>';
-    return { type: c.type, effectiveType: c.effectiveType, rtt: c.rtt, downlink: c.downlink, saveData: c.saveData };
+    return { type: c.type === undefined ? '<undef>' : c.type,
+             typeIn: 'type' in c,
+             effectiveType: c.effectiveType, rtt: c.rtt, downlink: c.downlink, saveData: c.saveData };
   });
   out.pdfViewerEnabled = safe(() => navigator.pdfViewerEnabled === undefined ? '<undef>' : navigator.pdfViewerEnabled);
   out.plugins = safe(() => Array.from(navigator.plugins).map((p) => p.name));

@@ -115,6 +115,8 @@ STATE_JS = """async () => {
         hasOpenFilePicker: typeof window.showOpenFilePicker === 'function',
         hasPerfMemory: typeof performance.memory !== 'undefined',
         pdfViewerValue: nav.pdfViewerEnabled,
+        connTypeIn: !!(nav.connection && ('type' in nav.connection)),
+        connType: (nav.connection && ('type' in nav.connection)) ? nav.connection.type : null,
         // ---- iOS WebKit 专有手势事件家族（Chromium 全平台无）----
         hasGestureEvent: typeof window.GestureEvent === 'function',
         hasGestureHandler: 'ongesturestart' in window,
@@ -245,7 +247,7 @@ STATE_JS = """async () => {
 # 若首个文档在补丁生效前执行，这里抓到的就是原生的宿主值。
 RACE_PROBE_HTML = """<!doctype html><html><head><script>
 window.__probe = {
-  uaMobile: /Android|iPhone/.test(navigator.userAgent),
+  ua: navigator.userAgent,
   touch: navigator.maxTouchPoints,
   colorDepth: screen.colorDepth,
   memory: navigator.deviceMemory,
@@ -278,6 +280,7 @@ window.addEventListener('message', function (e) { window.msgs.push(e.data); });
 try {
   var code = 'postMessage({early: navigator.platform, uaP: navigator.userAgentData ? navigator.userAgentData.platform : null});'
     + 'setTimeout(function () { postMessage({late: navigator.platform, devMem: navigator.deviceMemory,'
+    + ' connType: (navigator.connection && ("type" in navigator.connection)) ? navigator.connection.type : "<none>",'
     + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null}); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.workerData = {};
@@ -317,6 +320,7 @@ try {
 try {
   var code = 'postMessage({early: navigator.platform});'
     + 'setTimeout(function () { postMessage({late: navigator.platform, devMem: navigator.deviceMemory,'
+    + ' connType: (navigator.connection && ("type" in navigator.connection)) ? navigator.connection.type : "<none>",'
     + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null}); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.__workerData = {};
@@ -819,7 +823,7 @@ async def main() -> int:
         "languages 以 zh-CN 开头": bool(state["languages"]) and state["languages"][0] == "zh-CN",
         "时区覆盖生效（launch.timezone）": state.get("timezone") == "America/Los_Angeles",
         # ---- 竞态：新标签页首个文档（含内联脚本）必须已是补丁值 ----
-        "竞态：首文档 UA 为移动端": probe.get("uaMobile") is True,
+        "竞态：首文档 UA 为移动端": probe.get("ua") == nav["userAgent"],
         "竞态：首文档色深 24": probe.get("colorDepth") == 24,
         "竞态：首文档触控已启用": int(probe.get("touch") or 0) >= 5,
         "竞态：首文档时区已对齐": probe.get("tz") == "America/Los_Angeles",
@@ -917,6 +921,10 @@ async def main() -> int:
             "无 GestureEvent/ongesturestart（Chromium 无 WebKit 手势面）": (
                 state["hasGestureEvent"] is False and state["hasGestureHandler"] is False),
             "connection 存在（Chrome Android 特性）": state["hasConnection"] is True,
+            "connection.type == 'wifi'（仅 Android 实现；桌面内核无该属性）": (
+                state["connTypeIn"] is True and state["connType"] == "wifi"),
+            "Worker（页面）：connection.type == 'wifi'": wk_main.get("connType") == "wifi",
+            "Worker（跨域 iframe）：connection.type == 'wifi'": fr_worker.get("connType") == "wifi",
             "standalone 不存在（iOS 专有属性）": state["hasStandalone"] is False,
             "竞态：首文档 UA-CH/内存已注入": bool(probe.get("hasUaData"))
                 and probe.get("memory") == mem_class,
@@ -976,6 +984,7 @@ async def main() -> int:
             "getBattery 不存在（WKWebView 无该 API）": state["hasGetBattery"] is False,
             "deviceMemory 不暴露（WKWebView 无该 API）": state["deviceMemory"] is None,
             "connection 不存在（Safari/CriOS 均无该 API）": state["hasConnection"] is False,
+            "Worker（页面）：无 connection.type（WKWebView 行为）": wk_main.get("connType") == "<none>",
             "pdfViewerEnabled 不存在（Safari/CriOS 均无该 API）": state["hasPdfViewer"] is False,
             "plugins/mimeTypes 为空（WKWebView 行为）": state["pluginsLen"] == 0 and state["mimeTypesLen"] == 0,
             # ---- 桌面 Chromium 独有 API 的抹除（一条 `'serial' in navigator` 即可判假）----

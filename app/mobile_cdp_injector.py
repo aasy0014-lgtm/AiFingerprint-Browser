@@ -203,6 +203,14 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
     # 存量指纹无需重建即可获得真机 PDF 面。
     empty_plugins = True
 
+    # NetworkInformation.type：仅 Android 实现（MDN BCD chrome_android=38；
+    # 桌面 chrome 仅 ChromeOS 有）。桌面内核上 'type' in navigator.connection
+    # 为 false——「桌面装 Android」的单行级证据。旧指纹无该字段时按平台兜底
+    # （与 empty_plugins 同理：存量档案无需重建）。
+    connection_type = extra.get("connectionType")
+    if connection_type is None and target_os == "android":
+        connection_type = "wifi"
+
     color_depth = screen.get("colorDepth")
     try:
         color_depth = int(color_depth)
@@ -220,6 +228,7 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
         "battery": battery,
         "removeProps": list(remove_props),
         "emptyPlugins": empty_plugins,
+        "connectionType": connection_type,
         "ios": target_os == "ios",
         "iosChrome": ios_chrome,
         "webgl": webgl,
@@ -524,6 +533,15 @@ _PATCH_TEMPLATE = r"""
         // 不同（桌面内核是 5 个 PDF 插件 + true，单行即可判「桌面装手机」）。
         if (D.emptyPlugins && !D.ios) {
             defineGet(N, 'pdfViewerEnabled', false);
+        }
+
+        // ---- Android Chrome：NetworkInformation.type（仅 Android 实现）----
+        // MDN BCD：chrome_android=38 有该属性；桌面 chrome 仅 ChromeOS 有——
+        // 桌面内核上 'type' in navigator.connection 为 false，是「桌面装
+        // Android」的单行级证据。真机取值为枚举（wifi/cellular/ethernet/…），
+        // 与其它信号无交叉约束，按环境出网方式取 'wifi'。
+        if (D.connectionType && !D.ios && typeof NetworkInformation !== 'undefined') {
+            defineGet(NetworkInformation.prototype, 'type', D.connectionType);
         }
 
         // ---- iOS Chrome（CriOS）：页面世界检测面 ----
@@ -845,6 +863,7 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "battery": spec.get("battery"),
         "removeProps": list(spec.get("removeProps") or []),
         "emptyPlugins": bool(spec.get("emptyPlugins")),
+        "connectionType": str(spec.get("connectionType") or ""),
         "ios": bool(spec.get("ios")),
         "iosChrome": spec.get("iosChrome"),
         "webgl": spec.get("webgl"),
@@ -956,6 +975,13 @@ _WORKER_PATCH_TEMPLATE = r"""
             defineGet(N, 'deviceMemory', D.deviceMemory);
         }
 
+        // ---- Android Chrome：Worker 内 NetworkInformation.type 同样存在 ----
+        // （MDN BCD worker_support chrome_android=38；桌面 WorkerNavigator 有
+        //   connection 但没有 type 属性）
+        if (D.connectionType && !D.ios && typeof NetworkInformation !== 'undefined') {
+            defineGet(NetworkInformation.prototype, 'type', D.connectionType);
+        }
+
         // ---- UA-CH：Worker 内 navigator.userAgentData 与主文档一致 ----
         // （安全上下文下内核原生提供一份桌面 Linux 元数据：platform "Linux"、
         //   mobile false；真机 Android Worker 的 UA-CH 与主文档相同）
@@ -1025,6 +1051,7 @@ def build_worker_patch(spec: Dict[str, Any]) -> str:
         "deviceMemory": spec.get("deviceMemory"),
         "uaCh": spec.get("uaCh"),
         "removeProps": list(spec.get("removeProps") or []),
+        "connectionType": str(spec.get("connectionType") or ""),
         "ios": bool(spec.get("ios")),
         "webgpu": spec.get("webgpu"),
     }
@@ -1079,7 +1106,13 @@ class MobileEmulationSession:
                 "ua": ua, "platform": platform, "vendor": "",
                 "maxTouchPoints": int(max_touch_points or 5),
                 "deviceMemory": None, "colorDepth": None, "uaCh": None,
-                "battery": None, "removeProps": [], "emptyPlugins": False,
+                "battery": None,
+                # 与 derive_spec 同口径：平台事实不依赖调用方式（移动仿真会话
+                # 只服务 Android/iOS，PDF 面与桌面独有 API 都要收敛）
+                "removeProps": (list(_IOS_REMOVE_PROPS) if target_os == "ios"
+                                else list(_ANDROID_REMOVE_PROPS)),
+                "emptyPlugins": True,
+                "connectionType": "wifi" if target_os == "android" else None,
                 "ios": target_os == "ios", "iosChrome": None, "webgl": None, "webgpu": None,
                 "mediaVideoInputs": 0,
                 "cssWidth": css_w, "cssHeight": css_h,
