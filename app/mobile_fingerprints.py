@@ -492,6 +492,13 @@ _IOS_REMOVE_GLOBALS = [
     "showSaveFilePicker", "showDirectoryPicker",
     # navigator 成员：WebXR / VirtualKeyboard / Ink（BCD safari_ios=false）
     "xr", "virtualKeyboard", "ink",
+    # V8 专有、WebKit 从未实现的两项。检测站各占一档独立判据：
+    #   Intl.v8BreakIterator —— V8 的旧版 ICU 断词器，WebKit 的 Intl 无此成员；
+    #   navigator.webkitTemporaryStorage / webkitPersistentStorage —— Blink
+    #   分叉时遗留的配额 API，WebKit main 的 NavigatorStorage.idl 只声明
+    #   `storage`（Source/WebCore/page/NavigatorStorage.idl，2026-10 核实），
+    #   真机 Safari/CriOS 均无。桌面内核两者俱全，一行 `in` 即可判假。
+    "v8BreakIterator", "webkitTemporaryStorage", "webkitPersistentStorage",
 ]
 
 # ---- Android Chrome（真实 Chrome Android 无、桌面内核有）----

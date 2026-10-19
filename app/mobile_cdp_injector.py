@@ -461,12 +461,27 @@ _PATCH_TEMPLATE = r"""
             var registry = new WeakMap();
             var faked = function toString() {
                 var v = registry.get(this);
-                return v !== undefined ? v : origToString.call(this);
+                if (v !== undefined) { return v; }
+                var s = origToString.call(this);
+                // JSC 的原生函数是 `function f() {\n    [native code]\n}`（多行缩进），
+                // V8 是单行 `function f() { [native code] }`。未登记（未被本补丁
+                // 包装）的原生函数直接透传会暴露 V8 格式——检测站对
+                // `Function.prototype.toString.call(eval)` 一行判定引擎，故 iOS
+                // 目标上统一改写为 JSC 形态。
+                if (D && D.ios && typeof s === 'string'
+                        && s.indexOf('[native code]') !== -1
+                        && s.indexOf('\n') === -1) {
+                    var m = /^function\s*([^(]*)\(/.exec(s);
+                    return 'function ' + (m ? m[1].trim() : '') + '() {\n    [native code]\n}';
+                }
+                return s;
             };
             var mask = function (fn, name, src) {
                 try {
                     if (typeof fn === 'function') {
-                        registry.set(fn, src || ('function ' + name + '() { [native code] }'));
+                        registry.set(fn, src || (D && D.ios
+                            ? 'function ' + name + '() {\n    [native code]\n}'
+                            : 'function ' + name + '() { [native code] }'));
                         try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e2) {}
                     }
                 } catch (e) {}
@@ -649,6 +664,118 @@ _PATCH_TEMPLATE = r"""
             // 赋值 undefined 后 typeof/truthiness 检查通过；'chrome' in window
             // 与 getOwnPropertyDescriptor 的残余暴露属内核层限制（已知边界）。
             try { window.chrome = undefined; } catch (e) {}
+
+            // ---- JavaScriptCore 引擎面 ----
+            // 检测站对「声明 iOS 但引擎是 V8」有四条独立判据，逐条对齐 WebKit：
+            //   a) 调用栈格式：JSC 为 `fn@url:line:col`，V8 为 `    at fn (...)`。
+            //   b) Error 实例的 line/column own 属性：JSC 恒有（ErrorInstance
+            //      的物理属性），V8 没有。
+            //   c) 原生函数 toString：JSC 多行
+            //      `function f() {\n    [native code]\n}`，V8 单行。
+            //   d) Error.prepareStackTrace：JSC 无该钩子（V8 专有）。
+            // 取证：Playwright WebKit 27.2 实测 + WebKit main
+            // Source/JavaScriptCore/runtime/{ErrorConstructor,ErrorPrototype}.cpp。
+            //
+            // 注意 Error.captureStackTrace 不是 V8 专有：WebKit main 的
+            // ErrorConstructor.cpp:52 注册了同名静态方法（检测站该项文案已过时，
+            // 与 SharedWorker 同类），故不抹除。
+            //
+            // 只有「显式构造」的 Error 能拿到 line/column：V8 引擎内部抛出的
+            // TypeError/SyntaxError 在 C++ 侧直接创建，不经过 Error 全局的
+            // construct/apply 陷阱。这类异常的 message 文本仍是 V8 口径
+            // （"Cannot read properties of null"），属引擎层残余，见文档。
+            try {
+                if (typeof Error === 'function' && typeof WeakMap === 'function') {
+                    var __jscLoc = new WeakMap();
+                    var __parseV8Frame = function (text) {
+                        // "    at fn (url:line:col)" / "    at url:line:col"
+                        var m = /(?:\(|at )([^\s()]+):(\d+):(\d+)\)?\s*$/.exec(text);
+                        if (!m) { return null; }
+                        return { file: m[1], line: parseInt(m[2], 10), col: parseInt(m[3], 10) };
+                    };
+                    var __frameName = function (text) {
+                        var t = text.replace(/^\s*at\s+/, '');
+                        var p = t.indexOf(' (');
+                        if (p > 0) { return t.slice(0, p); }
+                        var m = /^(.*?):\d+:\d+$/.exec(t);
+                        return m ? '' : t;
+                    };
+                    var __jscStack = function (raw) {
+                        var lines = String(raw).split('\n');
+                        var out = [];
+                        // 首行是 "Error: msg"（无调用点）——JSC 从调用帧开始
+                        for (var i = 1; i < lines.length; i++) {
+                            if (!/^\s*at\s+/.test(lines[i])) { continue; }
+                            var nm = __frameName(lines[i]);
+                            // Proxy 陷阱帧：`Object.construct@<anonymous>:294:56`
+                            // 之类的合成帧恒指向本补丁自身，真机不存在，且会让
+                            // 每个 Error 的 line/column 变成同一个常量——直接丢弃。
+                            if (/^Object\.(construct|apply)$/.test(nm)
+                                    && /<anonymous>/.test(lines[i])) { continue; }
+                            var loc = __parseV8Frame(lines[i]);
+                            out.push(nm + '@' + (loc ? loc.file + ':' + loc.line + ':' + loc.col : ''));
+                        }
+                        return out.join('\n');
+                    };
+                    var __jscAttach = function (err) {
+                        try {
+                            var raw;
+                            var getter = Object.getOwnPropertyDescriptor(Error.prototype, 'stack');
+                            raw = getter && getter.get ? getter.get.call(err) : err.stack;
+                            if (typeof raw !== 'string' || !/^\s*at\s+/m.test(raw)) { return err; }
+                            var loc = null;
+                            var __re = /^\s*at\s+.*$/gm, __mm;
+                            while ((__mm = __re.exec(raw)) !== null) {
+                                var __nm = __frameName(__mm[0]);
+                                if (/^Object\.(construct|apply)$/.test(__nm)
+                                        && /<anonymous>/.test(__mm[0])) { continue; }
+                                loc = __parseV8Frame(__mm[0]);
+                                break;
+                            }
+                            var text = __jscStack(raw);
+                            Object.defineProperty(err, 'stack', {
+                                value: text, writable: true,
+                                enumerable: false, configurable: true,
+                            });
+                            // line/column 在 JSC 是 own、不可枚举、可写、可配置的
+                            // 数据属性（Playwright WebKit 实测 {w:true,e:false,c:true}）。
+                            Object.defineProperty(err, 'line', {
+                                value: loc ? loc.line : 0, writable: true,
+                                enumerable: false, configurable: true,
+                            });
+                            Object.defineProperty(err, 'column', {
+                                value: loc ? loc.col : 0, writable: true,
+                                enumerable: false, configurable: true,
+                            });
+                        } catch (e) {}
+                        return err;
+                    };
+                    var __NErr = Error;
+                    var __JscError = new Proxy(__NErr, {
+                        construct: function (t, args, nt) {
+                            return __jscAttach(Reflect.construct(t, args, nt));
+                        },
+                        apply: function (t, thisArg, args) {
+                            return __jscAttach(Reflect.apply(t, thisArg, args));
+                        },
+                    });
+                    try {
+                        Object.defineProperty(__JscError, 'name', {
+                            value: __NErr.name, configurable: true,
+                        });
+                    } catch (e) {}
+                    try {
+                        Object.defineProperty(__JscError, 'length', {
+                            value: __NErr.length, configurable: true,
+                        });
+                    } catch (e) {}
+                    Object.defineProperty(window, 'Error', {
+                        value: __JscError, writable: true,
+                        enumerable: false, configurable: true,
+                    });
+                    // JSC 无 prepareStackTrace：内核上它本就缺席，此处不做定义。
+                }
+            } catch (e) {}
 
             // ---- iOS WebKit 与桌面 Chromium 的页面/窗口级属性差 ----
             // removeProp 只覆盖 navigator；以下两项在 Window / Performance 原型上。
@@ -1583,6 +1710,26 @@ _PATCH_TEMPLATE = r"""
             } catch (e) {}
         }
 
+        // ---- Intl 上的平台差集成员（Intl 既非 window 成员也非原型成员）----
+        // v8BreakIterator 挂在 Intl 对象自身（`Object.getOwnPropertyDescriptor(Intl,
+        // 'v8BreakIterator')` = {writable:true, enumerable:false, configurable:true}），
+        // 按名 delete 即可。带兜底定时器：V8 在个别构建里会于脚本执行期把该成员
+        // 惰性装回，0ms 定时器补删一次成本可忽略，且真机 WebKit 本就没有该成员，
+        // 删除语义与真机一致。
+        var __intlDrops = [];
+        for (var di = 0; di < dropsG.length; di++) {
+            if (dropsG[di] === 'v8BreakIterator') { __intlDrops.push(dropsG[di]); }
+        }
+        if (__intlDrops.length && typeof Intl !== 'undefined') {
+            var __dropIntl = function () {
+                for (var k = 0; k < __intlDrops.length; k++) {
+                    try { delete Intl[__intlDrops[k]]; } catch (e) {}
+                }
+            };
+            __dropIntl();
+            try { setTimeout(__dropIntl, 0); } catch (e) {}
+        }
+
         // ---- 无内置 PDF 插件的平台（iOS WKWebView / Android Chrome）----
         // iOS：Safari 的 plugins/mimeTypes 恒为空（无水印 PDF 插件体系）。
         // Android：Chrome 构建开关 enable_pdf=!is_android，同样为空。
@@ -2110,12 +2257,27 @@ _WORKER_PATCH_TEMPLATE = r"""
             var registry = new WeakMap();
             var faked = function toString() {
                 var v = registry.get(this);
-                return v !== undefined ? v : origToString.call(this);
+                if (v !== undefined) { return v; }
+                var s = origToString.call(this);
+                // JSC 的原生函数是 `function f() {\n    [native code]\n}`（多行缩进），
+                // V8 是单行 `function f() { [native code] }`。未登记（未被本补丁
+                // 包装）的原生函数直接透传会暴露 V8 格式——检测站对
+                // `Function.prototype.toString.call(eval)` 一行判定引擎，故 iOS
+                // 目标上统一改写为 JSC 形态。
+                if (D && D.ios && typeof s === 'string'
+                        && s.indexOf('[native code]') !== -1
+                        && s.indexOf('\n') === -1) {
+                    var m = /^function\s*([^(]*)\(/.exec(s);
+                    return 'function ' + (m ? m[1].trim() : '') + '() {\n    [native code]\n}';
+                }
+                return s;
             };
             var mask = function (fn, name, src) {
                 try {
                     if (typeof fn === 'function') {
-                        registry.set(fn, src || ('function ' + name + '() { [native code] }'));
+                        registry.set(fn, src || (D && D.ios
+                            ? 'function ' + name + '() {\n    [native code]\n}'
+                            : 'function ' + name + '() { [native code] }'));
                         try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e2) {}
                     }
                 } catch (e) {}
@@ -2243,6 +2405,28 @@ _WORKER_PATCH_TEMPLATE = r"""
                 }
             } catch (e) {}
         }
+        // Intl 上的平台差集成员：Intl 既非 self 成员也非 WorkerGlobalScope
+        // 原型成员（挂在 Intl 对象自身），上面的按名删除覆盖不到。Worker 里
+        // `Intl.v8BreakIterator` 与页面同源存在（实测），不补则「页面 false、
+        // Worker true」构成跨上下文矛盾。D.removeGlobals 与
+        // D.removeWorkerGlobals 两表都需查（iOS 的 v8BreakIterator 在页面表里）。
+        (function () {
+            if (typeof Intl === 'undefined') { return; }
+            var pools = [dropsW, D.removeGlobals || []];
+            var seen = {};
+            for (var pi = 0; pi < pools.length; pi++) {
+                for (var qi = 0; qi < pools[pi].length; qi++) {
+                    if (pools[pi][qi] === 'v8BreakIterator') { seen[pools[pi][qi]] = 1; }
+                }
+            }
+            var __dropIntlW = function () {
+                for (var k in seen) {
+                    try { delete Intl[k]; } catch (e) {}
+                }
+            };
+            __dropIntlW();
+            try { setTimeout(__dropIntlW, 0); } catch (e) {}
+        })();
 
         // ---- iOS Safari：Worker 侧同样没有 performance.memory ----
         // （WebKit 未实现 MemoryInfo；内核在 Worker 的 performance 上同样暴露）
@@ -2476,6 +2660,11 @@ def build_worker_drop_patch(drops: List[str]) -> str:
         "                });\n"
         "            }\n"
         "        } catch (e) {}\n"
+        "        // Intl 成员（如 v8BreakIterator）挂在 Intl 对象自身，非 self\n"
+        "        // 成员也非原型成员，需按名单独删。\n"
+        "        if (typeof Intl !== 'undefined') {\n"
+        "            try { delete Intl[n]; } catch (e) {}\n"
+        "        }\n"
         "    }\n"
         "})();\n"
     )
@@ -2553,6 +2742,7 @@ class MobileEmulationSession:
         self.ua = spec["ua"]
         self.platform = spec["platform"]
         self.max_touch_points = spec["maxTouchPoints"]
+        self.ios = bool(spec.get("ios"))
         self.css_w = spec["cssWidth"]
         self.css_h = spec["cssHeight"]
         self.viewport_h = spec["viewportHeight"]
@@ -3007,6 +3197,14 @@ class MobileEmulationSession:
                     "enabled": True,
                     "maxTouchPoints": self.max_touch_points,
                 }, session_id=session_id)
+            # 色域：与页面路径同口径（setEmulatedMedia 按目标生效，OOPIF 是
+            # 独立目标，不继承主文档的媒体特性覆盖）。
+            if self.ios:
+                with contextlib.suppress(CDPError):
+                    await self._send("Emulation.setEmulatedMedia", {
+                        "media": "screen",
+                        "features": [{"name": "color-gamut", "value": "p3"}],
+                    }, session_id=session_id)
             # 不启用 Emulation.setEmitTouchEventsForMouse：实测（fp-chromium 148）
             # 该转换会吞掉 mousePressed/Released 的 CDP 应答 → Playwright 点击
             # 永久挂起，且产出序列缺兼容鼠标事件与 click。移动端自动化应改用
@@ -3059,6 +3257,13 @@ class MobileEmulationSession:
         self._applied_targets.add(target_id)
         patch = build_worker_patch(self.spec)
         drops = list(self.spec.get("removeWorkerGlobals") or [])
+        # Intl 成员（v8BreakIterator）在页面表 removeGlobals 里，但 Worker 首
+        # 脚本前同样需要补删——否则「页面 false、Worker true」构成跨上下文
+        # 矛盾。合并进插桩断点的删除清单（build_worker_drop_patch 已按名尝试
+        # `delete Intl[n]`）。
+        for _n in (self.spec.get("removeGlobals") or []):
+            if _n == "v8BreakIterator" and _n not in drops:
+                drops.append(_n)
         injected = False
         try:
             await self._send("Runtime.evaluate", {"expression": patch},
@@ -3247,6 +3452,20 @@ class MobileEmulationSession:
                 "maxTouchPoints": self.max_touch_points,
             }, session_id=sid)
         # 不启用 setEmitTouchEventsForMouse（会吞鼠标命令应答，见主路径注释）
+
+        # 2.5 色域：iPhone 7 及以后全系是 Display P3 屏，
+        #     (color-gamut: p3) 恒为 true；宿主桌面显示器多为 sRGB，内核默认
+        #     报 false——「声明 iPhone 但只有 sRGB」是硬件级互斥判据。CDP 的
+        #     setEmulatedMedia 可原生注入该特性，无需 JS 改 matchMedia。
+        #     实测（fp-chromium 148）：立即生效、同一页面内导航后保持、同进程
+        #     iframe 继承，但**不跨页面**（新 page 目标回到 sRGB）——故页面路径
+        #     与 OOPIF 路径各自下发，且每次页面级仿真都重发。
+        if self.ios:
+            with contextlib.suppress(CDPError):
+                await self._send("Emulation.setEmulatedMedia", {
+                    "media": "screen",
+                    "features": [{"name": "color-gamut", "value": "p3"}],
+                }, session_id=sid)
 
         # 3. UA 覆盖（内核层只会按桌面平台拼 UA，必须显式覆盖为移动端 UA）
         if self.ua:
