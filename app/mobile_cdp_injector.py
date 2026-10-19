@@ -1099,6 +1099,270 @@ _PATCH_TEMPLATE = r"""
                     });
                 }
             } catch (e) {}
+
+            // 13) Safari 全局面（WebKit main / iOS 27 口径）：
+            //     a) WebKitPoint + webkitConvertPointFromPageToNode /
+            //        webkitConvertPointFromNodeToPage。DOMWindow.idl:120-122 原文
+            //        注「Blink has already dropped these」；MDN BCD：
+            //        chrome/chrome_android/webview_android 移除于 39、edge 79、
+            //        opera/samsung 同期，safari 4 / safari_ios 3 / webview_ios 3
+            //        保留 → 桌面内核一行
+            //        `typeof window.webkitConvertPointFromNodeToPage === 'function'`
+            //        判「不是 Safari」。真机语义（WebKit Node::convertToPage /
+            //        convertFromPage，均 MapCoordinatesMode::UseTransforms）：
+            //        node 无 layout box 时沿 parentElement 上溯，上溯到头则原样
+            //        返回；本实现以 border box（getBoundingClientRect + 滚动偏移）
+            //        换算——无变换元素与真机一致（layout 测试的 (0,0)/(5,40) 往返
+            //        口径），rotate/scale/skew 场景退化为 AABB（文档边界）。
+            //        WebIDL 转换口径（LayoutTests/fast/dom/Window/
+            //        webkitConvertPoint.html）：node 非 Node、p 非 WebKitPoint
+            //        且非 null/undefined → TypeError；node/p 任一 null → null。
+            //     b) webkitCancelRequestAnimationFrame：DOMWindow.idl:110
+            //        [ImplementedAs=cancelAnimationFrame]（webkitRequestAnimationFrame
+            //        / webkitCancelAnimationFrame 内核本就携带）。
+            //     c) WebKitNamespace / UserMessageHandlersNamespace /
+            //        UserMessageHandler 三个接口对象：WebKit 的 IDL 均无
+            //        LegacyNoInterfaceObject、Conditional=USER_MESSAGE_HANDLERS
+            //        （Cocoa 编译开启，PlatformEnableCocoa.h）→ 真机页面世界接口
+            //        对象存在且不可构造（IDL 无 constructor）；实例 window.webkit
+            //        仅当宿主为「页面世界」注册过消息处理器时出现
+            //        （JSDOMWindowCustom.cpp:227 → LocalDOMWindow::
+            //        shouldHaveWebKitNamespaceForWorld：页面世界
+            //        hasUserMessageHandler 才为 true）——Safari 无、CriOS 有。
+            //        原型成员按 world 门控：evaluateScript(isNonNormal) /
+            //        createJSHandle / createNodeSnapshot 在页面世界缺席，
+            //        messageHandlers / buffers 保留（WebKitNamespace.idl）。
+            //        CriOS 页面世界注册的通道：crwebinvoke（注入桥 core，§9.4
+            //        源码级确认）+ POST 两通道（POST 导航 workaround，B1-7 待
+            //        按导航态条件注入）；真机 window.webkit 为 DontDelete+ReadOnly
+            //        （JSC slot 属性：writable:false / enumerable:true /
+            //        configurable:false），postMessage 返回 Promise 且宿主未启用
+            //        回执时保持 pending（java_script_content_world.mm 页面世界
+            //        分支 CHECK 无回执）。
+            try {
+                var __wkFround = (typeof Math.fround === 'function')
+                    ? Math.fround : function (v) { return v; };
+                var __wkPtStore = new WeakMap();
+                var __wkPtRec = function (recv) {
+                    var s = null;
+                    try { s = __wkPtStore.get(recv); } catch (e) {}
+                    if (!s) { throw new TypeError('Illegal invocation'); }
+                    return s;
+                };
+                if (typeof window.WebKitPoint === 'undefined') {
+                    var __WKP = __maskNative(function WebKitPoint(x, y) {
+                        if (!(this instanceof __WKP)) {
+                            throw new TypeError('Illegal constructor');
+                        }
+                        var px = (arguments.length > 0 && x !== undefined) ? x : 0;
+                        var py = (arguments.length > 1 && y !== undefined) ? y : 0;
+                        __wkPtStore.set(this, { x: __wkFround(px), y: __wkFround(py) });
+                    }, 'WebKitPoint');
+                    try {
+                        Object.defineProperty(__WKP, 'length', { value: 0, configurable: true });
+                    } catch (e) {}
+                    try {
+                        // 接口对象 prototype 属性 = ReadOnly|DontEnum|DontDelete
+                        Object.defineProperty(__WKP, 'prototype', { writable: false });
+                    } catch (e) {}
+                    var __wkPtMember = function (name) {
+                        Object.defineProperty(__WKP.prototype, name, {
+                            configurable: true, enumerable: true,
+                            get: __maskNative(function () {
+                                return __wkPtRec(this)[name];
+                            }, 'get ' + name),
+                            set: __maskNative(function (v) {
+                                __wkPtRec(this)[name] = __wkFround(v);
+                            }, 'set ' + name),
+                        });
+                    };
+                    __wkPtMember('x');
+                    __wkPtMember('y');
+                    Object.defineProperty(__WKP.prototype, 'constructor', {
+                        value: __WKP, writable: true, enumerable: false, configurable: true,
+                    });
+                    try {
+                        Object.defineProperty(__WKP.prototype, Symbol.toStringTag, {
+                            value: 'WebKitPoint', writable: false,
+                            enumerable: false, configurable: true,
+                        });
+                    } catch (e) {}
+                    Object.defineProperty(window, 'WebKitPoint', {
+                        value: __WKP, writable: true, enumerable: false, configurable: true,
+                    });
+                }
+                // WebIDL Node? 品牌校验：借原生 nodeType 访问器（跨 realm 可用）
+                var __wkNodeTypeGet = null;
+                try {
+                    __wkNodeTypeGet = Object.getOwnPropertyDescriptor(
+                        Node.prototype, 'nodeType').get;
+                } catch (e) {}
+                var __wkIsNode = function (v) {
+                    if (!v || typeof v !== 'object') { return false; }
+                    if (__wkNodeTypeGet) {
+                        try { __wkNodeTypeGet.call(v); return true; } catch (e) { return false; }
+                    }
+                    return v instanceof Node;
+                };
+                var __wkAnchorOf = function (node) {
+                    var n = node;
+                    while (n) {
+                        if (n.nodeType === 9) {          // Document：LayoutView 原点 == 文档原点
+                            n = n.documentElement;
+                            continue;
+                        }
+                        if (n.nodeType !== 1) {          // 文本/注释：真机用其 renderer，仿真取父元素
+                            n = n.parentElement;
+                            continue;
+                        }
+                        var rects = null;
+                        try { rects = n.getClientRects(); } catch (e) { rects = null; }
+                        if (rects && rects.length > 0) { return n; }
+                        n = n.parentElement;
+                    }
+                    return null;
+                };
+                var __wkDefineConvert = function (toPage) {
+                    var name = toPage
+                        ? 'webkitConvertPointFromNodeToPage'
+                        : 'webkitConvertPointFromPageToNode';
+                    if (typeof window[name] === 'function') { return; }
+                    var fn = __maskNative(function (node, p) {
+                        var n = node;
+                        if (n === undefined || n === null) { return null; }
+                        if (!__wkIsNode(n)) {
+                            throw new TypeError('Argument 1 (node) to Window.' + name
+                                + ' must be an instance of Node');
+                        }
+                        var pt = p;
+                        if (pt === undefined || pt === null) { return null; }
+                        if (!(pt instanceof __WKP)) {
+                            throw new TypeError('Argument 2 (p) to Window.' + name
+                                + ' must be an instance of WebKitPoint');
+                        }
+                        var el = __wkAnchorOf(n);
+                        if (!el) { return new __WKP(pt.x, pt.y); }
+                        var r = el.getBoundingClientRect();
+                        var ox = r.left + (window.pageXOffset || 0);
+                        var oy = r.top + (window.pageYOffset || 0);
+                        return toPage
+                            ? new __WKP(pt.x + ox, pt.y + oy)
+                            : new __WKP(pt.x - ox, pt.y - oy);
+                    }, name);
+                    try {
+                        Object.defineProperty(fn, 'length', { value: 0, configurable: true });
+                    } catch (e) {}
+                    Object.defineProperty(window, name, {
+                        value: fn, writable: true, enumerable: true, configurable: true,
+                    });
+                };
+                __wkDefineConvert(true);
+                __wkDefineConvert(false);
+                if (typeof window.webkitCancelRequestAnimationFrame === 'undefined'
+                        && typeof window.cancelAnimationFrame === 'function') {
+                    var __wkCraf = __maskNative(function (id) {
+                        return window.cancelAnimationFrame(id);
+                    }, 'webkitCancelRequestAnimationFrame');
+                    try {
+                        Object.defineProperty(__wkCraf, 'length', { value: 1, configurable: true });
+                    } catch (e) {}
+                    Object.defineProperty(window, 'webkitCancelRequestAnimationFrame', {
+                        value: __wkCraf, writable: true, enumerable: true, configurable: true,
+                    });
+                }
+                // 不可构造的接口对象（apply/construct 均抛 TypeError，与 WebKit
+                // 「Illegal constructor」同文案；Proxy 无 JS 可观测品牌）
+                var __wkIfaceOf = function (name, fillProto) {
+                    var target = __maskNative(function () {
+                        throw new TypeError('Illegal constructor');
+                    }, name);
+                    try {
+                        Object.defineProperty(target, 'length', { value: 0, configurable: true });
+                    } catch (e) {}
+                    var proto = target.prototype;
+                    try {
+                        // WebKit 生成器：接口对象 prototype 属性 = ReadOnly|DontEnum|DontDelete
+                        Object.defineProperty(target, 'prototype', { writable: false });
+                    } catch (e) {}
+                    if (fillProto) { fillProto(proto); }
+                    var out = target;
+                    if (typeof Proxy !== 'undefined') {
+                        var __throwCtor = function () {
+                            throw new TypeError('Illegal constructor');
+                        };
+                        out = new Proxy(target, { apply: __throwCtor, construct: __throwCtor });
+                    }
+                    Object.defineProperty(proto, 'constructor', {
+                        value: out, writable: true, enumerable: false, configurable: true,
+                    });
+                    try {
+                        Object.defineProperty(proto, Symbol.toStringTag, {
+                            value: name, writable: false, enumerable: false, configurable: true,
+                        });
+                    } catch (e) {}
+                    return out;
+                };
+                var __wkNsSlots = new WeakMap();
+                var WebKitNamespace = __wkIfaceOf('WebKitNamespace', function (proto) {
+                    var mkMember = function (name, pick) {
+                        Object.defineProperty(proto, name, {
+                            configurable: true, enumerable: true,
+                            get: __maskNative(function () {
+                                var s = null;
+                                try { s = __wkNsSlots.get(this); } catch (e) {}
+                                if (!s) { throw new TypeError('Illegal invocation'); }
+                                return pick(s);
+                            }, 'get ' + name),
+                        });
+                    };
+                    mkMember('messageHandlers', function (s) { return s.handlers; });
+                    mkMember('buffers', function (s) { return s.buffers; });
+                });
+                var UserMessageHandlersNamespace = __wkIfaceOf('UserMessageHandlersNamespace');
+                var UserMessageHandler = __wkIfaceOf('UserMessageHandler', function (proto) {
+                    defineFn(proto, 'postMessage', function (message) {
+                        // 真机为原生 binding：返回 Promise，宿主未启用回执时永不落定
+                        try {
+                            return new Promise(function () {});
+                        } catch (e) { return undefined; }
+                    });
+                });
+                var __wkWinIface = function (name, iface) {
+                    if (typeof window[name] !== 'undefined') { return; }
+                    Object.defineProperty(window, name, {
+                        value: iface, writable: true, enumerable: false, configurable: true,
+                    });
+                };
+                __wkWinIface('WebKitNamespace', WebKitNamespace);
+                __wkWinIface('UserMessageHandlersNamespace', UserMessageHandlersNamespace);
+                __wkWinIface('UserMessageHandler', UserMessageHandler);
+                // CriOS：页面世界有注册过的消息处理器 → window.webkit 实例出现
+                // （Safari 页面世界无处理器 → 保持 undefined，见 P1-2 裁定）。
+                if (D.iosChrome && typeof window.webkit === 'undefined') {
+                    var __wkHandlersOf = function (names) {
+                        var ns = Object.create(UserMessageHandlersNamespace.prototype);
+                        for (var __hi = 0; __hi < names.length; __hi++) {
+                            try {
+                                Object.defineProperty(ns, names[__hi], {
+                                    value: Object.create(UserMessageHandler.prototype),
+                                    writable: false, enumerable: true, configurable: true,
+                                });
+                            } catch (e) {}
+                        }
+                        return ns;
+                    };
+                    var __wkNsObj = Object.create(WebKitNamespace.prototype);
+                    __wkNsSlots.set(__wkNsObj, {
+                        handlers: __wkHandlersOf(['crwebinvoke', 'POSTSuccessHandler',
+                                                  'POSTErrorHandler']),
+                        buffers: {},
+                    });
+                    Object.defineProperty(window, 'webkit', {
+                        value: __wkNsObj, writable: false,
+                        enumerable: true, configurable: false,
+                    });
+                }
+            } catch (e) {}
         }
 
         // ---- 抹掉该平台不存在的桌面 Chromium 属性（如 iOS 的 connection）----
@@ -1151,7 +1415,8 @@ _PATCH_TEMPLATE = r"""
         // 真机 Chrome iOS 是 WKWebView 壳：web_bundle.js 等用户脚本注入页面
         // 世界，网站 JS 可见 window.__gCrWeb（约 30 成员）、被改写的 history/
         // print/scrollTo（toString 可见 "invokeOnHost"、"setWebViewScrollView
-        // IsDragging" 字样）、window.webkit.messageHandlers。桌面内核均缺失
+        // IsDragging" 字样）、window.webkit.messageHandlers（装配见 13)）。
+        // 桌面内核均缺失
         // 这些特征，按 Chrome61-IPA 分析报告 §4.4 补齐；成员全集与文本细节以
         // 真机抓取二次校准（P2）。worker 内真机同样没有这些对象，故本段仅
         // 存在于页面模板。
@@ -1240,21 +1505,9 @@ _PATCH_TEMPLATE = r"""
                         "function scrollTo(x, y) { setWebViewScrollViewIsDragging(false); window.__gCrWeb.message.invokeOnHost('window.scrollTo', x, y); }");
                 }
 
-                // WKWebView 痕迹：webkit.messageHandlers（已确认通道；postMessage
-                // 为原生 binding 外观的 no-op；通道全集待真机抓取校准）
-                if (typeof window.webkit === 'undefined') {
-                    var handlers = {};
-                    var handlerNames = ['POSTSuccessHandler', 'POSTErrorHandler'];
-                    for (var hi = 0; hi < handlerNames.length; hi++) {
-                        handlers[handlerNames[hi]] = {
-                            postMessage: __maskNative(function () {}, 'postMessage')
-                        };
-                    }
-                    Object.defineProperty(window, 'webkit', {
-                        value: { messageHandlers: handlers },
-                        writable: true, enumerable: true, configurable: true,
-                    });
-                }
+                // WKWebView 痕迹 window.webkit 已移入上方 13)（WebKitNamespace
+                // 实例装配：通道 crwebinvoke/POST*、原型访问器 messageHandlers/
+                // buffers、postMessage 返回 pending Promise）。
             } catch (e) {}
         }
 

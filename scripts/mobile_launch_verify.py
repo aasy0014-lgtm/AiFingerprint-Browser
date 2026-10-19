@@ -264,6 +264,179 @@ STATE_JS = """async () => {
                             e.rotationRate.gamma, e.interval];
                 } catch (err) { return 'throw:' + err.name; }
             })(),
+            // ---- Safari 全局面（item 13：WebKitPoint / convertPoint 换算 /
+            //      webkitCancelRequestAnimationFrame / WebKitNamespace 家族）----
+            wkp: (() => {
+                const P = window.WebKitPoint;
+                if (typeof P !== 'function') return null;
+                const p = new P(1.5, 2.5);
+                const p0 = new P();
+                const one = new P(0.1);
+                const mut = new P(1, 2);
+                mut.x = 0.1;
+                const pd = descOf(P, 'prototype');
+                const xd = descOf(P.prototype, 'x');
+                const wd = descOf(window, 'WebKitPoint');
+                const q = new P(NaN, Infinity);
+                return {
+                    len: P.length, name: P.name, native: nativeStr(P),
+                    ownNames: Object.getOwnPropertyNames(P),
+                    protoNames: Object.getOwnPropertyNames(P.prototype),
+                    protoWritable: pd ? pd.writable : null,
+                    protoCtorSelf: P.prototype.constructor === P,
+                    winDesc: wd ? [wd.writable, wd.enumerable, wd.configurable,
+                                   ('value' in wd) ? 'data' : 'accessor'] : null,
+                    xDesc: xd ? [xd.enumerable, xd.configurable,
+                                 typeof xd.get, typeof xd.set] : null,
+                    vals: [p.x, p.y], defaults: [p0.x, p0.y], one: [one.x, one.y],
+                    fround: one.x === Math.fround(0.1),
+                    setFround: mut.x === Math.fround(0.1),
+                    nanInf: [Number.isNaN(q.x), q.y === Infinity],
+                    src: String(P).slice(0, 24),
+                    tag: Object.prototype.toString.call(p),
+                    instProto: Object.getPrototypeOf(p) === P.prototype,
+                    instOwn: Object.getOwnPropertyNames(p),
+                    callNoNew: (() => { try { P(1, 2); return 'ok'; }
+                        catch (e) { return e.name; } })(),
+                    badRecv: (() => { try { P.prototype.x; return 'ok'; }
+                        catch (e) { return e.name; } })(),
+                };
+            })(),
+            conv: (() => {
+                const f1 = window.webkitConvertPointFromNodeToPage;
+                const f2 = window.webkitConvertPointFromPageToNode;
+                const craf = window.webkitCancelRequestAnimationFrame;
+                if (typeof f1 !== 'function' || typeof f2 !== 'function') {
+                    return { present: false, t1: typeof f1, t2: typeof f2,
+                             crafType: typeof craf };
+                }
+                const holder = document.createElement('div');
+                holder.style.cssText = 'position:absolute;left:37px;top:23px;'
+                    + 'width:120px;height:40px;background:#eef';
+                document.body.appendChild(holder);
+                const inner = document.createElement('div');
+                inner.style.cssText = 'position:relative;left:5px;top:7px;'
+                    + 'width:20px;height:10px;background:#fdd';
+                holder.appendChild(inner);
+                const hidden = document.createElement('div');
+                hidden.style.cssText = 'display:none';
+                holder.appendChild(hidden);
+                const spacer = document.createElement('div');
+                spacer.style.cssText = 'height:2000px;width:1px';
+                document.body.appendChild(spacer);
+                const sx = window.pageXOffset || 0;
+                const sy = window.pageYOffset || 0;
+                const hr = holder.getBoundingClientRect();
+                const ir = inner.getBoundingClientRect();
+                const p0 = f1(holder, new WebKitPoint(0, 0));
+                const p5 = f1(holder, new WebKitPoint(5, 40));
+                const back = f2(holder, p5);
+                const innerPt = f1(inner, new WebKitPoint(0, 0));
+                const hiddenPt = f1(hidden, new WebKitPoint(0, 0));
+                const detPt = f1(document.createElement('div'), new WebKitPoint(3, 4));
+                const docPt = f1(document, new WebKitPoint(0, 0));
+                window.scrollTo(0, 60);
+                const sp = f1(holder, new WebKitPoint(0, 0));
+                window.scrollTo(0, 0);
+                const out = {
+                    present: true, len1: f1.length, len2: f2.length, name1: f1.name,
+                    native1: nativeStr(f1),
+                    desc1: (() => { const d = descOf(window,
+                        'webkitConvertPointFromNodeToPage');
+                        return d ? [d.writable, d.enumerable, d.configurable] : null; })(),
+                    zeroOk: Math.abs(p0.x - (hr.left + sx)) < 1e-6
+                        && Math.abs(p0.y - (hr.top + sy)) < 1e-6,
+                    fiveOk: Math.abs(p5.x - (p0.x + 5)) < 1e-2
+                        && Math.abs(p5.y - (p0.y + 40)) < 1e-2,
+                    roundtripOk: Math.abs(back.x - 5) < 1e-2
+                        && Math.abs(back.y - 40) < 1e-2,
+                    innerOk: Math.abs(innerPt.x - (ir.left + sx)) < 1e-6
+                        && Math.abs(innerPt.y - (ir.top + sy)) < 1e-6,
+                    hiddenOk: Math.abs(hiddenPt.x - p0.x) < 1e-6
+                        && Math.abs(hiddenPt.y - p0.y) < 1e-6,
+                    detachedOk: Math.abs(detPt.x - 3) < 1e-6
+                        && Math.abs(detPt.y - 4) < 1e-6,
+                    docOk: docPt !== null && Math.abs(docPt.x) <= 1
+                        && Math.abs(docPt.y) <= 1,
+                    scrolledStable: Math.abs(p0.y - sp.y) < 1e-2,
+                    nullArgs: [f1(null, new WebKitPoint(0, 0)) === null,
+                               f1(null, null) === null,
+                               f1(undefined, undefined) === null],
+                    undefNode: f1(undefined, new WebKitPoint(1, 1)) === null,
+                    retType: (window.WebKitPoint && p0 instanceof window.WebKitPoint)
+                        ? 'WebKitPoint' : 'other',
+                    errNode: (() => { try { f1(5, new WebKitPoint(0, 0)); return 'ok'; }
+                        catch (e) { return e.name; } })(),
+                    errPoint: (() => { try { f1(holder, {}); return 'ok'; }
+                        catch (e) { return e.name; } })(),
+                    errOneArg: (() => { try { f1(new WebKitPoint(0, 0)); return 'ok'; }
+                        catch (e) { return e.name; } })(),
+                    craf: typeof craf === 'function'
+                        ? [craf.length, craf.name, nativeStr(craf)] : null,
+                };
+                holder.parentNode.removeChild(holder);
+                spacer.parentNode.removeChild(spacer);
+                return out;
+            })(),
+            ns: (() => {
+                const shape = (C) => {
+                    if (typeof C !== 'function') return null;
+                    const pd = descOf(C, 'prototype');
+                    return {
+                        len: C.length, name: C.name, native: nativeStr(C),
+                        ownNames: Object.getOwnPropertyNames(C),
+                        protoNames: Object.getOwnPropertyNames(C.prototype),
+                        protoWritable: pd ? pd.writable : null,
+                        protoCtorSelf: C.prototype.constructor === C,
+                        callThrows: (() => { try { C(); return 'ok'; }
+                            catch (e) { return e.name + ':' + e.message; } })(),
+                        newThrows: (() => { try { new C(); return 'ok'; }
+                            catch (e) { return e.name + ':' + e.message; } })(),
+                    };
+                };
+                const wk = window.webkit;
+                const h = (wk && wk.messageHandlers)
+                    ? wk.messageHandlers.crwebinvoke : null;
+                const wd = descOf(window, 'webkit');
+                return {
+                    WN: shape(window.WebKitNamespace),
+                    UH: shape(window.UserMessageHandlersNamespace),
+                    UM: shape(window.UserMessageHandler),
+                    wkType: typeof wk,
+                    wkDesc: wd ? [wd.writable, wd.enumerable, wd.configurable] : null,
+                    wkProtoOk: (wk && window.WebKitNamespace)
+                        ? Object.getPrototypeOf(wk) === window.WebKitNamespace.prototype
+                        : null,
+                    wkOwn: wk ? Object.getOwnPropertyNames(wk) : null,
+                    mhProtoOk: (wk && wk.messageHandlers
+                                && window.UserMessageHandlersNamespace)
+                        ? Object.getPrototypeOf(wk.messageHandlers)
+                            === window.UserMessageHandlersNamespace.prototype : null,
+                    mhKeys: (wk && wk.messageHandlers)
+                        ? Object.keys(wk.messageHandlers) : null,
+                    crweb: h ? {
+                        protoOk: window.UserMessageHandler
+                            ? Object.getPrototypeOf(h)
+                                === window.UserMessageHandler.prototype : null,
+                        pmLen: h.postMessage ? h.postMessage.length : null,
+                        pmNative: h.postMessage ? nativeStr(h.postMessage) : null,
+                        pmRet: (() => { const p = h.postMessage(1);
+                            return (p && typeof p.then === 'function')
+                                ? 'promise' : typeof p; })(),
+                    } : null,
+                    buffersType: wk ? typeof wk.buffers : null,
+                    buffersKeys: (wk && wk.buffers) ? Object.keys(wk.buffers) : null,
+                    evalScriptProto: window.WebKitNamespace
+                        ? ('evaluateScript' in window.WebKitNamespace.prototype) : null,
+                    jsHandleProto: window.WebKitNamespace
+                        ? ('createJSHandle' in window.WebKitNamespace.prototype) : null,
+                    pmLegacyProto: window.UserMessageHandler
+                        ? ('postLegacySynchronousMessage'
+                           in window.UserMessageHandler.prototype) : null,
+                    jsHandleGlobal: typeof window.WebKitJSHandle,
+                    nodeSnapshotGlobal: typeof window.WebKitNodeSnapshot,
+                };
+            })(),
         },
         ownProps: Object.getOwnPropertyNames(nav).filter((n) =>
             ['platform','userAgent','maxTouchPoints','mobile','deviceMemory',
@@ -1203,6 +1376,7 @@ async def main() -> int:
     rp_gesture = sensor.get("gesture") or {}
     # ---- 引擎面「一行判假」信号（iOS 批次）----
     eng = state.get("engine") or {}
+    ns = eng.get("ns") or {}
     aig_mag = _sensor_magnitude(last_motion.get("aig"))
     lin_mag = _sensor_magnitude(last_motion.get("acc"))
     gyro_mag = _sensor_magnitude(last_motion.get("rr"))
@@ -1357,6 +1531,14 @@ async def main() -> int:
             "引擎面：无 WebKit legacy 传感器链（createEvent → init 不可用）": (
                 eng.get("legacyDOEChain") is None
                 or str(eng.get("legacyDOEChain")).startswith("throw:")),
+            # ---- Safari 全局面（item 13）在 Android 必须缺席（Blink 口径）----
+            "引擎面：无 WebKitPoint / convertPoint / webkitCancelRequestAnimationFrame":
+                (eng.get("wkp") is None
+                 and eng.get("conv", {}).get("present") is False
+                 and eng.get("conv", {}).get("crafType") == "undefined"),
+            "引擎面：无 WebKitNamespace 家族接口对象": (
+                ns.get("WN") is None and ns.get("UH") is None and ns.get("UM") is None
+                and ns.get("wkType") == "undefined"),
         })
     else:
         is_ios_chrome = extra.get("browser") == "chrome_ios"
@@ -1493,6 +1675,72 @@ async def main() -> int:
                 eng.get("legacyDOEChain") == ["deviceorientation", 10, 20, 30, 45, 5]),
             "传感器：createEvent → init → 回读一致（motion 链，含字典与 interval）": (
                 eng.get("legacyDMEChain") == ["devicemotion", 1, 5, 9, 16]),
+            # ---- Safari 全局面（item 13：WebKit main / iOS 口径）----
+            "引擎面：WebKitPoint 形状（原型访问器 / 不可无 new / 原生外观）": (
+                eng.get("wkp") is not None
+                and eng["wkp"].get("len") == 0
+                and eng["wkp"].get("name") == "WebKitPoint"
+                and eng["wkp"].get("native") is True
+                and eng["wkp"].get("ownNames") == ["length", "name", "prototype"]
+                and eng["wkp"].get("protoNames") == ["constructor", "x", "y"]
+                and eng["wkp"].get("protoWritable") is False
+                and eng["wkp"].get("protoCtorSelf") is True
+                and eng["wkp"].get("winDesc") == [True, False, True, "data"]
+                and eng["wkp"].get("xDesc") == [True, True, "function", "function"]),
+            "引擎面：WebKitPoint 取值（float32 / 默认值 / NaN+Inf / toStringTag）": (
+                eng.get("wkp", {}).get("vals") == [1.5, 2.5]
+                and eng["wkp"].get("defaults") == [0, 0]
+                and eng["wkp"].get("one") == [0.10000000149011612, 0]
+                and eng["wkp"].get("fround") is True
+                and eng["wkp"].get("setFround") is True
+                and eng["wkp"].get("nanInf") == [True, True]
+                and eng["wkp"].get("tag") == "[object WebKitPoint]"
+                and eng["wkp"].get("instProto") is True
+                and eng["wkp"].get("instOwn") == []
+                and eng["wkp"].get("callNoNew") == "TypeError"
+                and eng["wkp"].get("badRecv") == "TypeError"),
+            "引擎面：webkitConvertPoint 形状 + 坐标语义（原点/往返/嵌套/滚动不变）": (
+                eng.get("conv", {}).get("present") is True
+                and eng["conv"].get("len1") == 0 and eng["conv"].get("len2") == 0
+                and eng["conv"].get("name1") == "webkitConvertPointFromNodeToPage"
+                and eng["conv"].get("native1") is True
+                and eng["conv"].get("desc1") == [True, True, True]
+                and eng["conv"].get("zeroOk") is True
+                and eng["conv"].get("fiveOk") is True
+                and eng["conv"].get("roundtripOk") is True
+                and eng["conv"].get("innerOk") is True
+                and eng["conv"].get("hiddenOk") is True
+                and eng["conv"].get("detachedOk") is True
+                and eng["conv"].get("docOk") is True
+                and eng["conv"].get("scrolledStable") is True
+                and eng["conv"].get("retType") == "WebKitPoint"),
+            "引擎面：webkitConvertPoint 边界（null → null；非 Node/非 WebKitPoint 抛 TypeError）": (
+                eng["conv"].get("nullArgs") == [True, True, True]
+                and eng["conv"].get("undefNode") is True
+                and eng["conv"].get("errNode") == "TypeError"
+                and eng["conv"].get("errPoint") == "TypeError"
+                and eng["conv"].get("errOneArg") == "TypeError"),
+            "引擎面：webkitCancelRequestAnimationFrame 别名（length 1 / 原生外观）": (
+                eng.get("conv", {}).get("craf")
+                == [1, "webkitCancelRequestAnimationFrame", True]),
+            "引擎面：WebKitNamespace 家族接口对象（不可构造 / 页面世界原型成员）": (
+                ns.get("WN") is not None and ns.get("UH") is not None
+                and ns.get("UM") is not None
+                and ns["WN"].get("ownNames") == ["length", "name", "prototype"]
+                and ns["WN"].get("protoNames")
+                    == ["constructor", "messageHandlers", "buffers"]
+                and ns["WN"].get("protoWritable") is False
+                and ns["WN"].get("protoCtorSelf") is True
+                and ns["WN"].get("native") is True
+                and ns["WN"].get("callThrows") == "TypeError:Illegal constructor"
+                and ns["WN"].get("newThrows") == "TypeError:Illegal constructor"
+                and ns["UH"].get("protoNames") == ["constructor"]
+                and ns["UM"].get("protoNames") == ["constructor", "postMessage"]
+                and ns.get("evalScriptProto") is False
+                and ns.get("jsHandleProto") is False
+                and ns.get("pmLegacyProto") is False
+                and ns.get("jsHandleGlobal") == "undefined"
+                and ns.get("nodeSnapshotGlobal") == "undefined"),
         })
         if is_ios_chrome:
             checks.update({
@@ -1510,8 +1758,24 @@ async def main() -> int:
                     <= set(state["gCrWebKeys"] or [])),
                 "CriOS：window.webkit.messageHandlers 存在": state["hasWK"] is True,
                 "CriOS：messageHandlers 含已确认通道": (
-                    {"POSTSuccessHandler", "POSTErrorHandler"}
+                    {"crwebinvoke", "POSTSuccessHandler", "POSTErrorHandler"}
                     <= set(state["wkHandlers"] or [])),
+                # ---- window.webkit 按 WebKit 机制装配（item 13）----
+                "CriOS：window.webkit 为 WebKitNamespace 实例（ReadOnly+DontDelete / 无自有属性）": (
+                    ns.get("wkType") == "object"
+                    and ns.get("wkDesc") == [False, True, False]
+                    and ns.get("wkProtoOk") is True
+                    and ns.get("wkOwn") == []),
+                "CriOS：messageHandlers 为 UserMessageHandlersNamespace 实例": (
+                    ns.get("mhProtoOk") is True
+                    and "crwebinvoke" in (ns.get("mhKeys") or [])),
+                "CriOS：crwebinvoke.postMessage 原生外观且返回 pending Promise": (
+                    (ns.get("crweb") or {}).get("protoOk") is True
+                    and (ns.get("crweb") or {}).get("pmLen") == 1
+                    and (ns.get("crweb") or {}).get("pmNative") is True
+                    and (ns.get("crweb") or {}).get("pmRet") == "promise"),
+                "CriOS：window.webkit.buffers 空命名空间": (
+                    ns.get("buffersType") == "object" and ns.get("buffersKeys") == []),
                 "CriOS：history.pushState toString 含 invokeOnHost": state["historyPatched"] is True,
                 "CriOS：print toString 含 invokeOnHost": state["printPatched"] is True,
                 "CriOS：scrollTo toString 含 setWebViewScrollViewIsDragging": (
@@ -1540,6 +1804,8 @@ async def main() -> int:
                 "Safari：UA 不含 CriOS": state["isCriOS"] is False,
                 "Safari：无 __gCrWeb（真机 Safari 无该对象）": state["hasGCrWeb"] is False,
                 "Safari：无 window.webkit.messageHandlers": state["hasWK"] is False,
+                "Safari：无 window.webkit（页面世界未注册消息处理器，JSDOMWindowCustom 门控）": (
+                    ns.get("wkType") == "undefined"),
                 "Safari：history/print/scrollTo 保持原生外观": (
                     state["historyPatched"] is False
                     and state["printPatched"] is False

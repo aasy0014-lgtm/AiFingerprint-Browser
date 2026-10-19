@@ -291,6 +291,56 @@ ENGINE_JS = r"""() => {
       doeChain: chain('DeviceOrientationEvent'),
       dmeChain: chain('DeviceMotionEvent'),
     },
+    // Safari 全局面（item 13：WebKitPoint 家族 / WebKitNamespace 家族 /
+    // webkitCancelRequestAnimationFrame）。真机 iOS 有、桌面内核无。
+    safari: {
+      webKitPoint: typeof window.WebKitPoint,
+      wkpProto: window.WebKitPoint
+        ? Object.getOwnPropertyNames(window.WebKitPoint.prototype) : null,
+      wkpVals: (() => {
+        try {
+          if (typeof window.WebKitPoint !== 'function') return null;
+          const p = new WebKitPoint(1.5, 2.5); return [p.x, p.y];
+        }
+        catch (e) { return 'throw:' + e.name; }
+      })(),
+      convertNodeToPage: typeof window.webkitConvertPointFromNodeToPage,
+      convertPageToNode: typeof window.webkitConvertPointFromPageToNode,
+      convertLen: window.webkitConvertPointFromNodeToPage
+        ? window.webkitConvertPointFromNodeToPage.length : null,
+      convertRoundtrip: (() => {
+        try {
+          const f1 = window.webkitConvertPointFromNodeToPage;
+          const f2 = window.webkitConvertPointFromPageToNode;
+          if (typeof f1 !== 'function' || typeof f2 !== 'function') return null;
+          const p = f1(document.body, new WebKitPoint(5, 40));
+          const b = f2(document.body, p);
+          return [Math.round(b.x), Math.round(b.y)];
+        } catch (e) { return 'throw:' + e.name; }
+      })(),
+      craf: typeof window.webkitCancelRequestAnimationFrame,
+      webKitNamespace: typeof window.WebKitNamespace,
+      nsProto: window.WebKitNamespace
+        ? Object.getOwnPropertyNames(window.WebKitNamespace.prototype) : null,
+      userMsgHandlersNs: typeof window.UserMessageHandlersNamespace,
+      userMsgHandler: typeof window.UserMessageHandler,
+      webKitJSHandle: typeof window.WebKitJSHandle,
+      webKitNodeSnapshot: typeof window.WebKitNodeSnapshot,
+      windowWebkit: typeof window.webkit,
+      wkHandlers: (window.webkit && window.webkit.messageHandlers)
+        ? Object.keys(window.webkit.messageHandlers) : null,
+      crwebInvoke: !!(window.webkit && window.webkit.messageHandlers
+        && window.webkit.messageHandlers.crwebinvoke),
+      crwebPmRet: (() => {
+        try {
+          const h = window.webkit && window.webkit.messageHandlers
+            && window.webkit.messageHandlers.crwebinvoke;
+          if (!h) return null;
+          const p = h.postMessage(1);
+          return (p && typeof p.then === 'function') ? 'promise' : typeof p;
+        } catch (e) { return 'throw:' + e.name; }
+      })(),
+    },
   };
 }"""
 

@@ -3,7 +3,7 @@
 > **依据**：[`Chrome61-IPA检测机制分析.md`](Chrome61-IPA检测机制分析.md)（2026-10-18；样本 `Chrome-v61-3163-73.ipa`，SHA-256 `5f901179…a041c`，官方原版、FairPlay 加密）
 > **目的**：把报告的检测面结论整理为可执行的补丁清单，分两条路线——**A：真机 / 云机（IPA 二次开发）**；**B：本项目仿真层（桌面 CDP 补齐 CriOS 检测面）**。
 > **结论先行**（报告 §8.1）：该 IPA 是原版 Chrome，本身不含任何伪装逻辑；"防关联/指纹"能力无论走哪条线都必须在外围补——A 线在设备侧（解密/重签/注入），B 线在本仓库（注入器 + 指纹库）。
-> **B 线状态（2026-10-19）**：P0 已落地并验证——`mobileExtra.browser = "chrome_ios"`、CriOS UA、`derive_spec.iosChrome`、`__gCrWeb` / `webkit.messageHandlers` / history·print·scrollTo 改写痕迹、iOS 两口径 `window.chrome = undefined`。P1 的面板/API 浏览器口径也已落地（创建/更新/MCP/面板）。同日加固：移动端平台属性面（Android 抹 WebHID + PDF 插件面收敛 + 补 `NetworkInformation.type='wifi'`；iOS 抹 serial/usb/hid/bluetooth/keyboard/MIDI/presentation/relatedApps/vibrate/showOpenFilePicker/performance.memory + 补 GestureEvent 家族）、输入事件层触摸语义（API/RPA 的 click/scroll）与传感器事件流（Android CDP 虚拟传感器 60Hz 数值流；iOS 补 `requestPermission` 权限面并抹除 `absolute`/`ondeviceorientationabsolute`，见 [`移动端大厂检测对抗优化方案.md`](移动端大厂检测对抗优化方案.md) §2.5）；iOS 引擎面二批（iPhone 元素级全屏面删除 + `<video>` webkit 全屏家族 + `-webkit-touch-callout`/`-webkit-overflow-scrolling` + 传感器构造器不可构造 + 罗盘/legacy 初始化器/`createEvent`，CriOS 同 WebKit 口径，见 §2.6）。数据层 225 项、iOS Chrome 真机级 116 项、iOS Safari 104 项、Android 104 项全绿。未做：B1-7（`__crPostRequestWorkaround`，真机仅在 POST 导航时暴露，需按导航状态条件注入，留待校准）、B1-8（PaymentRequest）、真机抓取校准、`window.chrome` 深掩。
+> **B 线状态（2026-10-19）**：P0 已落地并验证——`mobileExtra.browser = "chrome_ios"`、CriOS UA、`derive_spec.iosChrome`、`__gCrWeb` / `webkit.messageHandlers` / history·print·scrollTo 改写痕迹、iOS 两口径 `window.chrome = undefined`。P1 的面板/API 浏览器口径也已落地（创建/更新/MCP/面板）。同日加固：移动端平台属性面（Android 抹 WebHID + PDF 插件面收敛 + 补 `NetworkInformation.type='wifi'`；iOS 抹 serial/usb/hid/bluetooth/keyboard/MIDI/presentation/relatedApps/vibrate/showOpenFilePicker/performance.memory + 补 GestureEvent 家族）、输入事件层触摸语义（API/RPA 的 click/scroll）与传感器事件流（Android CDP 虚拟传感器 60Hz 数值流；iOS 补 `requestPermission` 权限面并抹除 `absolute`/`ondeviceorientationabsolute`，见 [`移动端大厂检测对抗优化方案.md`](移动端大厂检测对抗优化方案.md) §2.5）；iOS 引擎面二批（iPhone 元素级全屏面删除 + `<video>` webkit 全屏家族 + `-webkit-touch-callout`/`-webkit-overflow-scrolling` + 传感器构造器不可构造 + 罗盘/legacy 初始化器/`createEvent`，CriOS 同 WebKit 口径，见 §2.6）。数据层 225 项、iOS Chrome 真机级 116 项、iOS Safari 104 项、Android 104 项全绿。**2026-10-19 第二批**：Safari 全局面（`WebKitPoint` + `webkitConvertPointFromNodeToPage/PageToNode` + `webkitCancelRequestAnimationFrame` + `WebKitNamespace`/`UserMessageHandlersNamespace`/`UserMessageHandler` 接口对象，P2-11 关闭）与 `window.webkit` 门控裁定（P1-2：源码级确认 Safari 页面世界无该属性、CriOS 有）——B1-6 随之升级为 WebKitNamespace 实例装配（见 §2.1）。回归：数据层 225 项、iOS Chrome 真机级 126 项、iOS Safari 111 项、Android 106 项全绿。未做：B1-7（`__crPostRequestWorkaround`，真机仅在 POST 导航时暴露，需按导航状态条件注入，留待校准）、B1-8（PaymentRequest）、真机抓取校准、`window.chrome` 深掩。
 
 ---
 
@@ -79,7 +79,7 @@
 
 **前置事实**（本次实测，fp-chromium 148；明细见附录 C）：
 - `window.chrome` 是 own 属性且 `configurable: false`、`delete` 返回 false → 页面层**无法删除**，只能赋 `undefined`；
-- `window.webkit` 内核为 `undefined` → 需注入；`window.print` / `window.scrollTo` 本就是 window 自有属性 → 改写挂载层级与真机一致；
+- `window.webkit` 内核为 `undefined` → 需注入（**仅 CriOS 口径**：Safari 页面世界按 WebKit 门控 `shouldHaveWebKitNamespaceForWorld` 同样无该属性，保持 `undefined` 即正确形态）；`window.print` / `window.scrollTo` 本就是 window 自有属性 → 改写挂载层级与真机一致；
 - `History.prototype.pushState` 为原型级可配置数据属性 → 原型级改写可行。
 
 **总原则**：全部在页面补丁模板 `_PATCH_TEMPLATE` 的 `D.iosChrome` 段实现（含 OOPIF/iframe，随现有 init 脚本下发）；**worker 模板不动**——真机 worker 内同样没有 `__gCrWeb`。
@@ -92,7 +92,7 @@
 | B1-3 | `window.print` 被改写 | `toString` 含 `invokeOnHost` | 同上包装 + 源文本 | `window` | 正则断言 |
 | B1-4 | `window.scrollTo` 被改写 | `toString` 含 `setWebViewScrollViewIsDragging` | 同上包装（行为透传）+ 源文本 | `window` | 正则断言 |
 | B1-5 | 普通页面**无 `window.chrome`** | `typeof undefined` | `window.chrome = undefined`（实测属性不可删，见前置事实）；**iOS 两模式（safari / chrome_ios）通用**——此为现有 Safari 口径的同款缺口，一并修复 | 模板 iOS 公共段 | `typeof window.chrome === 'undefined'` |
-| B1-6 | `window.webkit.messageHandlers` 存在 | 存在；已确认通道：`POSTSuccessHandler` / `POSTErrorHandler`（其余以真机抓取校准） | `defineProperty(window,'webkit',{messageHandlers:{…}})`，每通道 `postMessage` no-op | `D.iosChrome` 段 | 探针 `hasWK` 为 true、keys 含已确认通道 |
+| B1-6 | `window.webkit.messageHandlers` 存在 | 存在（注入桥在**页面世界**注册消息处理器，`JSDOMWindowCustom.cpp:227` 门控才暴露本体）；`messageHandlers` 为 `UserMessageHandlersNamespace` 实例、通道名是 `UserMessageHandler` 实例：已确认 `crwebinvoke`（桥本体，§9.4）+ `POSTSuccessHandler` / `POSTErrorHandler`（其余以真机抓取校准）；`buffers` 为空命名空间；`evaluateScript` / `createJSHandle` 因 world 门控在页面世界**缺席** | 按 WebKit 机制装配：`window.webkit` = `WebKitNamespace` 实例（原型链对齐、描述符 `{writable:false, enumerable:true, configurable:false}` 对齐 JSC 惰性属性）；`messageHandlers` = `UserMessageHandlersNamespace` 实例，具名通道属性 = `UserMessageHandler` 实例（`postMessage` 原生外观、返回 pending Promise——页面世界分支无回执）；`buffers` = 空命名空间 | `D.iosChrome` 段 | 探针 `hasWK` 为 true、keys 含 `crwebinvoke` + `POST*`；实例原型链 / 描述符 / `postMessage` pending Promise / `buffers` 空对象 |
 | B1-7 | `__crPostRequestWorkaround` | 函数（POST 导航时启用） | 注入同名函数（存在性 + 最小语义）；P1 | `D.iosChrome` 段 | `typeof === 'function'` |
 | B1-8 | `PaymentRequest/PaymentResponse` 为 JS polyfill | polyfill 源码形态 | **P2 可选**：内核自带原生实现，默认接受形态差异 | — | 记录现状 |
 | B1-9 | `navigator.vendor = "Apple Computer, Inc."` | WKWebView 默认 | **已具备**（现 iOS 指纹即此值；CriOS 保持不改为 Google，与真机一致） | — | 现有断言 |
@@ -126,7 +126,7 @@
    |---|---|
    | `hasGCrWeb` | `true` |
    | `gCrWebWindowId` | 非空字符串 |
-   | `hasWK` / `wkHandlers` | `true`；含 `POSTSuccessHandler`、`POSTErrorHandler`（校准前只断言已确认项） |
+   | `hasWK` / `wkHandlers` | `true`；含 `crwebinvoke` + `POSTSuccessHandler`、`POSTErrorHandler`（校准前只断言已确认项） |
    | `historyPatched` / `printPatched` / `scrollPatched` | `true` |
    | `hasChromeObj` | `false`（`typeof` 口径） |
    | `isCriOS` | `true` |
@@ -260,7 +260,7 @@ window.chrome = undefined;       // → typeof window.chrome === 'undefined'（�
 // 残余暴露：'chrome' in window === true / getOwnPropertyDescriptor 仍可读到（页面层无法掩盖）
 
 // 探针 2：改写目标的挂载层级
-typeof window.webkit;            // → "undefined"（内核无 → 需注入）
+typeof window.webkit;            // → "undefined"（内核无；CriOS 需注入，Safari 保持 undefined）
 Object.prototype.hasOwnProperty.call(window, 'print');     // → true（window 属主级）
 Object.prototype.hasOwnProperty.call(window, 'scrollTo');  // → true（window 属主级）
 Object.getOwnPropertyDescriptor(History.prototype, 'pushState');
