@@ -641,6 +641,84 @@ STATE_JS = """async () => {
                     keptNav: read(navigator, ['share', 'canShare', 'wakeLock', 'gpu']),
                 };
             })(),
+            // ---- JavaScriptCore 引擎面（iOS 目标；检测站四条独立判据）----
+            // 取证：Playwright WebKit 27.2 实测 + WebKit main
+            // Source/JavaScriptCore/runtime/{ErrorConstructor,ErrorPrototype}.cpp。
+            // 注意 Error.captureStackTrace 不是 V8 专有（ErrorConstructor.cpp:52
+            // 注册同名静态方法），检测站该文案已过时，与 SharedWorker 同类。
+            jsc: (() => {
+                const e = new Error('jsc');
+                const dLine = descOf(e, 'line');
+                const dCol = descOf(e, 'column');
+                const dErrMsg = descOf(Error.prototype, 'message');
+                const nativeEval = String(eval);
+                const nativeAlert = String(alert);
+                const myFn = function myFn() {};
+                const errStack = (() => {
+                    try { null.x(); return ''; } catch (x) { return String(x.stack || ''); }
+                })();
+                const thrownDesc = (() => {
+                    try { null.x(); } catch (x) {
+                        return descOf(x, 'line') ? 'own' : 'absent';
+                    }
+                })();
+                return {
+                    line: e.line, column: e.column,
+                    lineDesc: dLine ? [dLine.writable, dLine.enumerable, dLine.configurable] : null,
+                    colDesc: dCol ? [dCol.writable, dCol.enumerable, dCol.configurable] : null,
+                    ownNames: Object.getOwnPropertyNames(e),
+                    stackHead: String(e.stack || '').split('\\n')[0],
+                    // JSC 栈帧 `fn@url:line:col`；V8 为 `    at fn (...)`。
+                    hasV8StackTrace: /^\\s*at\\s+/m.test(String(e.stack || '')),
+                    stackEngine: /@/.test(String(e.stack || '')) ? 'jsc' : 'v8',
+                    // 原生函数 toString：JSC 多行缩进，V8 单行。
+                    nativeEvalMultiLine: nativeEval.indexOf('\\n') !== -1,
+                    nativeAlertMultiLine: nativeAlert.indexOf('\\n') !== -1,
+                    nativeEval,
+                    // 非原生函数不受改写影响
+                    userFn: String(myFn),
+                    // V8 专有：Error.prepareStackTrace 钩子（JSC 无）
+                    hasPrepareStackTrace: typeof Error.prepareStackTrace !== 'undefined',
+                    // JSC 专有：Error.prototype.message 是数据属性（V8 是访问器）
+                    errProtoMessageIsData: !!(dErrMsg && !dErrMsg.get),
+                    errProtoMessageVal: dErrMsg ? dErrMsg.value : 'ABSENT',
+                    errProtoNameIsData: (() => {
+                        const d = descOf(Error.prototype, 'name');
+                        return !!(d && !d.get);
+                    })(),
+                    // 引擎内部抛出的 TypeError：V8 在 C++ 侧创建，不过 Error 陷阱
+                    thrownLineDesc: thrownDesc,
+                    thrownErrStack: errStack.split('\\n').slice(0, 2).join('|'),
+                    // Proxy 透明性
+                    instanceofOk: (e instanceof Error) && (e instanceof TypeError === false),
+                    subclassOk: (() => {
+                        try {
+                            class Sub extends Error {}
+                            const s = new Sub('x');
+                            return [s instanceof Sub, s instanceof Error, s.name];
+                        } catch (x) { return 'throw:' + x.name; }
+                    })(),
+                    errName: Error.name, errLen: Error.length,
+                    errNameDesc: (() => {
+                        const d = descOf(Error, 'name');
+                        return d ? [d.writable, d.enumerable, d.configurable] : null;
+                    })(),
+                    errLenDesc: (() => {
+                        const d = descOf(Error, 'length');
+                        return d ? [d.writable, d.enumerable, d.configurable] : null;
+                    })(),
+                    statics: Object.getOwnPropertyNames(Error).filter((n) =>
+                        ['captureStackTrace', 'stackTraceLimit', 'isError'].includes(n)),
+                    captureStackTraceType: typeof Error.captureStackTrace,
+                    // V8 专有全局/成员（WebKit 从未实现）
+                    v8BI: (() => { try { return 'v8BreakIterator' in Intl; }
+                        catch (x) { return 'ERR'; } })(),
+                    wkTemp: (() => { try { return 'webkitTemporaryStorage' in navigator; }
+                        catch (x) { return 'ERR'; } })(),
+                    wkPersist: (() => { try { return 'webkitPersistentStorage' in navigator; }
+                        catch (x) { return 'ERR'; } })(),
+                };
+            })(),
         },
         ownProps: Object.getOwnPropertyNames(nav).filter((n) =>
             ['platform','userAgent','maxTouchPoints','mobile','deviceMemory',
@@ -768,6 +846,12 @@ STATE_JS = """async () => {
             hoverHover: q('(hover: hover)'),
             anyPointerCoarse: q('(any-pointer: coarse)'),
             anyHoverNone: q('(any-hover: none)'),
+            // 色域：iPhone 7 及以后全系 Display P3 屏，(color-gamut: p3) 恒为
+            // true；宿主桌面显示器多为 sRGB。由 CDP setEmulatedMedia 原生注入
+            // （app/mobile_cdp_injector.py 页面路径与 OOPIF 路径各自下发），
+            // 不跨页面继承——新 page 目标需重新下发，故此处按当前页读。
+            p3: q('(color-gamut: p3)'),
+            srgb: q('(color-gamut: srgb)'),
         };
     })();
     // ---- 音频采样率：真机 OfflineAudioContext 采样率恒为精确整数；内核
@@ -837,7 +921,10 @@ try {
     + ' timer: e.some(function (x) { return /disjoint_timer_query/i.test(x); }),'
     + ' maxTex: g.getParameter(g.MAX_TEXTURE_SIZE)}; } catch (e) { return "ERR"; } })()'
     + ' , platW: (function () { var ns = ["IdleDetector","WebSocketStream","ImageDecoder","FileSystemObserver","Scheduler","scheduler","VideoDecoder","BarcodeDetector","URLPattern","WebGL2RenderingContext"];'
-    + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()}); }, 300);';
+    + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
+    + ' , intlV8: (function () { try { return "v8BreakIterator" in Intl; } catch (e) { return "ERR"; } })()'
+    + ' , intlOwn: (function () { try { return Object.getOwnPropertyNames(Intl).indexOf("v8BreakIterator") !== -1; } catch (e) { return "ERR"; } })()'
+    + '}); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.workerData = {};
   w.onmessage = function (ev) { for (var k in ev.data) { window.workerData[k] = ev.data[k]; } };
@@ -895,7 +982,10 @@ try {
     + ' timer: e.some(function (x) { return /disjoint_timer_query/i.test(x); }),'
     + ' maxTex: g.getParameter(g.MAX_TEXTURE_SIZE)}; } catch (e) { return "ERR"; } })()'
     + ' , platW: (function () { var ns = ["IdleDetector","WebSocketStream","ImageDecoder","FileSystemObserver","Scheduler","scheduler","VideoDecoder","BarcodeDetector","URLPattern","WebGL2RenderingContext"];'
-    + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()}); }, 300);';
+    + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
+    + ' , intlV8: (function () { try { return "v8BreakIterator" in Intl; } catch (e) { return "ERR"; } })()'
+    + ' , intlOwn: (function () { try { return Object.getOwnPropertyNames(Intl).indexOf("v8BreakIterator") !== -1; } catch (e) { return "ERR"; } })()'
+    + '}); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.__workerData = {};
   w.onmessage = function (ev) { for (var k in ev.data) { window.__workerData[k] = ev.data[k]; } };
@@ -1767,6 +1857,7 @@ async def main() -> int:
     eng = state.get("engine") or {}
     ns = eng.get("ns") or {}
     plat = eng.get("plat") or {}
+    jsc = eng.get("jsc") or {}
     aig_mag = _sensor_magnitude(last_motion.get("aig"))
     lin_mag = _sensor_magnitude(last_motion.get("acc"))
     gyro_mag = _sensor_magnitude(last_motion.get("rr"))
@@ -2183,6 +2274,63 @@ async def main() -> int:
                 (fr_worker.get("platW") or {}).get("IdleDetector") == "undefined"
                 and (fr_worker.get("platW") or {}).get("Scheduler") == "undefined"
                 and (fr_worker.get("platW") or {}).get("VideoDecoder") == "function"),
+            # ---- JavaScriptCore 引擎面（iOS 目标）----
+            # 声明 iOS 而引擎是 V8 有四条独立判据，逐条对齐 WebKit；取证见
+            # app/mobile_cdp_injector.py 的「JavaScriptCore 引擎面」注释块。
+            "引擎面：Error 栈为 JSC 格式（`fn@url:line:col`，非 V8 的 `at fn`）": (
+                jsc.get("stackEngine") == "jsc"
+                and jsc.get("hasV8StackTrace") is False),
+            "引擎面：原生函数 toString 为 JSC 多行缩进形态": (
+                jsc.get("nativeEvalMultiLine") is True
+                and jsc.get("nativeAlertMultiLine") is True),
+            "引擎面：用户函数 toString 不被改写（无补丁痕迹）": (
+                isinstance(jsc.get("userFn"), str)
+                and "myFn" in jsc["userFn"]
+                and "[native code]" not in jsc["userFn"]),
+            "引擎面：Error.prepareStackTrace 缺席（V8 专有钩子，JSC 无）": (
+                jsc.get("hasPrepareStackTrace") is False),
+            "引擎面：Error.prototype.message/name 为数据属性（JSC 口径）": (
+                jsc.get("errProtoMessageIsData") is True
+                and jsc.get("errProtoNameIsData") is True),
+            "引擎面：显式构造的 Error 具备 own line/column 数据属性": (
+                jsc.get("ownNames") == ["stack", "message", "line", "column"]
+                and jsc.get("lineDesc") == [True, False, True]
+                and jsc.get("colDesc") == [True, False, True]
+                and isinstance(jsc.get("line"), int)
+                and isinstance(jsc.get("column"), int)),
+            "引擎面：栈首帧为 `fn@loc` 形态（无 Proxy 陷阱合成帧）": (
+                isinstance(jsc.get("stackHead"), str)
+                and "@" in jsc["stackHead"]
+                and "Object.construct@" not in jsc["stackHead"]
+                and "Object.apply@" not in jsc["stackHead"]),
+            "引擎面：Proxy 透明（instanceof / 子类化 / name / length 不变）": (
+                jsc.get("instanceofOk") is True
+                and jsc.get("subclassOk") == [True, True, "Error"]
+                and jsc.get("errName") == "Error"
+                and jsc.get("errLen") == 1
+                # WebKit 实测：Error.name / Error.length 均为
+                # [writable:false, enumerable:false, configurable:true]
+                and jsc.get("errNameDesc") == [False, False, True]
+                and jsc.get("errLenDesc") == [False, False, True]),
+            # Error.captureStackTrace 是 WebKit/JSC 自有成员（ErrorConstructor.cpp:52），
+            # 检测站「V8 专有」文案已过时——必须保留，不得抹除。
+            "引擎面：Error.captureStackTrace 保留（JSC 自有，非 V8 专有）": (
+                jsc.get("captureStackTraceType") == "function"
+                and "captureStackTrace" in (jsc.get("statics") or [])),
+            "引擎面：Intl.v8BreakIterator 缺席（V8 专有，WebKit Intl 无此成员）": (
+                jsc.get("v8BI") is False),
+            "引擎面：navigator.webkitTemporaryStorage/PersistentStorage 缺席": (
+                jsc.get("wkTemp") is False and jsc.get("wkPersist") is False),
+            # Intl.v8BreakIterator 在 Worker 里与页面同源存在（实测），不补删
+            # 即构成「页面 false、Worker true」的跨上下文矛盾。
+            "引擎面：Worker 内 Intl.v8BreakIterator 同样缺席（页面/Worker 同口径）": (
+                wk_main.get("intlV8") is False
+                and wk_main.get("intlOwn") is False
+                and fr_worker.get("intlV8") is False),
+            # ---- 色域：Display P3（iPhone 7 及以后全系硬件判据）----
+            "色域：(color-gamut: p3) 为真且 srgb 亦为真（iPhone 屏口径）": (
+                (state.get("mediaQueries") or {}).get("p3") is True
+                and (state.get("mediaQueries") or {}).get("srgb") is True),
             # ---- 传感器权限面（WebKit 专有）：requestPermission 与授权语义 ----
             "传感器：requestPermission 存在（iOS 14.5+ 专有静态方法）": (
                 rp.get("motion") == "function" and rp.get("orientation") == "function"),
