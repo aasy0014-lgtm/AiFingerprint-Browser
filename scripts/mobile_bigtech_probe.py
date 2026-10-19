@@ -222,6 +222,79 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+ENGINE_JS = r"""() => {
+  // 引擎面「一行判假」读数：全屏面 / <video> webkit 全屏家族 / WebKit 专属
+  // CSS 面 / 传感器构造器与 legacy 链。真机 iOS 与 Chrome Android 在这些
+  // 读数上互斥（见 docs/移动端大厂检测对抗优化方案.md）。
+  const fsNames = (obj) => Object.getOwnPropertyNames(obj).filter((n) => /fullscreen/i.test(n));
+  const chain = (kind) => {
+    try {
+      const e = document.createEvent(kind);
+      const init = (kind === 'DeviceOrientationEvent')
+        ? e.initDeviceOrientationEvent : e.initDeviceMotionEvent;
+      if (typeof init !== 'function') return 'no-init';
+      if (kind === 'DeviceOrientationEvent') {
+        init.call(e, 'deviceorientation', false, false, 10, 20, 30, 45, 5);
+        return [e.type, e.alpha, e.beta, e.gamma, e.webkitCompassHeading, e.webkitCompassAccuracy];
+      }
+      init.call(e, 'devicemotion', false, false, {x: 1, y: 2, z: 3},
+                {x: 4, y: 5, z: 6}, {alpha: 7, beta: 8, gamma: 9}, 16);
+      return [e.type, e.acceleration.x, e.accelerationIncludingGravity.y,
+              e.rotationRate.gamma, e.interval];
+    } catch (err) { return 'throw:' + err.name; }
+  };
+  const ctor = (name) => {
+    try { new window[name]('x'); return 'ok'; } catch (e) { return e.name; }
+  };
+  const v = document.createElement('video');
+  const s = document.body.style;
+  // 先取「属性存在性」再跑写入回环：写未知驼峰属性会在 Chromium 上留下 JS
+  // expando，污染 `in` 读数（读真机时同一顺序同样关键）。
+  const tcInStyle = 'webkitTouchCallout' in s;
+  const oscInStyle = 'webkitOverflowScrolling' in s;
+  const styleRoundtrip = (() => {
+    const before = s.webkitTouchCallout;
+    s.webkitTouchCallout = 'none';
+    const mid = s.webkitTouchCallout;
+    s.removeProperty('-webkit-touch-callout');
+    return [before, mid, s.webkitTouchCallout];
+  })();
+  return {
+    fullscreen: {
+      elementOwn: fsNames(Element.prototype),
+      documentOwn: fsNames(Document.prototype),
+      requestType: typeof document.documentElement.requestFullscreen,
+      enabledType: typeof document.fullscreenEnabled,
+      exitType: typeof document.exitFullscreen,
+      elementInDoc: 'fullscreenElement' in document,
+    },
+    video: {
+      enterType: typeof v.webkitEnterFullscreen,
+      supportsType: ('webkitSupportsFullscreen' in v)
+        ? typeof v.webkitSupportsFullscreen : 'ABSENT',
+    },
+    css: {
+      touchCallout: CSS.supports('-webkit-touch-callout', 'none'),
+      touchCalloutOneArg: CSS.supports('-webkit-touch-callout: none'),
+      overflowScrolling: CSS.supports('-webkit-overflow-scrolling', 'touch'),
+      touchCalloutInStyle: tcInStyle,
+      overflowScrollingInStyle: oscInStyle,
+      styleRoundtrip: styleRoundtrip,
+    },
+    sensors: {
+      dmeCtor: ctor('DeviceMotionEvent'),
+      doeCtor: ctor('DeviceOrientationEvent'),
+      compassHeadingIn: 'webkitCompassHeading' in DeviceOrientationEvent.prototype,
+      absoluteInProto: 'absolute' in DeviceOrientationEvent.prototype,
+      initDOE: typeof DeviceOrientationEvent.prototype.initDeviceOrientationEvent,
+      initDME: typeof DeviceMotionEvent.prototype.initDeviceMotionEvent,
+      doeChain: chain('DeviceOrientationEvent'),
+      dmeChain: chain('DeviceMotionEvent'),
+    },
+  };
+}"""
+
+
 EVENT_CAPTURE_JS = r"""() => {
   window.__ev = [];
   const rec = (e) => window.__ev.push(e.type + (e.pointerType !== undefined ? ':' + e.pointerType : ''));
@@ -407,12 +480,15 @@ async def main() -> int:
             # 传感器事件流（页面在 127.0.0.1 = 信任来源；真机非安全上下文
             # 同样不派发，故必须以本地服务页为准）
             sensor = await page.evaluate(SENSOR_JS)
+            # 引擎面读数（全屏 / 视频 webkit 全屏 / WebKit CSS / 传感器构造器）
+            engine = await page.evaluate(ENGINE_JS)
 
             out = {
                 "target_os": target_os,
                 "device": device_name,
                 "signals": signals,
                 "sensor": sensor,
+                "engine": engine,
                 "input_mouse_click_events": events_mouse,
                 "input_playwright_touchscreen_tap": tap_api,
                 "input_touch_tap_events": events_touch,

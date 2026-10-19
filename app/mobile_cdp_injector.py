@@ -636,6 +636,469 @@ _PATCH_TEMPLATE = r"""
             if ('ondeviceorientationabsolute' in window) {
                 defineGet(Window.prototype, 'ondeviceorientationabsolute', undefined);
             }
+            // 7) 未授权时真机为零事件：桌面内核没有传感器，注册监听会立刻收到
+            //    一次全 null 的哨兵 devicemotion/deviceorientation（实测各 1 次）。
+            //    真机 iOS 未授权时连这一次都没有，「监听 1.5s 计数 > 0」即可
+            //    判非 iOS。init 脚本先于页面脚本执行，捕获阶段监听先注册先执行，
+            //    用 stopImmediatePropagation 抹掉内核派发；只有 isTrusted
+            //    （内核派发）的事件被拦，脚本自派发保持原语义。
+            try {
+                var __killSensorSentinel = function (ev) {
+                    if (ev.isTrusted) {
+                        ev.stopImmediatePropagation();
+                    }
+                };
+                window.addEventListener('devicemotion', __killSensorSentinel, true);
+                window.addEventListener('deviceorientation', __killSensorSentinel, true);
+                // WebKit 全平台没有该事件（6) 已抹除处理属性）；桌面内核注册
+                // 监听时同样会派发一次该事件的哨兵，不抑制时「doa 事件计数 1」
+                // 与真机（0）可辨。
+                window.addEventListener('deviceorientationabsolute',
+                                        __killSensorSentinel, true);
+            } catch (e) {}
+
+            // 8) 元素级全屏 API：iPhone 上 WebKit 整块缺席。MDN BCD
+            //    （Element.requestFullscreen / Document.fullscreenEnabled，
+            //    safari_ios 16.4）注「Only available on iPad, not on iPhone」；
+            //    WebKit 源码 Element+Fullscreen.idl / Document+Fullscreen.idl /
+            //    DocumentOrShadowRoot+Fullscreen.idl 整块由
+            //    EnabledBySettingOrQuirk=FullScreenEnabled|… +
+            //    DisabledByQuirk=shouldDisableElementFullscreen 门控，iPhone 上
+            //    标准版、webkit/Mozilla 前缀版与 onfullscreen* 处理属性全部不存在
+            //    （2026-08 真机实测报告一致：元素级 requestFullscreen 与
+            //    webkitRequestFullscreen 均 undefined，仅 <video> 有全屏通道）。
+            //    真机一行 `'requestFullscreen' in document.documentElement` 判内核。
+            //    注：iPad Safari 元素级全屏自 16.4 起可用 → 义表型设备保留现状。
+            var __isIPad = /iPad/.test(String(D.platform || '')) || /iPad/.test(String(D.ua || ''));
+            if (!__isIPad) {
+                var __fsKill = function (obj, names) {
+                    if (!obj) { return; }
+                    for (var __fi = 0; __fi < names.length; __fi++) {
+                        try { delete obj[names[__fi]]; } catch (e) {}
+                    }
+                };
+                __fsKill(Element.prototype, [
+                    'requestFullscreen', 'webkitRequestFullscreen', 'webkitRequestFullScreen',
+                    'onfullscreenchange', 'onfullscreenerror',
+                    'onwebkitfullscreenchange', 'onwebkitfullscreenerror']);
+                __fsKill(Document.prototype, [
+                    'fullscreenEnabled', 'fullscreen', 'fullscreenElement', 'exitFullscreen',
+                    'webkitFullscreenEnabled', 'webkitFullscreenElement', 'webkitExitFullscreen',
+                    'webkitCancelFullScreen', 'webkitIsFullScreen',
+                    'webkitFullScreenKeyboardInputAllowed', 'webkitCurrentFullScreenElement',
+                    'onfullscreenchange', 'onfullscreenerror',
+                    'onwebkitfullscreenchange', 'onwebkitfullscreenerror']);
+                if (typeof ShadowRoot !== 'undefined') {
+                    __fsKill(ShadowRoot.prototype, ['fullscreenElement']);
+                }
+            }
+
+            // 9) <video> 的 webkit 全屏家族：iPhone/iPad 全有
+            //    （HTMLVideoElement.idl 的 webkitSupportsFullscreen /
+            //    webkitDisplayingFullscreen / webkitEnterFullscreen /
+            //    webkitExitFullscreen 及其 FullScreen 大写拼写别名均无平台守卫），
+            //    也是 iPhone 上唯一的元素级全屏通道。视频站点普遍用
+            //    `video.webkitEnterFullscreen` 做 iOS 能力探测，桌面内核带
+            //    HTMLVideoElement 但全部缺失 → 一行判假。
+            //    语义：webkitSupportsFullscreen=元素已有媒体源（真机无源 false）；
+            //    webkitDisplayingFullscreen 跟随 enter/exit 状态机（仿真无真实
+            //    全屏，只对齐可观察状态，不打扰视频播放）。
+            if (typeof HTMLVideoElement !== 'undefined') {
+                try {
+                    var __vfProto = HTMLVideoElement.prototype;
+                    if (!('webkitEnterFullscreen' in __vfProto)) {
+                        var __vfState = new WeakSet();
+                        var __vfEnterOf = function () {
+                            return function () {
+                                try { __vfState.add(this); } catch (e) {}
+                            };
+                        };
+                        var __vfExitOf = function () {
+                            return function () {
+                                try { __vfState.delete(this); } catch (e) {}
+                            };
+                        };
+                        defineFn(__vfProto, 'webkitEnterFullscreen', __vfEnterOf());
+                        defineFn(__vfProto, 'webkitEnterFullScreen', __vfEnterOf());
+                        defineFn(__vfProto, 'webkitExitFullscreen', __vfExitOf());
+                        defineFn(__vfProto, 'webkitExitFullScreen', __vfExitOf());
+                        Object.defineProperty(__vfProto, 'webkitSupportsFullscreen', {
+                            get: __maskNative(function () {
+                                try {
+                                    return !!(this.currentSrc || this.src);
+                                } catch (e) { return false; }
+                            }, 'get webkitSupportsFullscreen'),
+                            enumerable: true, configurable: true,
+                        });
+                        Object.defineProperty(__vfProto, 'webkitDisplayingFullscreen', {
+                            get: __maskNative(function () {
+                                try { return __vfState.has(this); } catch (e) { return false; }
+                            }, 'get webkitDisplayingFullscreen'),
+                            enumerable: true, configurable: true,
+                        });
+                    }
+                } catch (e) {}
+            }
+
+            // 10) 传感器构造器不可构造：WebKit 的 DeviceMotionEvent /
+            //     DeviceOrientationEvent 没有构造器操作——DeviceMotionEvent.idl
+            //     原文「FIXME: Add support for DeviceMotionEvent constructor.」；
+            //     MDN BCD constructible：safari/safari_ios=false、chrome=59。
+            //     真机 `new DeviceMotionEvent('devicemotion')` 一行 throw 判内核。
+            //     用 Proxy 包装原生构造器（apply/construct 均抛 TypeError
+            //     「Illegal constructor」，与 WebKit 默认文案一致），原型链、
+            //     instanceof、toString 外观、prototype.constructor 指向与 window
+            //     属性描述符全部保持原生形态（Proxy 无 JS 可观测品牌）。
+            var __sensorNatives = {};
+            var __noCtor = function (name) {
+                try {
+                    var __Native = window[name];
+                    if (typeof __Native !== 'function') {
+                        return;
+                    }
+                    __sensorNatives[name] = __Native;
+                    if (typeof Proxy === 'undefined') {
+                        return;
+                    }
+                    var __throwCtor = function () {
+                        throw new TypeError('Illegal constructor');
+                    };
+                    var __proxy = new Proxy(__Native, { apply: __throwCtor, construct: __throwCtor });
+                    var __wdesc = Object.getOwnPropertyDescriptor(window, name);
+                    Object.defineProperty(window, name, {
+                        value: __proxy,
+                        writable: __wdesc ? !!__wdesc.writable : true,
+                        enumerable: __wdesc ? !!__wdesc.enumerable : false,
+                        configurable: __wdesc ? !!__wdesc.configurable : true,
+                    });
+                    if (__Native.prototype) {
+                        Object.defineProperty(__Native.prototype, 'constructor', {
+                            value: __proxy, writable: true, enumerable: false, configurable: true,
+                        });
+                    }
+                } catch (e) {}
+            };
+            __noCtor('DeviceMotionEvent');
+            __noCtor('DeviceOrientationEvent');
+
+            // 11) iOS 传感器事件的完整形态面（罗盘属性 + legacy 初始化器 + createEvent）：
+            //     a) WebKit 的 DeviceOrientationEvent 在 iOS 构建下没有 absolute，
+            //        取而代之 webkitCompassHeading / webkitCompassAccuracy
+            //        （DeviceOrientationEvent.idl 的 #if WTF_PLATFORM_IOS_FAMILY
+            //        分支；非 iOS 构建才有 absolute）。真机一行
+            //        `'webkitCompassHeading' in DeviceOrientationEvent.prototype` 判 iOS；
+            //        无罗盘数据时为 null。
+            //     b) legacy 初始化器：WebKit 的 DeviceMotionEvent /
+            //        DeviceOrientationEvent 都有 initDeviceMotionEvent /
+            //        initDeviceOrientationEvent（iOS 版 DOE 的第 7/8 参数是
+            //        compassHeading/compassAccuracy，非 absolute），Chromium 148
+            //        已移除；真机 `'initDeviceMotionEvent' in
+            //        DeviceMotionEvent.prototype` 一行判假。补齐后 alpha/beta/gamma
+            //        （与 acceleration / accelerationIncludingGravity /
+            //        rotationRate / interval）需回读一致，故以 WeakMap 存值 +
+            //        覆盖原型 getter（引擎派发的事件不在存储里，仍走原生 getter，
+            //        行为不变）；字典参数按 WebIDL 转换（缺键/非对象 → null 字段，
+            //        每次读取返回新对象，与真机字典返回值一致）。
+            //     c) document.createEvent('DeviceMotionEvent'/'DeviceOrientationEvent')：
+            //        WebKit 的 Document::createEvent 明确支持这两个名字
+            //        （Document.cpp 的 ENABLE(DEVICE_ORIENTATION) 分支），Chromium
+            //        148 抛 NotSupportedError；真机一行判假，故整链补齐（返回值用
+            //        原生构造器造未初始化实例：type=''，与 createForBindings 同形态）。
+            var __dblOrNull = function (v) {
+                if (v === undefined || v === null) { return null; }
+                return Number(v);
+            };
+            var __dictOrNull = function (v, keys) {
+                if (v === undefined || v === null) { return null; }
+                var o = Object(v);
+                var out = {};
+                for (var __ki = 0; __ki < keys.length; __ki++) {
+                    out[keys[__ki]] = __dblOrNull(o[keys[__ki]]);
+                }
+                return out;
+            };
+            var __overrideSensorGet = function (proto, prop, read) {
+                try {
+                    var d = Object.getOwnPropertyDescriptor(proto, prop);
+                    if (!d || typeof d.get !== 'function') { return; }
+                    var __nativeGet = d.get;
+                    var desc = {
+                        get: __maskNative(function () { return read(this, __nativeGet); },
+                            'get ' + prop),
+                        enumerable: d.enumerable, configurable: true,
+                    };
+                    if (d.set) { desc.set = d.set; }
+                    Object.defineProperty(proto, prop, desc);
+                } catch (e) {}
+            };
+            var __legacyInit = function (proto, name, store, values) {
+                try {
+                    if (typeof proto[name] === 'function') { return; }
+                    var fn = function () {
+                        var args = arguments;
+                        Event.prototype.initEvent.call(this, args[0], !!args[1], !!args[2]);
+                        try { store.set(this, values.call(this, args)); } catch (e) {}
+                    };
+                    try {
+                        Object.defineProperty(fn, 'length', { value: 0, configurable: true });
+                    } catch (e) {}
+                    defineFn(proto, name, fn);
+                } catch (e) {}
+            };
+            if (typeof DeviceOrientationEvent !== 'undefined') {
+                try {
+                    var __compass = new WeakMap();
+                    var __legacyOrient = new WeakMap();
+                    var __compassOf = function (ev) {
+                        try { return __compass.get(ev) || null; } catch (e) { return null; }
+                    };
+                    Object.defineProperty(DeviceOrientationEvent.prototype, 'webkitCompassHeading', {
+                        get: __maskNative(function () {
+                            var s = __compassOf(this);
+                            return s ? s.heading : null;
+                        }, 'get webkitCompassHeading'),
+                        enumerable: true, configurable: true,
+                    });
+                    Object.defineProperty(DeviceOrientationEvent.prototype, 'webkitCompassAccuracy', {
+                        get: __maskNative(function () {
+                            var s = __compassOf(this);
+                            return s ? s.accuracy : null;
+                        }, 'get webkitCompassAccuracy'),
+                        enumerable: true, configurable: true,
+                    });
+                    var __orientProps = ['alpha', 'beta', 'gamma'];
+                    for (var __oi = 0; __oi < __orientProps.length; __oi++) {
+                        (function (prop) {
+                            __overrideSensorGet(DeviceOrientationEvent.prototype, prop,
+                                function (ev, nativeGet) {
+                                    var s = __legacyOrient.get(ev);
+                                    if (s && s[prop] !== undefined) { return s[prop]; }
+                                    return nativeGet.call(ev);
+                                });
+                        })(__orientProps[__oi]);
+                    }
+                    __legacyInit(DeviceOrientationEvent.prototype, 'initDeviceOrientationEvent',
+                        __legacyOrient,
+                        function (args) {
+                            var out = {
+                                alpha: __dblOrNull(args[3]),
+                                beta: __dblOrNull(args[4]),
+                                gamma: __dblOrNull(args[5]),
+                            };
+                            try {
+                                __compass.set(this, {
+                                    heading: __dblOrNull(args[6]),
+                                    accuracy: __dblOrNull(args[7]),
+                                });
+                            } catch (e) {}
+                            return out;
+                        });
+                } catch (e) {}
+            }
+            if (typeof DeviceMotionEvent !== 'undefined') {
+                try {
+                    var __legacyMotion = new WeakMap();
+                    var __motionDicts = {
+                        acceleration: ['x', 'y', 'z'],
+                        accelerationIncludingGravity: ['x', 'y', 'z'],
+                        rotationRate: ['alpha', 'beta', 'gamma'],
+                    };
+                    var __motionProps = ['acceleration', 'accelerationIncludingGravity',
+                                         'rotationRate', 'interval'];
+                    for (var __mi = 0; __mi < __motionProps.length; __mi++) {
+                        (function (prop) {
+                            var keys = __motionDicts[prop] || null;
+                            __overrideSensorGet(DeviceMotionEvent.prototype, prop,
+                                function (ev, nativeGet) {
+                                    var s = __legacyMotion.get(ev);
+                                    if (!s || s[prop] === undefined) {
+                                        return nativeGet.call(ev);
+                                    }
+                                    if (!keys || s[prop] === null) { return s[prop]; }
+                                    var out = {};
+                                    for (var __ki = 0; __ki < keys.length; __ki++) {
+                                        out[keys[__ki]] = s[prop][keys[__ki]];
+                                    }
+                                    return out;
+                                });
+                        })(__motionProps[__mi]);
+                    }
+                    __legacyInit(DeviceMotionEvent.prototype, 'initDeviceMotionEvent',
+                        __legacyMotion,
+                        function (args) {
+                            return {
+                                acceleration: __dictOrNull(args[3], ['x', 'y', 'z']),
+                                accelerationIncludingGravity:
+                                    __dictOrNull(args[4], ['x', 'y', 'z']),
+                                rotationRate: __dictOrNull(args[5], ['alpha', 'beta', 'gamma']),
+                                interval: __dblOrNull(args[6]),
+                            };
+                        });
+                } catch (e) {}
+            }
+            try {
+                var __origCreateEvent = Document.prototype.createEvent;
+                var __sensorEventNames = {
+                    devicemotionevent: 'DeviceMotionEvent',
+                    deviceorientationevent: 'DeviceOrientationEvent',
+                };
+                var __createEvent = function (type) {
+                    var iface = __sensorEventNames[String(type).toLowerCase()];
+                    if (iface) {
+                        var native = __sensorNatives[iface];
+                        if (typeof native === 'function') {
+                            return new native('');
+                        }
+                    }
+                    return __origCreateEvent.apply(this, arguments);
+                };
+                try {
+                    Object.defineProperty(__createEvent, 'length', {
+                        value: __origCreateEvent.length, configurable: true,
+                    });
+                } catch (e) {}
+                defineFn(Document.prototype, 'createEvent', __createEvent);
+            } catch (e) {}
+
+            // 12) WebKit 专属 CSS 面：-webkit-touch-callout（WebKit CSSProperties.json
+            //     非标准属性，值 default|none；MDN BCD 仅 safari_ios=2，chrome /
+            //     chrome_android=false）与 -webkit-overflow-scrolling（同源非标准，
+            //     值 auto|touch；Chromium 从未实现）。iOS 检测脚本的经典组合正是
+            //     `CSS.supports('-webkit-touch-callout', 'none')` /
+            //     `'webkitTouchCallout' in el.style`——桌面内核装 iOS 一行判假。
+            //     真机语义：CSS.supports 两参（含值合法性）与单参条件文本（含复合
+            //     条件）都按键值合法性作答；驼峰属性是 CSS 属性访问器，读写与
+            //     getPropertyValue / setProperty / removeProperty 同源；非法值静默
+            //     忽略（不覆盖旧值）。访问器 enumerable:false：真机 WebKit 的 CSS
+            //     属性是不可枚举的具名属性（`for...in` 不列出）。
+            //     已知边界：getComputedStyle 侧无级联/used value（引擎级能力，无法
+            //     从 JS 补齐）——返回内联存储值或 ''；cssText 写入不识别这两项。
+            try {
+                var __wf = Object.create(null);
+                __wf['-webkit-touch-callout'] = {
+                    camel: 'webkitTouchCallout', values: ['default', 'none'],
+                };
+                __wf['-webkit-overflow-scrolling'] = {
+                    camel: 'webkitOverflowScrolling', values: ['auto', 'touch'],
+                };
+                var __cssStore = new WeakMap();
+                var __wfInfo = function (name) {
+                    if (typeof name !== 'string') { return null; }
+                    var key = name.trim().toLowerCase();
+                    var info = __wf[key];
+                    return info ? { key: key, info: info } : null;
+                };
+                var __wfValueOk = function (info, value) {
+                    if (value === undefined || value === null) { return false; }
+                    var v = String(value).trim().toLowerCase();
+                    for (var __vi = 0; __vi < info.values.length; __vi++) {
+                        if (info.values[__vi] === v) { return true; }
+                    }
+                    return false;
+                };
+                var __wfStore = function (decl) {
+                    var s = __cssStore.get(decl);
+                    if (!s) {
+                        s = Object.create(null);
+                        __cssStore.set(decl, s);
+                    }
+                    return s;
+                };
+                for (var __wk in __wf) {
+                    (function (key, info) {
+                        try {
+                            if (Object.getOwnPropertyDescriptor(
+                                    CSSStyleDeclaration.prototype, info.camel)) {
+                                return;
+                            }
+                            Object.defineProperty(CSSStyleDeclaration.prototype, info.camel, {
+                                configurable: true,
+                                enumerable: false,
+                                get: __maskNative(function () {
+                                    var s = __cssStore.get(this);
+                                    return (s && s[key] !== undefined) ? s[key] : '';
+                                }, 'get ' + info.camel),
+                                set: __maskNative(function (v) {
+                                    if (__wfValueOk(info, v)) {
+                                        __wfStore(this)[key] = String(v).trim().toLowerCase();
+                                    }
+                                }, 'set ' + info.camel),
+                            });
+                        } catch (e) {}
+                    })(__wk, __wf[__wk]);
+                }
+                var __matchLen = function (fn, ref) {
+                    try {
+                        Object.defineProperty(fn, 'length', {
+                            value: ref.length, configurable: true,
+                        });
+                    } catch (e) {}
+                    return fn;
+                };
+                var __csProto = CSSStyleDeclaration.prototype;
+                var __origSetProperty = __csProto.setProperty;
+                var __origGetPropertyValue = __csProto.getPropertyValue;
+                var __origRemoveProperty = __csProto.removeProperty;
+                __csProto.setProperty = __maskNative(__matchLen(function (property, value, priority) {
+                    var hit = __wfInfo(property);
+                    if (hit) {
+                        if (__wfValueOk(hit.info, value)) {
+                            __wfStore(this)[hit.key] = String(value).trim().toLowerCase();
+                        }
+                        return;
+                    }
+                    return __origSetProperty.apply(this, arguments);
+                }, __origSetProperty), 'setProperty');
+                __csProto.getPropertyValue = __maskNative(__matchLen(function (property) {
+                    var hit = __wfInfo(property);
+                    if (hit) {
+                        var s = __cssStore.get(this);
+                        return (s && s[hit.key] !== undefined) ? s[hit.key] : '';
+                    }
+                    return __origGetPropertyValue.apply(this, arguments);
+                }, __origGetPropertyValue), 'getPropertyValue');
+                __csProto.removeProperty = __maskNative(__matchLen(function (property) {
+                    var hit = __wfInfo(property);
+                    if (hit) {
+                        var s = __cssStore.get(this);
+                        var prev = (s && s[hit.key] !== undefined) ? s[hit.key] : '';
+                        if (s) { delete s[hit.key]; }
+                        return prev;
+                    }
+                    return __origRemoveProperty.apply(this, arguments);
+                }, __origRemoveProperty), 'removeProperty');
+                var __origSupports = (typeof CSS !== 'undefined' && CSS
+                    && typeof CSS.supports === 'function') ? CSS.supports : null;
+                if (__origSupports) {
+                    var __fakeSupports = function (a, b) {
+                        try {
+                            if (arguments.length >= 2) {
+                                var hit2 = __wfInfo(a);
+                                if (hit2) { return __wfValueOk(hit2.info, b); }
+                            } else if (arguments.length === 1) {
+                                var text = String(a);
+                                if (/webkit-(touch-callout|overflow-scrolling)/i.test(text)) {
+                                    var rewritten = text.replace(
+                                        /-webkit-(touch-callout|overflow-scrolling)\s*:\s*([^)]*)/gi,
+                                        function (m, prop, val) {
+                                            var info = __wf['-webkit-' + prop.toLowerCase()];
+                                            return __wfValueOk(info, val)
+                                                ? '(color: red)'
+                                                : '(color: __fp_invalid_color_0x9)';
+                                        });
+                                    return __origSupports.call(CSS, rewritten);
+                                }
+                            }
+                        } catch (e) {}
+                        return __origSupports.apply(CSS, arguments);
+                    };
+                    __matchLen(__fakeSupports, __origSupports);
+                    Object.defineProperty(CSS, 'supports', {
+                        value: __maskNative(__fakeSupports, 'supports'),
+                        writable: true, enumerable: true, configurable: true,
+                    });
+                }
+            } catch (e) {}
         }
 
         // ---- 抹掉该平台不存在的桌面 Chromium 属性（如 iOS 的 connection）----

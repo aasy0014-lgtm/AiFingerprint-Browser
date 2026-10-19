@@ -127,6 +127,144 @@ STATE_JS = """async () => {
                     && Object.getPrototypeOf(window.GestureEvent.prototype) === UIEvent.prototype;
             } catch (e) { return false; }
         })(),
+        // ---- 引擎面「一行判假」信号（iOS 批次：MDN BCD / WebKit 源码口径）----
+        engine: {
+            // 元素级全屏（iPhone 应整块缺席：标准版 + webkit 前缀版 + 事件处理属性）
+            fsElementOwn: Object.getOwnPropertyNames(Element.prototype)
+                .filter((n) => /fullscreen/i.test(n)),
+            fsDocumentOwn: Object.getOwnPropertyNames(Document.prototype)
+                .filter((n) => /fullscreen/i.test(n)),
+            fsShadowOwn: (typeof ShadowRoot === 'undefined') ? null
+                : Object.getOwnPropertyNames(ShadowRoot.prototype)
+                    .filter((n) => /fullscreen/i.test(n)),
+            fsRequestType: typeof document.documentElement.requestFullscreen,
+            fsEnabledType: typeof document.fullscreenEnabled,
+            fsExitType: typeof document.exitFullscreen,
+            fsElementInDoc: 'fullscreenElement' in document,
+            fsHandlerInDoc: 'onfullscreenchange' in document,
+            // <video> 的 webkit 全屏家族（iOS 全设备有：真机唯一元素级全屏通道）
+            videoEnterType: typeof document.createElement('video').webkitEnterFullscreen,
+            videoEnterCapType: typeof document.createElement('video').webkitEnterFullScreen,
+            videoExitType: typeof document.createElement('video').webkitExitFullscreen,
+            videoSupportsType: (() => {
+                const v = document.createElement('video');
+                return ('webkitSupportsFullscreen' in v)
+                    ? typeof v.webkitSupportsFullscreen : 'ABSENT';
+            })(),
+            videoSupportsNoSrc: (() => {
+                const v = document.createElement('video');
+                return ('webkitSupportsFullscreen' in v) ? v.webkitSupportsFullscreen : null;
+            })(),
+            videoSupportsWithSrc: (() => {
+                const v = document.createElement('video');
+                if (!('webkitSupportsFullscreen' in v)) return null;
+                v.src = 'data:video/mp4;base64,AAAA';
+                return v.webkitSupportsFullscreen;
+            })(),
+            videoDisplayingAfterEnter: (() => {
+                const v = document.createElement('video');
+                if (typeof v.webkitEnterFullscreen !== 'function') return null;
+                v.webkitEnterFullscreen();
+                return v.webkitDisplayingFullscreen;
+            })(),
+            videoDisplayingAfterExit: (() => {
+                const v = document.createElement('video');
+                if (typeof v.webkitEnterFullscreen !== 'function') return null;
+                v.webkitEnterFullscreen();
+                v.webkitExitFullscreen();
+                return v.webkitDisplayingFullscreen;
+            })(),
+            // WebKit 专属 CSS 面：-webkit-touch-callout / -webkit-overflow-scrolling
+            cssTouchCalloutTwoArg: CSS.supports('-webkit-touch-callout', 'none'),
+            cssTouchCalloutBadValue: CSS.supports('-webkit-touch-callout', 'bogus'),
+            cssTouchCalloutOneArg: CSS.supports('-webkit-touch-callout: none'),
+            cssTouchCalloutParen: CSS.supports('(-webkit-touch-callout: none)'),
+            cssTouchCalloutCompound: CSS.supports('(-webkit-touch-callout: none) and (display: grid)'),
+            cssTouchCalloutNegInvalid: CSS.supports('not (-webkit-touch-callout: bogus)'),
+            cssOscTwoArg: CSS.supports('-webkit-overflow-scrolling', 'touch'),
+            cssOscOneArg: CSS.supports('-webkit-overflow-scrolling: touch'),
+            cssNativeTrue: CSS.supports('display', 'grid'),
+            cssNativeFalse: CSS.supports('display', 'bogusvalue'),
+            tcInStyle: 'webkitTouchCallout' in document.body.style,
+            oscInStyle: 'webkitOverflowScrolling' in document.body.style,
+            tcDefault: document.body.style.webkitTouchCallout,
+            tcRoundtrip: (() => {
+                const s = document.body.style;
+                const before = s.webkitTouchCallout;
+                s.webkitTouchCallout = 'none';
+                const mid = s.webkitTouchCallout;
+                s.removeProperty('-webkit-touch-callout');
+                const after = s.webkitTouchCallout;
+                s.setProperty('-webkit-overflow-scrolling', 'touch');
+                const osc = s.getPropertyValue('-webkit-overflow-scrolling');
+                s.removeProperty('-webkit-overflow-scrolling');
+                return [before, mid, after, osc];
+            })(),
+            tcSetterInvalidIgnored: (() => {
+                const s = document.body.style;
+                s.webkitTouchCallout = 'none';
+                s.webkitTouchCallout = 'bogus';
+                const v = s.webkitTouchCallout;
+                s.removeProperty('-webkit-touch-callout');
+                return v;
+            })(),
+            // 传感器构造器（WebKit 不可构造）与 iOS 专有罗盘属性
+            dmeCtorThrows: (() => {
+                try { new DeviceMotionEvent('devicemotion'); return 'ok'; }
+                catch (e) { return e.name; }
+            })(),
+            doeCtorThrows: (() => {
+                try { new DeviceOrientationEvent('deviceorientation'); return 'ok'; }
+                catch (e) { return e.name; }
+            })(),
+            dmeProtoCtorSelf: DeviceMotionEvent.prototype.constructor === DeviceMotionEvent,
+            dmeNativeStr: /\\[native code\\]/.test(String(DeviceMotionEvent)),
+            compassHeadingIn: 'webkitCompassHeading' in DeviceOrientationEvent.prototype,
+            compassAccuracyIn: 'webkitCompassAccuracy' in DeviceOrientationEvent.prototype,
+            compassHeadingValue: (() => {
+                const d = descOf(DeviceOrientationEvent.prototype, 'webkitCompassHeading');
+                if (!d || !d.get) return 'ABSENT';
+                try { return d.get.call(new Event('fp')); } catch (e) { return 'throw'; }
+            })(),
+            absoluteInProto: 'absolute' in DeviceOrientationEvent.prototype,
+            initDOELen: (typeof DeviceOrientationEvent.prototype.initDeviceOrientationEvent === 'function')
+                ? DeviceOrientationEvent.prototype.initDeviceOrientationEvent.length : null,
+            initDMELen: (typeof DeviceMotionEvent.prototype.initDeviceMotionEvent === 'function')
+                ? DeviceMotionEvent.prototype.initDeviceMotionEvent.length : null,
+            // 真机闭环：createEvent → init → 回读（WebKit 支持这两条链，Chromium 不支持）
+            createEventDOE: (() => {
+                try {
+                    const e = document.createEvent('DeviceOrientationEvent');
+                    return 'ok:' + typeof e.initDeviceOrientationEvent + ':' + e.type;
+                } catch (err) { return 'throw:' + err.name; }
+            })(),
+            createEventDME: (() => {
+                try {
+                    const e = document.createEvent('DeviceMotionEvent');
+                    return 'ok:' + typeof e.initDeviceMotionEvent + ':' + e.type;
+                } catch (err) { return 'throw:' + err.name; }
+            })(),
+            legacyDOEChain: (() => {
+                try {
+                    const e = document.createEvent('DeviceOrientationEvent');
+                    if (typeof e.initDeviceOrientationEvent !== 'function') return null;
+                    e.initDeviceOrientationEvent('deviceorientation', false, false, 10, 20, 30, 45, 5);
+                    return [e.type, e.alpha, e.beta, e.gamma,
+                            e.webkitCompassHeading, e.webkitCompassAccuracy];
+                } catch (err) { return 'throw:' + err.name; }
+            })(),
+            legacyDMEChain: (() => {
+                try {
+                    const e = document.createEvent('DeviceMotionEvent');
+                    if (typeof e.initDeviceMotionEvent !== 'function') return null;
+                    e.initDeviceMotionEvent('devicemotion', false, false,
+                        {x: 1, y: 2, z: 3}, {x: 4, y: 5, z: 6},
+                        {alpha: 7, beta: 8, gamma: 9}, 16);
+                    return [e.type, e.acceleration.x, e.accelerationIncludingGravity.y,
+                            e.rotationRate.gamma, e.interval];
+                } catch (err) { return 'throw:' + err.name; }
+            })(),
+        },
         ownProps: Object.getOwnPropertyNames(nav).filter((n) =>
             ['platform','userAgent','maxTouchPoints','mobile','deviceMemory',
              'userAgentData','vendor','getBattery','standalone','connection'].includes(n)),
@@ -1063,6 +1201,8 @@ async def main() -> int:
     rp = sensor.get("requestPermission") or {}
     rp_no_gesture = sensor.get("noGesture") or {}
     rp_gesture = sensor.get("gesture") or {}
+    # ---- 引擎面「一行判假」信号（iOS 批次）----
+    eng = state.get("engine") or {}
     aig_mag = _sensor_magnitude(last_motion.get("aig"))
     lin_mag = _sensor_magnitude(last_motion.get("acc"))
     gyro_mag = _sensor_magnitude(last_motion.get("rr"))
@@ -1196,9 +1336,32 @@ async def main() -> int:
                 rp.get("motion") == "undefined" and rp.get("orientation") == "undefined"),
             "传感器：跨域 iframe（OOPIF，已委托 allow）内 devicemotion 同样有流": (
                 int(fr.get("dm") or 0) >= 20),
+            # ---- 引擎面锁定：Android 保持 Chromium 口径（防误删/防误补）----
+            "引擎面：标准全屏 API 保留（Chrome Android 口径）": (
+                eng.get("fsRequestType") == "function"
+                and eng.get("fsEnabledType") == "boolean"
+                and eng.get("fsElementInDoc") is True
+                and eng.get("fsHandlerInDoc") is True),
+            "引擎面：无 webkit 视频全屏家族（Chromium 口径）": (
+                eng.get("videoEnterType") == "undefined"
+                and eng.get("videoSupportsType") == "ABSENT"),
+            "引擎面：无 WebKit 专属 CSS 面（touch-callout/overflow-scrolling 均 false）": (
+                eng.get("cssTouchCalloutTwoArg") is False
+                and eng.get("cssOscTwoArg") is False
+                and eng.get("tcInStyle") is False
+                and eng.get("oscInStyle") is False),
+            "引擎面：传感器构造器可构造（Chromium 口径）": (
+                eng.get("dmeCtorThrows") == "ok" and eng.get("doeCtorThrows") == "ok"),
+            "引擎面：absolute 保留 + 无 webkitCompassHeading（Chromium 口径）": (
+                eng.get("absoluteInProto") is True and eng.get("compassHeadingIn") is False),
+            "引擎面：无 WebKit legacy 传感器链（createEvent → init 不可用）": (
+                eng.get("legacyDOEChain") is None
+                or str(eng.get("legacyDOEChain")).startswith("throw:")),
         })
     else:
         is_ios_chrome = extra.get("browser") == "chrome_ios"
+        _is_ipad = (nav.get("platform") == "iPad"
+                    or "iPad" in (nav.get("userAgent") or ""))
         checks.update({
             "UA-CH 不存在（Safari/CriOS 均无该 API）": state["uaData"] == "ABSENT",
             "getBattery 不存在（WKWebView 无该 API）": state["hasGetBattery"] is False,
@@ -1256,6 +1419,80 @@ async def main() -> int:
                 sensor_counts.get("motionNumeric", 0) == 0
                 and sensor_counts.get("orientationNumeric", 0) == 0
                 and sensor_counts.get("orientationAbsoluteNumeric", 0) == 0),
+            # 桌面内核在注册监听时会派发一次全 null 的 devicemotion /
+            # deviceorientation / deviceorientationabsolute 哨兵事件；真机 iOS
+            # 未授权时事件总数为 0（且 WebKit 根本没有 deviceorientationabsolute）。
+            "传感器：未授权时事件总数为 0（三类哨兵事件全抑制）": (
+                sensor_counts.get("motion", 0) == 0
+                and sensor_counts.get("orientation", 0) == 0
+                and sensor_counts.get("orientationAbsolute", 0) == 0),
+            # ---- 引擎面「一行判假」信号（iOS 批次；BCD / WebKit 源码口径）----
+            # 元素级全屏按设备分口径：iPhone 整块缺席；iPad Safari 16.4+ 有
+            # （模板按 platform/UA 的 iPad 判断保留原生实现）。
+            "全屏：元素级全屏成员按设备口径（iPhone 清空 / iPad 保留）": (
+                ("requestFullscreen" in (eng.get("fsElementOwn") or [])
+                 and "exitFullscreen" in (eng.get("fsDocumentOwn") or []))
+                if _is_ipad else
+                (eng.get("fsElementOwn") == [] and eng.get("fsDocumentOwn") == []
+                 and eng.get("fsShadowOwn") in ([], None))),
+            "全屏：requestFullscreen/fullscreenEnabled/exitFullscreen 按设备口径": (
+                (eng.get("fsRequestType") == "function"
+                 and eng.get("fsEnabledType") == "boolean"
+                 and eng.get("fsExitType") == "function"
+                 and eng.get("fsElementInDoc") is True)
+                if _is_ipad else
+                (eng.get("fsRequestType") == "undefined"
+                 and eng.get("fsEnabledType") == "undefined"
+                 and eng.get("fsExitType") == "undefined"
+                 and eng.get("fsElementInDoc") is False
+                 and eng.get("fsHandlerInDoc") is False)),
+            "视频：webkit 全屏家族齐全（含 FullScreen 大写拼写别名）": (
+                eng.get("videoEnterType") == "function"
+                and eng.get("videoEnterCapType") == "function"
+                and eng.get("videoExitType") == "function"),
+            "视频：webkitSupportsFullscreen 无源 false / 有源 true": (
+                eng.get("videoSupportsType") == "boolean"
+                and eng.get("videoSupportsNoSrc") is False
+                and eng.get("videoSupportsWithSrc") is True),
+            "视频：webkitDisplayingFullscreen 随 enter/exit 切换": (
+                eng.get("videoDisplayingAfterEnter") is True
+                and eng.get("videoDisplayingAfterExit") is False),
+            "CSS：CSS.supports 白名单（两参/单参/条件式/复合式）": (
+                eng.get("cssTouchCalloutTwoArg") is True
+                and eng.get("cssTouchCalloutOneArg") is True
+                and eng.get("cssTouchCalloutParen") is True
+                and eng.get("cssTouchCalloutCompound") is True
+                and eng.get("cssOscTwoArg") is True
+                and eng.get("cssOscOneArg") is True),
+            "CSS：值合法性（非法值 false、否定式语义正确）": (
+                eng.get("cssTouchCalloutBadValue") is False
+                and eng.get("cssTouchCalloutNegInvalid") is True),
+            "CSS：原生判定不受影响（display: grid 真 / 非法值假）": (
+                eng.get("cssNativeTrue") is True and eng.get("cssNativeFalse") is False),
+            "CSS：webkitTouchCallout/webkitOverflowScrolling 属性面 + 读写回环": (
+                eng.get("tcInStyle") is True and eng.get("oscInStyle") is True
+                and eng.get("tcDefault") == ""
+                and eng.get("tcRoundtrip") == ["", "none", "", "touch"]),
+            "CSS：非法值静默忽略（不覆盖旧值）": (
+                eng.get("tcSetterInvalidIgnored") == "none"),
+            "传感器：new DeviceMotionEvent/DeviceOrientationEvent 抛 TypeError": (
+                eng.get("dmeCtorThrows") == "TypeError"
+                and eng.get("doeCtorThrows") == "TypeError"),
+            "传感器：构造器保持原生形态（prototype.constructor 指回 + native 外观）": (
+                eng.get("dmeProtoCtorSelf") is True and eng.get("dmeNativeStr") is True),
+            "传感器：webkitCompassHeading/Accuracy 存在，无数据为 null": (
+                eng.get("compassHeadingIn") is True
+                and eng.get("compassAccuracyIn") is True
+                and eng.get("compassHeadingValue") is None),
+            "传感器：legacy 初始化器齐全（initDeviceMotionEvent/…OrientationEvent，length 0）": (
+                eng.get("initDOELen") == 0 and eng.get("initDMELen") == 0),
+            "传感器：createEvent 两条链可用（WebKit 口径）": (
+                str(eng.get("createEventDOE", "")).startswith("ok:function:")
+                and str(eng.get("createEventDME", "")).startswith("ok:function:")),
+            "传感器：createEvent → init → 回读一致（orientation 链，含罗盘值）": (
+                eng.get("legacyDOEChain") == ["deviceorientation", 10, 20, 30, 45, 5]),
+            "传感器：createEvent → init → 回读一致（motion 链，含字典与 interval）": (
+                eng.get("legacyDMEChain") == ["devicemotion", 1, 5, 9, 16]),
         })
         if is_ios_chrome:
             checks.update({
@@ -1323,7 +1560,8 @@ async def main() -> int:
     for name, passed in checks.items():
         print(("  ✅ " if passed else "  ❌ ") + name)
         ok_all = ok_all and passed
-    print("\n" + ("✅ 全部通过" if ok_all else "❌ 存在失败项"))
+    print("\n" + (f"✅ 全部通过（{len(checks)} 项）" if ok_all
+                  else f"❌ 存在失败项（{len(checks)} 项）"))
     return 0 if ok_all else 1
 
 
