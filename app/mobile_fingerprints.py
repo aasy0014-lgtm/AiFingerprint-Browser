@@ -286,7 +286,7 @@ def generate_mobile_fingerprint(
 
     Parameters:
         target_os: "android" or "ios"
-        manufacturer: 可选品牌（Samsung/Google/Xiaomi/OnePlus/Apple 等），
+        manufacturer: 可选品牌（Samsung/Google/Xiaomi/OnePlus/Honor/Apple 等），
                       无匹配时回退为该平台全库，实际结果见返回的 manufacturer
         mode: "generate"（版本随机）/ "preset"（版本取机型当前主流组合）
         browser: 浏览器口径。Android 仅 "chrome"（默认）；iOS 可选

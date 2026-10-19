@@ -271,7 +271,7 @@ async function ensureMobileLibrary() {
   return mobileLibrary;
 }
 
-/* 按当前目标 OS 填充品牌下拉（Apple/Samsung/Google/Xiaomi/OnePlus） */
+/* 按当前目标 OS 填充品牌下拉（Apple/Samsung/Google/Xiaomi/OnePlus/Honor） */
 function fillMobileBrands() {
   const sel = $("#mobileBrandSelect");
   const os = $("#targetOsSelect").value;

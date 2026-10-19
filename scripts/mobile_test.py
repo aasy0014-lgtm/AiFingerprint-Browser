@@ -189,8 +189,8 @@ def test_library() -> dict:
     check("机型数量充足（≥30）", info["count"] >= 30)
     brands = list_brands()
     print(f"  品牌: {brands}")
-    check("Android 品牌齐全（含 Samsung/Google/Xiaomi/OnePlus）",
-          {"Samsung", "Google", "Xiaomi", "OnePlus"} <= set(brands["android"]))
+    check("Android 品牌齐全（含 Samsung/Google/Xiaomi/OnePlus/Honor）",
+          {"Samsung", "Google", "Xiaomi", "OnePlus", "Honor"} <= set(brands["android"]))
     check("iOS 品牌仅 Apple", brands["ios"] == ["Apple"])
     return load_device_index()
 

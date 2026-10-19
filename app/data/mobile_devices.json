@@ -1,6 +1,6 @@
 {
   "version": "2026.10",
-  "updated": "2026-10-18",
+  "updated": "2026-10-19",
   "notes": "移动端真实机型指纹库。屏幕/DPR/CSS 视口取自 Chrome DevTools 设备库实测值（Playwright deviceDescriptors）与厂商公开规格；GPU 字符串为对应 SoC 在 Chrome(ANGLE) / Safari 下的真实 WebGL 上报格式；系统版本分布为 2026-10 各机型的在网份额近似值。新增机型时按同结构追加即可。android_browsers 仅是没有安装 fp-chromium 内核时的回退版本池；已安装内核时 Android Chrome 版本自动跟随内核真实引擎版本（UA 与引擎 feature 必须一致）。",
   "android_browsers": [
     {"major": "156", "full": "156.0.8078.35", "weight": 40},
@@ -156,6 +156,42 @@
       "os_versions": {"15": 35, "14": 30, "16": 25, "13": 10}
     },
     {
+      "brand": "Xiaomi", "platform": "android", "type": "phone",
+      "model": "Redmi Note 13 Pro+", "market_name": "Redmi Note 13 Pro+", "released": "2023-09",
+      "weight": 5,
+      "screen": {"w": 1220, "h": 2712, "dpr": 2.75, "css_w": 444, "css_h": 986, "viewport_h": 910},
+      "gpu": {"vendor": "ARM", "renderer": "ANGLE (ARM, Mali-G610 MC4, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"15": 35, "14": 30, "16": 25, "13": 10}
+    },
+    {
+      "brand": "Xiaomi", "platform": "android", "type": "phone",
+      "model": "Redmi Note 14 Pro", "market_name": "Redmi Note 14 Pro", "released": "2024-09",
+      "weight": 8,
+      "screen": {"w": 1220, "h": 2712, "dpr": 2.75, "css_w": 444, "css_h": 986, "viewport_h": 910},
+      "gpu": {"vendor": "ARM", "renderer": "ANGLE (ARM, Mali-G615 MC2, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 8, "max_touch_points": 5,
+      "os_versions": {"16": 40, "15": 30, "17": 20, "14": 10}
+    },
+    {
+      "brand": "Xiaomi", "platform": "android", "type": "phone",
+      "model": "Redmi Note 14 Pro+", "market_name": "Redmi Note 14 Pro+", "released": "2024-09",
+      "weight": 7,
+      "screen": {"w": 1220, "h": 2712, "dpr": 2.75, "css_w": 444, "css_h": 986, "viewport_h": 910},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 810, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 40, "15": 30, "17": 20, "14": 10}
+    },
+    {
+      "brand": "Xiaomi", "platform": "android", "type": "phone",
+      "model": "Redmi Note 15 Pro+", "market_name": "Redmi Note 15 Pro+", "released": "2025-08",
+      "weight": 5,
+      "screen": {"w": 1280, "h": 2772, "dpr": 2.75, "css_w": 465, "css_h": 1008, "viewport_h": 932},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 810, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 45, "17": 35, "15": 20}
+    },
+    {
       "brand": "OnePlus", "platform": "android", "type": "phone",
       "model": "CPH2581", "market_name": "OnePlus 12", "released": "2023-12",
       "weight": 3,
@@ -172,6 +208,51 @@
       "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 830, OpenGL ES 3.2)"},
       "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
       "os_versions": {"16": 45, "17": 30, "15": 25}
+    },
+    {
+      "brand": "Honor", "platform": "android", "type": "phone",
+      "model": "ALI-AN00", "market_name": "Honor X50", "released": "2023-07",
+      "weight": 6,
+      "screen": {"w": 1200, "h": 2652, "dpr": 3.25, "css_w": 369, "css_h": 816, "viewport_h": 740},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 710, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 8, "max_touch_points": 5,
+      "os_versions": {"15": 45, "14": 40, "13": 15}
+    },
+    {
+      "brand": "Honor", "platform": "android", "type": "phone",
+      "model": "BVL-N49", "market_name": "Honor Magic6 Pro", "released": "2024-01",
+      "weight": 3,
+      "screen": {"w": 1280, "h": 2800, "dpr": 3.5, "css_w": 366, "css_h": 800, "viewport_h": 724},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 40, "17": 25, "15": 25, "14": 10}
+    },
+    {
+      "brand": "Honor", "platform": "android", "type": "phone",
+      "model": "ELI-NX9", "market_name": "Honor 200", "released": "2024-05",
+      "weight": 5,
+      "screen": {"w": 1200, "h": 2664, "dpr": 3.25, "css_w": 369, "css_h": 820, "viewport_h": 744},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 720, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 40, "15": 40, "14": 20}
+    },
+    {
+      "brand": "Honor", "platform": "android", "type": "phone",
+      "model": "PTP-N49", "market_name": "Honor Magic7 Pro", "released": "2024-11",
+      "weight": 3,
+      "screen": {"w": 1280, "h": 2800, "dpr": 3.5, "css_w": 366, "css_h": 800, "viewport_h": 724},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 830, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 45, "17": 35, "15": 20}
+    },
+    {
+      "brand": "Honor", "platform": "android", "type": "phone",
+      "model": "BKQ-N49", "market_name": "Honor Magic8 Pro", "released": "2025-10",
+      "weight": 2,
+      "screen": {"w": 1256, "h": 2808, "dpr": 3.5, "css_w": 359, "css_h": 802, "viewport_h": 726},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 840, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 55, "17": 45}
     },
     {
       "brand": "Apple", "platform": "ios", "type": "phone",
