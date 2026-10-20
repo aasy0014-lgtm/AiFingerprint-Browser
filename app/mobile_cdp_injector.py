@@ -1225,6 +1225,91 @@ _PATCH_TEMPLATE = r"""
                 defineFn(Document.prototype, 'createEvent', __createEvent);
             } catch (e) {}
 
+            // 12) WebKit 原生触控工厂 document.createTouch / createTouchList。
+            //     MDN BCD：safari_ios=≤3（至今保留）、chrome 25–68（已移除）、
+            //     safari=false；检测站按「声明 iOS 但无 createTouch」直接判
+            //     「现代 Blink 内核」（本仓库对照检测器该单项 25 分）。
+            //     真机形态取证（Playwright WebKit 27.2）：
+            //       * createTouch / createTouchList 挂在 Document.prototype，
+            //         writable+enumerable+configurable，length 0、原生外观；
+            //       * 参数顺序 (window, target, identifier, pageX, pageY,
+            //         screenX, screenY, radiusX, radiusY, rotationAngle, force)，
+            //         后四项目前恒为 null（不是 0）——WebKit 未实现该批扩展；
+            //       * 未传 target 时 target 为 null；返回真 Touch/TouchList 实例
+            //         （instanceof 成立、[object Touch]、索引与 item() 同源）。
+            //     实现：Touch 由内核原生构造器生成（真 Touch，语义天然一致），
+            //     TouchList 用 TouchEvent 的 touches 列表取得——内核不开放
+            //     TouchList 构造器（Illegal constructor），这是唯一能拿到真
+            //     TouchList 的路径；随后按 WebKit 口径把扩展项置 null。
+            try {
+                if (typeof Touch === 'function' && typeof TouchList === 'function'
+                        && typeof document.createTouch !== 'function') {
+                    var __mkTouch = function (win, target, id, px, py, sx, sy,
+                                              rx, ry, rot, force) {
+                        var tgt = (target === undefined || target === null)
+                            ? null : target;
+                        var t = new Touch({
+                            identifier: (id === undefined || id === null) ? 0 : Number(id) | 0,
+                            target: tgt || document,
+                            pageX: Number(px) || 0,
+                            pageY: Number(py) || 0,
+                            screenX: Number(sx) || 0,
+                            screenY: Number(sy) || 0,
+                            clientX: Number(px) || 0,
+                            clientY: Number(py) || 0,
+                            radiusX: 0, radiusY: 0, rotationAngle: 0, force: 0,
+                        });
+                        // 真机 target 可为 null；扩展四项 WebKit 恒为 null
+                        try {
+                            if (tgt === null) {
+                                Object.defineProperty(t, 'target', {
+                                    get: __maskNative(function () { return null; }, 'get target'),
+                                    enumerable: true, configurable: true,
+                                });
+                            }
+                            var __nullGet = function (name) {
+                                Object.defineProperty(t, name, {
+                                    get: __maskNative(function () { return null; }, 'get ' + name),
+                                    enumerable: true, configurable: true,
+                                });
+                            };
+                            __nullGet('radiusX');
+                            __nullGet('radiusY');
+                            __nullGet('rotationAngle');
+                            __nullGet('force');
+                        } catch (e2) {}
+                        return t;
+                    };
+                    var __mkTouchList = function (touches) {
+                        // 唯一路径：内核 TouchEvent 的 touches 列表
+                        var ev = new TouchEvent('touchend', {
+                            touches: touches, changedTouches: touches,
+                        });
+                        return ev.touches;
+                    };
+                    defineFn(Document.prototype, 'createTouch', function () {
+                        return __mkTouch.apply(null, arguments);
+                    });
+                    try {
+                        Object.defineProperty(Document.prototype.createTouch, 'length', {
+                            value: 0, configurable: true,
+                        });
+                    } catch (e2) {}
+                    defineFn(Document.prototype, 'createTouchList', function () {
+                        var args = [];
+                        for (var __ti = 0; __ti < arguments.length; __ti++) {
+                            args.push(arguments[__ti]);
+                        }
+                        return __mkTouchList(args);
+                    });
+                    try {
+                        Object.defineProperty(Document.prototype.createTouchList, 'length', {
+                            value: 0, configurable: true,
+                        });
+                    } catch (e2) {}
+                }
+            } catch (e) {}
+
             // ---- WebKit 媒体面（P2-13）：AirPlay / EME 前缀面 ----
             // 检测站按「声明 iOS 但无这些成员」判「现代 Blink」。真机形态取证
             // （Playwright WebKit 27.2 实测）：
@@ -1936,6 +2021,218 @@ _PATCH_TEMPLATE = r"""
                         value: __wkNsObj, writable: false,
                         enumerable: true, configurable: false,
                     });
+                }
+            } catch (e) {}
+
+            // 14) Notification 面（WebKit Notification.idl 口径）：
+            //     桌面 Chromium 的 Notification 与 WebKit 差四处，任一处一行可判：
+            //       a) 静态 permission 是**数据属性**（readonly attribute 生成
+            //          不可写数据属性，enumerable/configurable 均 true），内核
+            //          是原型外的访问器；
+            //       b) 静态 maxActions —— Notification.idl:46 已注释掉
+            //          （`// static readonly attribute unsigned long maxActions;`），
+            //          WebKit 从不暴露；内核有且值为 2；
+            //       c) 原型成员集：WebKit 只有 onclick/onerror/navigate/title/
+            //          dir/lang/body/tag/icon/silent/data/onclose/ondisplay/
+            //          onshow/close/show；内核多出 badge/vibrate/timestamp/
+            //          renotify/requireInteraction/actions，且没有 ondisplay/
+            //          navigate/show；
+            //       d) NotificationOptions.silent 是 `boolean?`，缺省为 null
+            //          （内核缺省 false）。
+            //     permission 取值按 WebKit Notification.cpp:407 的判定顺序：
+            //     无 notificationClient / 非安全上下文 → 'denied'；否则 Default。
+            //     内核在 iOS 目标上恒 'default'，非安全上下文即判假。
+            //
+            //     实现要点：不改写内核原型对象，而是**另建一个原型对象**
+            //     （Object.create(EventTarget.prototype)），构造器经 new.target
+            //     把实例接上去。原因有二：
+            //       * 内核原型上 badge/actions 等成员 configurable:false，delete
+            //         删不掉，只能整块换；
+            //       * 真机 Notification.prototype 继承 EventTarget.prototype
+            //         （Notification : EventTarget），实例要能用 addEventListener /
+            //         dispatchEvent。新原型的父链仍指向原生 EventTarget.prototype，
+            //         事件系统照常工作。
+            try {
+                if (typeof Notification === 'function') {
+                    var __Notif = Notification;
+                    var __nPerm = 'denied';
+                    try {
+                        if (window.isSecureContext) {
+                            var __nclient = window.webkit
+                                && window.webkit.messageHandlers
+                                && window.webkit.messageHandlers.notification;
+                            __nPerm = __nclient ? 'default' : 'denied';
+                        }
+                    } catch (e) { __nPerm = 'denied'; }
+                    // 新原型：父链 = 原生 EventTarget.prototype，成员按 WebKit
+                    // 顺序逐个重建（getOwnPropertyNames 的顺序真机可读）。
+                    var __NotifP = Object.create(EventTarget.prototype);
+                    var __nSlots = new WeakMap();
+                    var __nStr = function (v) {
+                        return (v === undefined || v === null) ? '' : String(v);
+                    };
+                    var __nCtor = __maskNative(function Notification(title, opts) {
+                        if (!(this instanceof __nCtor)) {
+                            throw new TypeError("Failed to construct 'Notification': "
+                                + 'Please use the new operator to construct the Notification.');
+                        }
+                        var o = (opts && typeof opts === 'object') ? opts : {};
+                        var data = null;
+                        if (o.data !== undefined && o.data !== null) {
+                            // 真机按结构化克隆；JSON 往返足以覆盖检测站会读的形状
+                            try { data = JSON.parse(JSON.stringify(o.data)); } catch (e) { data = null; }
+                        }
+                        var d = o.dir;
+                        var slot = {
+                            title: __nStr(title),
+                            dir: (d === 'ltr' || d === 'rtl') ? d : 'auto',
+                            lang: __nStr(o.lang),
+                            body: __nStr(o.body),
+                            tag: __nStr(o.tag),
+                            icon: __nStr(o.icon),
+                            // NotificationOptions.silent 是 boolean?，缺省 null
+                            silent: (o.silent === undefined || o.silent === null)
+                                ? null : !!o.silent,
+                            data: data,
+                            navigate: __nStr(o.navigate),
+                            handlers: { onclick: null, onerror: null, onclose: null,
+                                        ondisplay: null, onshow: null },
+                        };
+                        // 实例必须是**真 EventTarget**：addEventListener /
+                        // dispatchEvent 在原生实现里校验内部槽，Object.create
+                        // 出来的普通对象过不了。`new EventTarget()` 带槽，再把
+                        // 原型接到 __NotifP 上即可（instanceof 两链皆真）。
+                        var made;
+                        try {
+                            made = new EventTarget();
+                            Object.setPrototypeOf(made, __NotifP);
+                        } catch (e) {
+                            made = Object.create(__NotifP);
+                        }
+                        __nSlots.set(made, slot);
+                        var nt = new.target;
+                        if (nt && nt !== __nCtor) {
+                            try { Object.setPrototypeOf(made, nt.prototype); } catch (e) {}
+                        }
+                        return made;
+                    }, 'Notification');
+                    Object.defineProperty(__nCtor, 'length', {
+                        value: 1, writable: false, enumerable: false, configurable: true,
+                    });
+                    Object.defineProperty(__nCtor, 'prototype', {
+                        value: __NotifP, writable: false,
+                        enumerable: false, configurable: false,
+                    });
+                    // 静态 permission：数据属性，赋值静默失败
+                    try {
+                        Object.defineProperty(__nCtor, 'permission', {
+                            value: __nPerm, writable: false,
+                            enumerable: true, configurable: true,
+                        });
+                    } catch (e) {}
+                    // requestPermission 沿用原生实现（手势/安全上下文语义内核已对）
+                    try {
+                        Object.defineProperty(__nCtor, 'requestPermission', {
+                            value: __Notif.requestPermission, writable: true,
+                            enumerable: true, configurable: true,
+                        });
+                    } catch (e) {}
+                    Object.defineProperty(__NotifP, 'constructor', {
+                        value: __nCtor, writable: true,
+                        enumerable: false, configurable: true,
+                    });
+                    var __nHandler = function (name) {
+                        try {
+                            Object.defineProperty(__NotifP, name, {
+                                get: __maskNative(function () {
+                                    if (!__nSlots.has(this)) {
+                                        throw new TypeError('The ' + name + ' getter can '
+                                            + 'only be used on instances of Notification');
+                                    }
+                                    return __nSlots.get(this).handlers[name];
+                                }, 'get ' + name),
+                                set: __maskNative(function (v) {
+                                    if (!__nSlots.has(this)) {
+                                        throw new TypeError('The ' + name + ' setter can '
+                                            + 'only be used on instances of Notification');
+                                    }
+                                    __nSlots.get(this).handlers[name] =
+                                        (typeof v === 'function'
+                                            || (v !== null && typeof v === 'object'))
+                                            ? v : null;
+                                }, 'set ' + name),
+                                enumerable: true, configurable: true,
+                            });
+                        } catch (e) {}
+                    };
+                    var __nRo = function (name, read) {
+                        try {
+                            Object.defineProperty(__NotifP, name, {
+                                get: __maskNative(function () {
+                                    if (!__nSlots.has(this)) {
+                                        throw new TypeError('The ' + name + ' getter can '
+                                            + 'only be used on instances of Notification');
+                                    }
+                                    return read(__nSlots.get(this));
+                                }, 'get ' + name),
+                                enumerable: true, configurable: true,
+                            });
+                        } catch (e) {}
+                    };
+                    // 顺序对齐真机 getOwnPropertyNames：constructor, onclick,
+                    // onerror, navigate, title, dir, lang, body, tag, icon,
+                    // silent, data, onclose, ondisplay, onshow, close, show
+                    __nHandler('onclick');
+                    __nHandler('onerror');
+                    __nRo('navigate', function (s) { return s.navigate; });
+                    __nRo('title', function (s) { return s.title; });
+                    __nRo('dir', function (s) { return s.dir; });
+                    __nRo('lang', function (s) { return s.lang; });
+                    __nRo('body', function (s) { return s.body; });
+                    __nRo('tag', function (s) { return s.tag; });
+                    __nRo('icon', function (s) { return s.icon; });
+                    __nRo('silent', function (s) { return s.silent; });
+                    __nRo('data', function (s) { return s.data; });
+                    __nHandler('onclose');
+                    __nHandler('ondisplay');
+                    __nHandler('onshow');
+                    // close / show：show 是 WebKit 的 legacy 方法
+                    // （Notification.idl 末尾「Legacy. Not in the specification.」），
+                    // 内核没有
+                    var __nMethod = function (name) {
+                        try {
+                            Object.defineProperty(__NotifP, name, {
+                                value: __maskNative(function () {
+                                    if (!__nSlots.has(this)) {
+                                        throw new TypeError('Illegal invocation');
+                                    }
+                                }, name),
+                                writable: true, enumerable: true, configurable: true,
+                            });
+                        } catch (e) {}
+                    };
+                    __nMethod('close');
+                    __nMethod('show');
+                    try {
+                        Object.defineProperty(__NotifP, Symbol.toStringTag, {
+                            value: 'Notification', writable: false,
+                            enumerable: false, configurable: true,
+                        });
+                    } catch (e) {}
+                    // 静态 maxActions：WebKit 未实现，整项不存在
+                    try {
+                        delete __Notif.maxActions;
+                        Object.defineProperty(__Notif, 'maxActions', {
+                            value: undefined, writable: false,
+                            enumerable: false, configurable: true,
+                        });
+                    } catch (e) {}
+                    try {
+                        Object.defineProperty(window, 'Notification', {
+                            value: __nCtor, writable: true,
+                            enumerable: false, configurable: true,
+                        });
+                    } catch (e) {}
                 }
             } catch (e) {}
         }

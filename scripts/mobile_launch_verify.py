@@ -805,6 +805,103 @@ STATE_JS = """async () => {
                             n.indexOf('MEDIA_KEYERR_') === 0) : null,
                 };
             })(),
+            // ---- Notification 面（WebKit Notification.idl 口径）----
+            // 真机与桌面内核在静态成员/原型成员/选项缺省值上全线不同，
+            // 取证见 app/mobile_cdp_injector.py 的「Notification 面」注释块。
+            notif: (() => {
+                const N = window.Notification;
+                const out = { type: typeof N };
+                if (typeof N !== 'function') { return out; }
+                const P = N.prototype;
+                const dd = (o, n) => {
+                    const x = descOf(o, n);
+                    return x ? [x.get ? 'accessor' : 'data', x.writable,
+                                x.enumerable, x.configurable] : null;
+                };
+                out.len = N.length;
+                out.own = Object.getOwnPropertyNames(N);
+                out.protoOwn = Object.getOwnPropertyNames(P);
+                out.permission = (() => { try { return N.permission; }
+                    catch (e) { return 'throw:' + e.name; } })();
+                out.permissionDesc = dd(N, 'permission');
+                out.maxActionsIn = (() => { try { return 'maxActions' in N; }
+                    catch (e) { return 'ERR'; } })();
+                out.maxActions = (() => { try { return N.maxActions; }
+                    catch (e) { return 'throw:' + e.name; } })();
+                out.reqPermDesc = (() => {
+                    const x = descOf(N, 'requestPermission');
+                    return x ? [typeof x.value, x.writable, x.enumerable,
+                                x.configurable, x.value.length] : null;
+                })();
+                out.chain = (() => {
+                    const a = [];
+                    let x = P;
+                    for (let i = 0; i < 4 && x; i++) {
+                        a.push(x === EventTarget.prototype
+                            ? 'EventTarget.prototype'
+                            : ((x.constructor && x.constructor.name) || 'obj'));
+                        x = Object.getPrototypeOf(x);
+                    }
+                    return a;
+                })();
+                out.protoDesc = (() => {
+                    const x = descOf(N, 'prototype');
+                    return x ? [x.writable, x.enumerable, x.configurable] : null;
+                })();
+                out.tag = Object.prototype.toString.call(P);
+                out.inst = (() => {
+                    try {
+                        const n = new N('t', {body: 'b', tag: 'tg',
+                            icon: 'https://example.com/i.png', silent: true,
+                            dir: 'rtl', lang: 'en', data: {a: 1}});
+                        let hits = 0;
+                        n.addEventListener('click', () => { hits++; });
+                        n.dispatchEvent(new Event('click'));
+                        return {
+                            title: n.title, body: n.body, tag: n.tag,
+                            icon: n.icon, silent: n.silent, dir: n.dir,
+                            lang: n.lang, data: n.data, navigate: n.navigate,
+                            own: Object.getOwnPropertyNames(n),
+                            isET: n instanceof EventTarget,
+                            isN: n instanceof N, hits,
+                            show: String(n.show()),
+                            close: String(n.close()),
+                        };
+                    } catch (e) { return 'throw:' + e.name; }
+                })();
+                out.defaults = (() => {
+                    try {
+                        const n = new N('t');
+                        return {icon: n.icon, silent: n.silent, dir: n.dir,
+                                lang: n.lang, body: n.body, tag: n.tag,
+                                data: n.data, navigate: n.navigate};
+                    } catch (e) { return 'throw:' + e.name; }
+                })();
+                out.silentFalse = (() => {
+                    try { return new N('t', {silent: false}).silent; }
+                    catch (e) { return 'throw:' + e.name; }
+                })();
+                out.noNew = (() => { try { N('t'); return 'ok'; }
+                    catch (e) { return 'throw:' + e.name; } })();
+                out.badRecv = (() => { try { P.title; return 'ok'; }
+                    catch (e) { return 'throw:' + e.name; } })();
+                out.badRecvNav = (() => { try { P.navigate; return 'ok'; }
+                    catch (e) { return 'throw:' + e.name; } })();
+                out.handlerLoop = (() => {
+                    try {
+                        const n = new N('t');
+                        const f = () => {};
+                        n.ondisplay = f;
+                        const same = n.ondisplay === f;
+                        n.ondisplay = null;
+                        return [same, n.ondisplay];
+                    } catch (e) { return 'throw:' + e.name; }
+                })();
+                out.showBadRecv = (() => { try { P.show(); return 'ok'; }
+                    catch (e) { return 'throw:' + e.name; } })();
+                out.native = nativeStr(N);
+                return out;
+            })(),
         },
         ownProps: Object.getOwnPropertyNames(nav).filter((n) =>
             ['platform','userAgent','maxTouchPoints','mobile','deviceMemory',
@@ -1211,6 +1308,9 @@ async def input_event_probe(page) -> dict:
        Emulation.setEmitTouchEventsForMouse 转换会吞掉 mousePressed/Released
        的 CDP 应答（fp-chromium 148 实测），一旦启用，Playwright 点击永久挂起。
        本项即该回归的守卫（详见 docs/移动端大厂检测对抗优化方案.md 事件层）。
+    3) 触摸拖拽剖面（P2-4）：真机拖拽的 touchmove 带速度/压力曲线，松手后
+       内核按松手速度发起原生 fling。这里用 app/mobile_input.py 的真实路径
+       拖一次，读 event.timeStamp 间隔、force 序列与松手后的 scrollY 增量。
     """
     out: dict = {"touch": [], "mouse": [], "mouse_ok": False}
     await page.evaluate(EVENT_CAPTURE_JS)
@@ -1228,6 +1328,10 @@ async def input_event_probe(page) -> dict:
     except Exception as exc:  # noqa: BLE001
         out["touch_error"] = f"{type(exc).__name__}: {exc}"[:160]
     try:
+        out["drag"] = await _drag_profile_probe(page)
+    except Exception as exc:  # noqa: BLE001
+        out["drag_error"] = f"{type(exc).__name__}: {exc}"[:160]
+    try:
         await asyncio.wait_for(_mouse_click(page), 5)
         out["mouse_ok"] = True
     except Exception as exc:  # noqa: BLE001
@@ -1237,6 +1341,63 @@ async def input_event_probe(page) -> dict:
     await page.evaluate(
         "() => { const el = document.getElementById('__mobile_input_probe');"
         " if (el) el.remove(); }")
+    return out
+
+
+DRAG_CAPTURE_JS = r"""() => {
+  // 探针页本身只有一行文字；拖拽要读 scrollY，先撑出可滚动高度。
+  // html/body 的默认 margin 会改变可拖拽范围，这里统一抹平。
+  document.documentElement.style.cssText = 'margin:0;padding:0;overflow:auto';
+  document.body.style.cssText = 'margin:0;padding:0';
+  const spacer = document.createElement('div');
+  spacer.id = '__drag_spacer';
+  spacer.style.cssText = 'height:6000px;width:1px';
+  document.body.appendChild(spacer);
+  window.scrollTo(0, 0);
+  window.__drag = [];
+  document.addEventListener('touchstart', (e) => {
+    window.__dragStart = e.touches[0].clientY;
+  }, true);
+  document.addEventListener('touchmove', (e) => {
+    const t = e.touches[0];
+    window.__drag.push({ts: e.timeStamp, y: t.clientY, f: t.force, r: t.radiusX});
+  }, true);
+  return {h: innerHeight, sh: document.documentElement.scrollHeight};
+}"""
+
+
+async def _drag_profile_probe(page) -> dict:
+    """触摸拖拽剖面：时间戳间隔 / 位移 / force / 松手后惯性位移。"""
+    from app.mobile_input import touch_input
+
+    out: dict = {}
+    await page.evaluate(DRAG_CAPTURE_JS)
+    await asyncio.sleep(0.1)
+    # 起手点取视口中部、行程 600px、20 帧：每帧约 30px。帧数再少松手
+    # 速度过高（fling 溢出断言量级），再多每帧位移过小、加速段被内核
+    # 的 touchmove 合并吃掉。
+    await touch_input(page).scroll(160, 900, 600, steps=20)
+    await asyncio.sleep(0.05)
+    at_release = await page.evaluate("() => window.scrollY")
+    await asyncio.sleep(0.8)
+    after = await page.evaluate("() => window.scrollY")
+    ev = await page.evaluate("() => window.__drag || []")
+    start_y = await page.evaluate("() => window.__dragStart ?? null")
+    out["moves"] = len(ev)
+    out["atRelease"] = at_release
+    out["after"] = after
+    out["fling"] = after - at_release
+    out["startY"] = start_y
+    out["endY"] = ev[-1]["y"] if ev else None
+    if len(ev) >= 3:
+        out["tsDeltas"] = [round(ev[i + 1]["ts"] - ev[i]["ts"], 1)
+                           for i in range(len(ev) - 1)]
+        out["dy"] = [round(ev[i + 1]["y"] - ev[i]["y"], 1)
+                     for i in range(len(ev) - 1)]
+        out["force"] = [round(float(e["f"]), 3) for e in ev]
+        out["radius"] = [round(float(e["r"]), 2) for e in ev]
+    await page.evaluate("() => { const el = document.getElementById('__drag_spacer');"
+                        " if (el) el.remove(); window.scrollTo(0, 0); }")
     return out
 
 
@@ -1701,7 +1862,10 @@ async def main() -> int:
         # ---- 输入事件层：触摸派发（真机路径）/ 鼠标派发（应答守卫）----
         event_state = await input_event_probe(page)
         print("\n== 输入事件层（触摸派发 / 鼠标派发）==")
-        print(json.dumps(event_state, ensure_ascii=False))
+        print(json.dumps({k: v for k, v in event_state.items() if k != "drag"},
+                         ensure_ascii=False))
+        print("\n== 触摸拖拽剖面（速度 / 压力 / 松手惯性）==")
+        print(json.dumps(event_state.get("drag") or {}, ensure_ascii=False))
 
         # ---- 跨域 iframe（OOPIF）+ Worker：与主文档同一套信号 ----
         # 本地服务器双栈监听：127.0.0.1（父页）与 localhost（子帧）分属不同
@@ -1827,6 +1991,10 @@ async def main() -> int:
     is_android = target_os == "android"
     ev_touch = [str(e) for e in (event_state.get("touch") or [])]
     ev_mouse = [str(e) for e in (event_state.get("mouse") or [])]
+    drag = event_state.get("drag") or {}
+    drag_ts = drag.get("tsDeltas") or []
+    drag_dy = drag.get("dy") or []
+    drag_force = drag.get("force") or []
 
     checks: dict[str, bool] = {
         "已按 start_url 导航": "example.com" in (state["url"] or ""),
@@ -1850,6 +2018,28 @@ async def main() -> int:
         "事件层：鼠标点击应答正常（未启用 emit-touch 转换）": (
             event_state.get("mouse_ok") is True
             and any(s.split(":", 1)[0] == "mousedown" for s in ev_mouse)),
+        # ---- 触摸拖拽剖面（P2-4）：速度曲线 / 压力曲线 / 原生 fling ----
+        # 位移剖面：手指上滑时 clientY 递减，dy 为负；按绝对值比较。
+        # 首帧位移必须明显小于匀速段（真机拖拽的起步加速段），且全程
+        # 不是同一个值（等距拖拽是自动化痕迹）。视口高会改变可拖拽距离，
+        # 所以阈值按「相对匀速段的比例」判定而不是绝对像素。
+        "拖拽：起步加速段存在（速度剖面）": (
+            len(drag_dy) >= 6
+            and abs(drag_dy[0]) >= 4
+            and abs(drag_dy[0]) <= 0.75 * max(abs(d) for d in drag_dy)
+            and len(set(drag_dy)) >= 4),
+        "拖拽：位移覆盖完整行程（首帧到末帧连续）": (
+            drag.get("startY") is not None and drag.get("endY") is not None
+            and abs((drag["endY"] - drag["startY"])) > 100),
+        # 内核从第二次拖拽起会把 touchmove 合并到每两帧一条（33ms），
+        # 首次是 60fps 一条（16.7ms）；两种都是真机采样档，只要不出现
+        # 同帧连发（<8ms）即可。
+        "拖拽：timeStamp 间隔落在真机采样档（8~40ms）": (
+            len(drag_ts) >= 3 and all(8 <= d <= 40 for d in drag_ts)),
+        "拖拽：force 随按压起伏（非恒定 1）": (
+            len(set(drag_force)) >= 5 and 0 < min(drag_force) < max(drag_force) <= 1),
+        "拖拽：松手后内核原生 fling（scrollY 继续增长）": (
+            drag.get("fling", 0) >= 20),
         "navigator 无 own-property 泄漏": len(state["ownProps"]) == 0,
         "colorDepth/pixelDepth == 24": state["colorDepth"] == 24 and state["pixelDepth"] == 24,
         "navigator.vendor 一致": state["vendor"] == nav.get("vendor"),
@@ -1949,6 +2139,7 @@ async def main() -> int:
     plat = eng.get("plat") or {}
     jsc = eng.get("jsc") or {}
     med = eng.get("media") or {}
+    ntf = eng.get("notif") or {}
     aig_mag = _sensor_magnitude(last_motion.get("aig"))
     lin_mag = _sensor_magnitude(last_motion.get("acc"))
     gyro_mag = _sensor_magnitude(last_motion.get("rr"))
@@ -2506,6 +2697,49 @@ async def main() -> int:
                 and all(v == "undefined"
                         for v in (fr_worker.get("mediaW") or {}).values())
                 and bool(wk_main.get("mediaW")) and bool(fr_worker.get("mediaW"))),
+            # ---- Notification 面（WebKit Notification.idl 口径）----
+            "Notification：静态 permission 为数据属性（readonly attribute 形态）": (
+                ntf.get("permissionDesc") == ["data", False, True, True]
+                and ntf.get("permission") in ("default", "denied")),
+            "Notification：静态 maxActions 不存在（WebKit 未实现该项）": (
+                ntf.get("maxActionsIn") is False),
+            "Notification：原型成员集与 WebKit 逐项一致（含 ondisplay/navigate/show）": (
+                ntf.get("protoOwn") == ["constructor", "onclick", "onerror",
+                                        "navigate", "title", "dir", "lang",
+                                        "body", "tag", "icon", "silent", "data",
+                                        "onclose", "ondisplay", "onshow",
+                                        "close", "show"]),
+            "Notification：原型链继承 EventTarget.prototype（事件系统可用）": (
+                (ntf.get("chain") or [])[:2] == ["Notification", "EventTarget.prototype"]
+                and (ntf.get("inst") or {}).get("isET") is True
+                and (ntf.get("inst") or {}).get("isN") is True
+                # 真 EventTarget 才能通过 addEventListener/dispatchEvent 的内部槽校验
+                and (ntf.get("inst") or {}).get("hits") == 1),
+            "Notification：构造语义与选项缺省值（silent 缺省 null、navigate 空串）": (
+                (ntf.get("defaults") or {}).get("silent") is None
+                and (ntf.get("defaults") or {}).get("dir") == "auto"
+                and (ntf.get("defaults") or {}).get("icon") == ""
+                and (ntf.get("defaults") or {}).get("navigate") == ""
+                and ntf.get("silentFalse") is False
+                and (ntf.get("inst") or {}).get("silent") is True
+                and (ntf.get("inst") or {}).get("dir") == "rtl"
+                and (ntf.get("inst") or {}).get("data") == {"a": 1}),
+            "Notification：实例无自有属性、show/close 返回 undefined、无 new 抛 TypeError": (
+                (ntf.get("inst") or {}).get("own") == []
+                and (ntf.get("inst") or {}).get("show") == "undefined"
+                and (ntf.get("inst") or {}).get("close") == "undefined"
+                and ntf.get("noNew") == "throw:TypeError"),
+            "Notification：坏 receiver 抛 TypeError（含 navigate/ondisplay/show）": (
+                ntf.get("badRecv") == "throw:TypeError"
+                and ntf.get("badRecvNav") == "throw:TypeError"
+                and ntf.get("showBadRecv") == "throw:TypeError"
+                and ntf.get("handlerLoop") == [True, None]),
+            "Notification：构造器保持原生外观（length 1 / prototype 不可写）": (
+                ntf.get("len") == 1
+                and ntf.get("native") is True
+                and ntf.get("protoDesc") == [False, False, False]
+                and ntf.get("tag") == "[object Notification]"
+                and ntf.get("reqPermDesc") == ["function", True, True, True, 0]),
             # ---- 色域：Display P3（iPhone 7 及以后全系硬件判据）----
             "色域：(color-gamut: p3) 为真且 srgb 亦为真（iPhone 屏口径）": (
                 (state.get("mediaQueries") or {}).get("p3") is True
