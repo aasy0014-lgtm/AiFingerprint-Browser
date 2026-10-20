@@ -902,6 +902,116 @@ STATE_JS = """async () => {
                 out.native = nativeStr(N);
                 return out;
             })(),
+            // ---- WebKit 原生触控工厂：document.createTouch / createTouchList ----
+            // 检测站按「声明 iOS 但无 createTouch」直接判「现代 Blink 内核」。
+            // 真机形态（Playwright WebKit 27.2 实测，见 injector 第 12 块注释）：
+            // 扩展四参全部生效、Touch 表面只有 webkit* 前缀成员、构造器不可构造。
+            touchFactory: (() => {
+                const D = Document.prototype;
+                const out = {
+                    ct: typeof document.createTouch,
+                    ctl: typeof document.createTouchList,
+                };
+                // 原型面与工厂是否存在于无关：Android 上用来断言「没有被 iOS
+                // 补丁改成 WebKit 口径」。
+                out.touchProto = typeof Touch === 'function'
+                    ? Object.getOwnPropertyNames(Touch.prototype) : null;
+                out.touchListProto = typeof TouchList === 'function'
+                    ? Object.getOwnPropertyNames(TouchList.prototype) : null;
+                out.touchEventProto = typeof TouchEvent === 'function'
+                    ? Object.getOwnPropertyNames(TouchEvent.prototype) : null;
+                if (out.ct !== 'function' || out.ctl !== 'function') {
+                    return out;
+                }
+                const dd = (o, n) => {
+                    const x = descOf(o, n);
+                    return x ? [x.get ? 'accessor' : 'data', x.writable,
+                                x.enumerable, x.configurable] : null;
+                };
+                out.ctDesc = dd(D, 'createTouch');
+                out.ctlDesc = dd(D, 'createTouchList');
+                out.ctLen = document.createTouch.length;
+                out.ctlLen = document.createTouchList.length;
+                out.ctName = document.createTouch.name;
+                out.native = nativeStr(document.createTouch);
+                out.own = Object.getOwnPropertyNames(document.createTouch);
+                // 构造函数：真机两者都不可构造（Illegal constructor）
+                out.newTouch = (() => { try { new Touch({}); return 'ok'; }
+                    catch (e) { return 'throw:' + e.name; } })();
+                out.newTouchList = (() => { try { new TouchList(); return 'ok'; }
+                    catch (e) { return 'throw:' + e.name; } })();
+                out.touchLen = Touch.length;
+                out.touchDesc = (() => {
+                    const x = descOf(window, 'Touch');
+                    return x ? [x.writable, x.enumerable, x.configurable] : null;
+                })();
+                // 全参调用：九项逐个回读
+                out.full = (() => {
+                    try {
+                        const t = document.createTouch(
+                            window, document.body, 7, 100, 200, 300, 400, 5, 6, 45, 0.75);
+                        return {
+                            identifier: t.identifier,
+                            target: t.target === document.body,
+                            pageX: t.pageX, pageY: t.pageY,
+                            clientX: t.clientX, clientY: t.clientY,
+                            screenX: t.screenX, screenY: t.screenY,
+                            wkRX: t.webkitRadiusX, wkRY: t.webkitRadiusY,
+                            wkRot: t.webkitRotationAngle, wkForce: t.webkitForce,
+                            // 真机没有无前缀成员：`in` 为 false、读取为 undefined
+                            hasForce: 'force' in t, hasRadiusX: 'radiusX' in t,
+                            force: String(t.force), radiusX: String(t.radiusX),
+                            rotationAngle: String(t.rotationAngle),
+                            own: Object.getOwnPropertyNames(t),
+                            tag: Object.prototype.toString.call(t),
+                            instOf: t instanceof Touch,
+                            protoOk: Object.getPrototypeOf(t) === Touch.prototype,
+                        };
+                    } catch (e) { return 'throw:' + e.name; }
+                })();
+                // 无参：target 为 null、数值项为 0
+                out.minimal = (() => {
+                    try {
+                        const t = document.createTouch(window);
+                        return {target: String(t.target), identifier: t.identifier,
+                                pageX: t.pageX, pageY: t.pageY,
+                                wkForce: t.webkitForce, own: Object.getOwnPropertyNames(t)};
+                    } catch (e) { return 'throw:' + e.name; }
+                })();
+                // 字符串参数按 WebKit 语义强制转换
+                out.coerce = (() => {
+                    try {
+                        const t = document.createTouch(
+                            window, document.body, '7', '100', '200', 0, 0, '5', '6', 0, 0.5);
+                        return [t.identifier, t.pageX, t.webkitRadiusX,
+                                t.webkitRotationAngle, t.webkitForce];
+                    } catch (e) { return 'throw:' + e.name; }
+                })();
+                // TouchList：索引与 item() 同源、越界为 null、空列表长度 0
+                out.list = (() => {
+                    try {
+                        const t = document.createTouch(window, document.body, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+                        const t2 = document.createTouch(window, document.body, 2, 0, 0, 0, 0, 0, 0, 0, 0);
+                        const tl = document.createTouchList(t, t2);
+                        const tl0 = document.createTouchList();
+                        return {
+                            len: tl.length, isTL: tl instanceof TouchList,
+                            same0: tl[0] === t, same1: tl[1] === t2,
+                            item0: tl.item(0) === t,
+                            itemNeg: String(tl.item(-1)), itemOOR: String(tl.item(5)),
+                            own: Object.getOwnPropertyNames(tl),
+                            protoOk: Object.getPrototypeOf(tl) === TouchList.prototype,
+                            len0: tl0.length, isTL0: tl0 instanceof TouchList,
+                        };
+                    } catch (e) { return 'throw:' + e.name; }
+                })();
+                // 坏 receiver：两个工厂方法都走原生 receiver 校验
+                out.badRecv = (() => { try { D.createTouch.call({}, window); return 'ok'; }
+                    catch (e) { return 'throw:' + e.name; } })();
+                out.badRecvList = (() => { try { D.createTouchList.call({}); return 'ok'; }
+                    catch (e) { return 'throw:' + e.name; } })();
+                return out;
+            })(),
         },
         ownProps: Object.getOwnPropertyNames(nav).filter((n) =>
             ['platform','userAgent','maxTouchPoints','mobile','deviceMemory',
@@ -1360,7 +1470,11 @@ DRAG_CAPTURE_JS = r"""() => {
   }, true);
   document.addEventListener('touchmove', (e) => {
     const t = e.touches[0];
-    window.__drag.push({ts: e.timeStamp, y: t.clientY, f: t.force, r: t.radiusX});
+    // 压力/接触面积的成员名随平台口径不同：Chromium 是 force/radiusX，
+    // WebKit（iOS 目标）只有 webkitForce/webkitRadiusX。
+    window.__drag.push({ts: e.timeStamp, y: t.clientY,
+                        f: t.force !== undefined ? t.force : t.webkitForce,
+                        r: t.radiusX !== undefined ? t.radiusX : t.webkitRadiusX});
   }, true);
   return {h: innerHeight, sh: document.documentElement.scrollHeight};
 }"""
@@ -1394,8 +1508,10 @@ async def _drag_profile_probe(page) -> dict:
                            for i in range(len(ev) - 1)]
         out["dy"] = [round(ev[i + 1]["y"] - ev[i]["y"], 1)
                      for i in range(len(ev) - 1)]
-        out["force"] = [round(float(e["f"]), 3) for e in ev]
-        out["radius"] = [round(float(e["r"]), 2) for e in ev]
+        out["force"] = [round(float(e["f"]), 3) if e["f"] is not None else None
+                        for e in ev]
+        out["radius"] = [round(float(e["r"]), 2) if e["r"] is not None else None
+                         for e in ev]
     await page.evaluate("() => { const el = document.getElementById('__drag_spacer');"
                         " if (el) el.remove(); window.scrollTo(0, 0); }")
     return out
@@ -2140,6 +2256,7 @@ async def main() -> int:
     jsc = eng.get("jsc") or {}
     med = eng.get("media") or {}
     ntf = eng.get("notif") or {}
+    tf = eng.get("touchFactory") or {}
     aig_mag = _sensor_magnitude(last_motion.get("aig"))
     lin_mag = _sensor_magnitude(last_motion.get("acc"))
     gyro_mag = _sensor_magnitude(last_motion.get("rr"))
@@ -2152,6 +2269,7 @@ async def main() -> int:
                             for i in range(3))
 
     if is_android:
+        eng_tf = eng.get("touchFactory") or {}
         ua_data = state.get("uaData") if isinstance(state.get("uaData"), dict) else None
         high = state.get("uaDataHigh") if isinstance(state.get("uaDataHigh"), dict) else None
         battery = state.get("battery") if isinstance(state.get("battery"), dict) else None
@@ -2413,6 +2531,13 @@ async def main() -> int:
                 and med.get("sessionProto") is None and med.get("errCodes") is None
                 and all(v == "undefined"
                         for v in (wk_main.get("mediaW") or {}).values())),
+            # document.createTouch 是 WebKit 专有工厂，Android Chrome 全无——
+            # 且不得因为 iOS 目标的补丁把 Touch 表面改成 WebKit 口径。
+            "触控工厂：Android 无 createTouch / createTouchList（未误伤）": (
+                eng_tf.get("ct") == "undefined"
+                and eng_tf.get("ctl") == "undefined"
+                and "force" in (eng_tf.get("touchProto") or [])
+                and "webkitForce" not in (eng_tf.get("touchProto") or [])),
         })
     else:
         is_ios_chrome = extra.get("browser") == "chrome_ios"
@@ -2740,6 +2865,83 @@ async def main() -> int:
                 and ntf.get("protoDesc") == [False, False, False]
                 and ntf.get("tag") == "[object Notification]"
                 and ntf.get("reqPermDesc") == ["function", True, True, True, 0]),
+            # ---- WebKit 原生触控工厂（document.createTouch / createTouchList）----
+            # 取证：Playwright WebKit 27.2 实测 + WebKit main Source/WebCore/
+            # dom/Document.idl（createTouch / createTouchList）与 Touch.idl。
+            "触控工厂：createTouch / createTouchList 存在且为 Document.prototype 数据属性": (
+                tf.get("ct") == "function" and tf.get("ctl") == "function"
+                and tf.get("ctDesc") == ["data", True, True, True]
+                and tf.get("ctlDesc") == ["data", True, True, True]
+                and tf.get("ctLen") == 0 and tf.get("ctlLen") == 0
+                and tf.get("ctName") == "createTouch"
+                and tf.get("native") is True),
+            "触控工厂：Touch / TouchList 均不可构造（Illegal constructor）": (
+                tf.get("newTouch") == "throw:TypeError"
+                and tf.get("newTouchList") == "throw:TypeError"),
+            # 真机 Touch 原型只有 webkit* 前缀成员；无前缀 radiusX/force/
+            # rotationAngle 整个不存在（不是 null）——这是「Chromium 内核装 iOS」
+            # 的独立判据，与有没有 createTouch 无关。
+            "触控工厂：Touch 原型为 WebKit 口径（webkit* 前缀、无无前缀成员）": (
+                tf.get("touchProto") == [
+                    "constructor", "clientX", "clientY", "screenX", "screenY",
+                    "pageX", "pageY", "target", "identifier",
+                    "webkitRadiusX", "webkitRadiusY", "webkitRotationAngle",
+                    "webkitForce"]
+                and tf.get("touchListProto") == ["constructor", "length", "item"]
+                and tf.get("touchEventProto") == [
+                    "constructor", "touches", "targetTouches", "changedTouches",
+                    "ctrlKey", "shiftKey", "altKey", "metaKey"]
+                # Touch.length 在 V8 上是 [writable:false, configurable:false]，
+                # 改不动（WebKit 为 0）——该项为已知残余，见方案 §2.14
+                and tf.get("touchDesc") == [True, False, True]),
+            "触控工厂：createTouch 全参回读（九项取值 + 无前缀成员缺席）": (
+                (tf.get("full") or {}).get("identifier") == 7
+                and (tf.get("full") or {}).get("target") is True
+                and (tf.get("full") or {}).get("pageX") == 100
+                and (tf.get("full") or {}).get("pageY") == 200
+                # clientX/clientY 镜像 pageX/pageY
+                and (tf.get("full") or {}).get("clientX") == 100
+                and (tf.get("full") or {}).get("clientY") == 200
+                and (tf.get("full") or {}).get("screenX") == 300
+                and (tf.get("full") or {}).get("screenY") == 400
+                # 扩展四参全部生效（不是 null/0）
+                and (tf.get("full") or {}).get("wkRX") == 5
+                and (tf.get("full") or {}).get("wkRY") == 6
+                and (tf.get("full") or {}).get("wkRot") == 45
+                and (tf.get("full") or {}).get("wkForce") == 0.75
+                and (tf.get("full") or {}).get("hasForce") is False
+                and (tf.get("full") or {}).get("hasRadiusX") is False
+                and (tf.get("full") or {}).get("force") == "undefined"
+                and (tf.get("full") or {}).get("radiusX") == "undefined"
+                and (tf.get("full") or {}).get("rotationAngle") == "undefined"),
+            "触控工厂：返回真 Touch 实例（无 own 属性、instanceof、[object Touch]）": (
+                (tf.get("full") or {}).get("own") == []
+                and (tf.get("full") or {}).get("instOf") is True
+                and (tf.get("full") or {}).get("protoOk") is True
+                and (tf.get("full") or {}).get("tag") == "[object Touch]"),
+            "触控工厂：无参调用 target 为 null、数值项为 0": (
+                (tf.get("minimal") or {}).get("target") == "null"
+                and (tf.get("minimal") or {}).get("identifier") == 0
+                and (tf.get("minimal") or {}).get("pageX") == 0
+                and (tf.get("minimal") or {}).get("pageY") == 0
+                and (tf.get("minimal") or {}).get("wkForce") == 0),
+            "触控工厂：字符串参数按 WebKit 语义强制转换": (
+                tf.get("coerce") == [7, 100, 5, 0, 0.5]),
+            "触控工厂：createTouchList 返回真 TouchList（索引与 item() 同源、越界为 null）": (
+                (tf.get("list") or {}).get("len") == 2
+                and (tf.get("list") or {}).get("isTL") is True
+                and (tf.get("list") or {}).get("same0") is True
+                and (tf.get("list") or {}).get("same1") is True
+                and (tf.get("list") or {}).get("item0") is True
+                and (tf.get("list") or {}).get("itemNeg") == "null"
+                and (tf.get("list") or {}).get("itemOOR") == "null"
+                and (tf.get("list") or {}).get("own") == ["0", "1"]
+                and (tf.get("list") or {}).get("protoOk") is True
+                and (tf.get("list") or {}).get("len0") == 0
+                and (tf.get("list") or {}).get("isTL0") is True),
+            "触控工厂：坏 receiver 抛 TypeError（两个工厂方法）": (
+                tf.get("badRecv") == "throw:TypeError"
+                and tf.get("badRecvList") == "throw:TypeError"),
             # ---- 色域：Display P3（iPhone 7 及以后全系硬件判据）----
             "色域：(color-gamut: p3) 为真且 srgb 亦为真（iPhone 屏口径）": (
                 (state.get("mediaQueries") or {}).get("p3") is True

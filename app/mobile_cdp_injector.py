@@ -1229,54 +1229,208 @@ _PATCH_TEMPLATE = r"""
             //     MDN BCD：safari_ios=≤3（至今保留）、chrome 25–68（已移除）、
             //     safari=false；检测站按「声明 iOS 但无 createTouch」直接判
             //     「现代 Blink 内核」（本仓库对照检测器该单项 25 分）。
-            //     真机形态取证（Playwright WebKit 27.2）：
+            //     真机形态取证（Playwright WebKit 27.2，/tmp/probe_wk_createtouch.py）：
             //       * createTouch / createTouchList 挂在 Document.prototype，
             //         writable+enumerable+configurable，length 0、原生外观；
             //       * 参数顺序 (window, target, identifier, pageX, pageY,
             //         screenX, screenY, radiusX, radiusY, rotationAngle, force)，
-            //         后四项目前恒为 null（不是 0）——WebKit 未实现该批扩展；
-            //       * 未传 target 时 target 为 null；返回真 Touch/TouchList 实例
-            //         （instanceof 成立、[object Touch]、索引与 item() 同源）。
-            //     实现：Touch 由内核原生构造器生成（真 Touch，语义天然一致），
-            //     TouchList 用 TouchEvent 的 touches 列表取得——内核不开放
-            //     TouchList 构造器（Illegal constructor），这是唯一能拿到真
-            //     TouchList 的路径；随后按 WebKit 口径把扩展项置 null。
+            //         **后四项全部生效**，写入 Touch 的 webkitRadiusX /
+            //         webkitRadiusY / webkitRotationAngle / webkitForce
+            //         （force 为 float32，-1 原样保留，不夹到 [0,1]）；
+            //       * clientX/clientY 镜像 pageX/pageY；未传 target 时 target 为
+            //         null、identifier/pageX/pageY 为 0；
+            //       * Touch 表面是 WebKit 口径：原型成员仅
+            //         clientX/clientY/screenX/screenY/pageX/pageY/target/
+            //         identifier/webkitRadiusX/webkitRadiusY/
+            //         webkitRotationAngle/webkitForce——**没有**无前缀的
+            //         radiusX/radiusY/rotationAngle/force；`new Touch({})` 与
+            //         `new TouchList()` 均抛 TypeError「Illegal constructor」；
+            //       * 返回真 Touch / TouchList（instanceof、[object Touch]、
+            //         索引与 item() 同源、越界 item() 为 null、实例无 own 属性）。
+            //     实现：TouchList 取内核 TouchEvent 的 touches 列表（内核不开放
+            //     TouchList 构造器，这是唯一能拿到真 TouchList 的路径）。Touch
+            //     不能再用 `new Touch({...})`：内核构造器不接受 target=null，且
+            //     造出来的实例带 Chromium 的 radiusX/force。改为「真触摸事件取
+            //     一个实例作模板」——同文档派发一次 touchstart，拿到内核生成的
+            //     真 Touch（内部槽齐备），把六个可设字段记进 WeakMap 后释放；
+            //     实例的 webkit* 访问器从 WeakMap 取值，无前缀四项从原型上删除。
             try {
-                if (typeof Touch === 'function' && typeof TouchList === 'function'
-                        && typeof document.createTouch !== 'function') {
+                var __touchOK = typeof Touch === 'function'
+                    && typeof TouchList === 'function'
+                    && typeof TouchEvent === 'function'
+                    && typeof document.createTouch !== 'function';
+                if (__touchOK) {
+                    var __touchMeta = typeof WeakMap === 'function' ? new WeakMap() : null;
+                    var __touchTpl = null;
+                    var __touchFields = ['identifier', 'pageX', 'pageY', 'screenX',
+                                         'screenY', 'webkitRadiusX', 'webkitRadiusY',
+                                         'webkitRotationAngle', 'webkitForce'];
+                    try {
+                        var __tplTarget = document.documentElement || document;
+                        var __tplSeen = null;
+                        var __tplCb = function (e) {
+                            try {
+                                if (e.touches && e.touches.length) {
+                                    __tplSeen = e.touches[0];
+                                }
+                            } catch (e2) {}
+                        };
+                        document.addEventListener('touchstart', __tplCb, true);
+                        try {
+                            var __tplEv = new TouchEvent('touchstart', {
+                                touches: [new Touch({
+                                    identifier: 0, target: __tplTarget,
+                                    pageX: 0, pageY: 0,
+                                    screenX: 0, screenY: 0,
+                                })],
+                            });
+                            document.dispatchEvent(__tplEv);
+                        } catch (e2) {}
+                        document.removeEventListener('touchstart', __tplCb, true);
+                        if (__tplSeen && __tplSeen instanceof Touch) {
+                            __touchTpl = __tplSeen;
+                        }
+                    } catch (e2) {}
+
+                    // 无前缀四项：真机原型上没有，删掉内核的（configurable:true，实测可删）。
+                    // 删之前先把原生 getter 留一份：页面上真实派发的触摸（CDP 注入的
+                    // touchmove）在内核里带 force/radiusX/radiusY/rotationAngle，
+                    // WebKit 口径下这四个值要搬到 webkit* 前缀成员上，否则拖动时的
+                    // 压力/接触面积会整块丢失（实测拖拽探针 force 变 undefined）。
+                    var __chromiumTouchGets = {};
+                    try {
+                        var __drop = ['radiusX', 'radiusY', 'rotationAngle', 'force'];
+                        for (var __di = 0; __di < __drop.length; __di++) {
+                            var __dd = Object.getOwnPropertyDescriptor(
+                                Touch.prototype, __drop[__di]);
+                            if (__dd && __dd.get) {
+                                __chromiumTouchGets[__drop[__di]] = __dd.get;
+                            }
+                            delete Touch.prototype[__drop[__di]];
+                        }
+                    } catch (e2) {}
+                    // webkit* 成员与内核无前缀成员的对应关系（Touch.idl 的
+                    // webkitRadiusX ↔ 内核 radiusX，webkitForce ↔ force）
+                    var __wkFallback = {
+                        webkitRadiusX: 'radiusX', webkitRadiusY: 'radiusY',
+                        webkitRotationAngle: 'rotationAngle', webkitForce: 'force',
+                    };
+
+                    // 实例成员：真机从内部槽取值，这里用 WeakMap 存 createTouch
+                    // 写入的九个字段；非 createTouch 造出来的 Touch（页面上真实
+                    // 派发的触摸）没有 meta，回落原生 getter，语义不变。
+                    var __touchField = function (name, nativeGet) {
+                        try {
+                            var getter = __maskNative(function () {
+                                var m = __touchMeta ? __touchMeta.get(this) : null;
+                                if (m && name in m) { return m[name]; }
+                                return nativeGet.call(this);
+                            }, 'get ' + name);
+                            Object.defineProperty(Touch.prototype, name, {
+                                get: getter, enumerable: true, configurable: true,
+                            });
+                        } catch (e2) {}
+                    };
+                    var __touchFieldsMap = {
+                        identifier: 'identifier', clientX: 'clientX',
+                        clientY: 'clientY', screenX: 'screenX', screenY: 'screenY',
+                        pageX: 'pageX', pageY: 'pageY', target: 'target',
+                        webkitRadiusX: 'webkitRadiusX', webkitRadiusY: 'webkitRadiusY',
+                        webkitRotationAngle: 'webkitRotationAngle',
+                        webkitForce: 'webkitForce',
+                    };
+                    try {
+                        for (var __fn in __touchFieldsMap) {
+                            var __fd = Object.getOwnPropertyDescriptor(
+                                Touch.prototype, __fn);
+                            var __fallback = __chromiumTouchGets[__wkFallback[__fn]];
+                            if (__fd && __fd.get) {
+                                __touchField(__fn, __fd.get);
+                            } else if (__fallback) {
+                                __touchField(__fn, __fallback);
+                            } else {
+                                __touchField(__fn, function () { return 0; });
+                            }
+                        }
+                    } catch (e2) {}
+
+                    // 原型成员顺序：真机按 IDL 声明序，内核是 Chromium 的
+                    // 声明序（TouchList 的 constructor 在末尾、TouchEvent 的
+                    // 修饰键在前）。三个原型的成员描述符都是 configurable，
+                    // 按 IDL 序整体重挂即可对齐。
+                    var __reorderProto = function (proto, order) {
+                        try {
+                            var cur = Object.getOwnPropertyNames(proto);
+                            var same = cur.length === order.length
+                                && order.every(function (n, i) { return cur[i] === n; });
+                            if (same) { return; }
+                            var saved = {};
+                            for (var i = 0; i < cur.length; i++) {
+                                saved[cur[i]] = Object.getOwnPropertyDescriptor(proto, cur[i]);
+                                delete proto[cur[i]];
+                            }
+                            for (var j = 0; j < order.length; j++) {
+                                if (saved[order[j]]) {
+                                    Object.defineProperty(proto, order[j], saved[order[j]]);
+                                }
+                            }
+                        } catch (e2) {}
+                    };
+                    __reorderProto(Touch.prototype, [
+                        'constructor', 'clientX', 'clientY', 'screenX', 'screenY',
+                        'pageX', 'pageY', 'target', 'identifier',
+                        'webkitRadiusX', 'webkitRadiusY', 'webkitRotationAngle',
+                        'webkitForce']);
+                    __reorderProto(TouchList.prototype,
+                                   ['constructor', 'length', 'item']);
+                    __reorderProto(TouchEvent.prototype, [
+                        'constructor', 'touches', 'targetTouches', 'changedTouches',
+                        'ctrlKey', 'shiftKey', 'altKey', 'metaKey']);
+
+                    // 模板缺失时退路：用空对象占位，字段全 0（形状仍正确）
                     var __mkTouch = function (win, target, id, px, py, sx, sy,
                                               rx, ry, rot, force) {
-                        var tgt = (target === undefined || target === null)
-                            ? null : target;
-                        var t = new Touch({
-                            identifier: (id === undefined || id === null) ? 0 : Number(id) | 0,
-                            target: tgt || document,
-                            pageX: Number(px) || 0,
-                            pageY: Number(py) || 0,
-                            screenX: Number(sx) || 0,
-                            screenY: Number(sy) || 0,
-                            clientX: Number(px) || 0,
-                            clientY: Number(py) || 0,
-                            radiusX: 0, radiusY: 0, rotationAngle: 0, force: 0,
-                        });
-                        // 真机 target 可为 null；扩展四项 WebKit 恒为 null
+                        var t = __touchTpl;
+                        if (!t) {
+                            try {
+                                var ev0 = new TouchEvent('touchstart', {
+                                    touches: [new Touch({
+                                        identifier: 0, target: document,
+                                        pageX: 0, pageY: 0,
+                                        screenX: 0, screenY: 0,
+                                    })],
+                                });
+                                t = ev0.touches && ev0.touches[0];
+                            } catch (e2) {}
+                        }
+                        if (!t) { return null; }
+                        var num = function (v) { var n = Number(v); return n === n ? n : 0; };
+                        var meta = {
+                            identifier: (id === undefined || id === null) ? 0 : num(id),
+                            pageX: num(px), pageY: num(py),
+                            screenX: num(sx), screenY: num(sy),
+                            // WebKit 的 webkitForce 是 float32，负值原样保留
+                            webkitRadiusX: (rx === undefined || rx === null) ? 0 : num(rx),
+                            webkitRadiusY: (ry === undefined || ry === null) ? 0 : num(ry),
+                            webkitRotationAngle: (rot === undefined || rot === null) ? 0 : num(rot),
+                            webkitForce: (force === undefined || force === null) ? 0 : num(force),
+                        };
+                        // pageX/pageY 同时镜像到 clientX/clientY（真机语义）
+                        meta.clientX = meta.pageX;
+                        meta.clientY = meta.pageY;
+                        if (__touchMeta) { __touchMeta.set(t, meta); }
+                        // target 为 null 时按真机语义返回 null；否则用模板的
+                        // target（createTouch 的第一个参数是 window，第二个才是
+                        // target，且内核 Touch 的 target 槽不可在事后改）
                         try {
-                            if (tgt === null) {
+                            if (target === undefined || target === null) {
                                 Object.defineProperty(t, 'target', {
                                     get: __maskNative(function () { return null; }, 'get target'),
                                     enumerable: true, configurable: true,
                                 });
+                            } else {
+                                meta.target = target;
                             }
-                            var __nullGet = function (name) {
-                                Object.defineProperty(t, name, {
-                                    get: __maskNative(function () { return null; }, 'get ' + name),
-                                    enumerable: true, configurable: true,
-                                });
-                            };
-                            __nullGet('radiusX');
-                            __nullGet('radiusY');
-                            __nullGet('rotationAngle');
-                            __nullGet('force');
                         } catch (e2) {}
                         return t;
                     };
