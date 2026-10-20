@@ -399,6 +399,34 @@ def test_engines_compat() -> None:
           spec_ios["connectionType"] is None)
 
 
+def test_api_model() -> None:
+    """P1-7：移动端内核配对在模型层就拦住（MCP / 脚本绕过 HTTP 也生效）。"""
+    import pydantic
+
+    from app.models import ProfileCreate
+
+    def err(**kw) -> str:
+        try:
+            ProfileCreate(name="t", **kw)
+            return ""
+        except pydantic.ValidationError as e:
+            return e.errors()[0]["msg"]
+
+    section("10. API 模型：移动端配对校验（P1-7）")
+    check("Android + camoufox 在构造期被拒",
+          "仅支持 fp-chromium" in err(target_os="android", kernel="camoufox"))
+    check("iOS + chromium 在构造期被拒",
+          "仅支持 fp-chromium" in err(target_os="ios", kernel="chromium"))
+    check("Android + safari 在构造期被拒",
+          "仅支持 chrome" in err(target_os="android", kernel="fp-chromium",
+                               browser="safari"))
+    check("合法移动端组合通过（Android chrome / iOS chrome_ios）",
+          not err(target_os="android", kernel="fp-chromium", browser="chrome")
+          and not err(target_os="ios", kernel="fp-chromium", browser="chrome_ios"))
+    check("桌面端不受影响（camoufox + windows）",
+          not err(kernel="camoufox", target_os="windows"))
+
+
 def main() -> None:
     print("移动端真实机型指纹库 —— 数据层测试")
     devices = test_library()
@@ -407,6 +435,7 @@ def main() -> None:
     test_preset_determinism()
     test_generate_randomness(devices)
     test_engines_compat()
+    test_api_model()
 
     section(f"结果：{_PASS} 通过 / {_FAIL} 失败")
     if _FAIL:

@@ -222,7 +222,9 @@ STATE_JS = """async () => {
             var a = document.createElement('audio');
             var v = document.createElement('video');
             var probe = function (t) {
-                try { return (/^audio\//i.test(t) ? a : v).canPlayType(t); }
+                // 用 indexOf 代替正则：本字符串非 raw，反斜杠转义会触发
+                // SyntaxWarning（JS 侧语义相同）
+                try { return (t.indexOf('audio/') === 0 ? a : v).canPlayType(t); }
                 catch (e) { return 'ERR'; }
             };
             return {
