@@ -1448,9 +1448,27 @@ async def input_event_probe(page) -> dict:
         out["mouse_error"] = type(exc).__name__
     await asyncio.sleep(0.25)
     out["mouse"] = await page.evaluate("() => (window.__ev || []).splice(0)")
+    # 滚轮：触屏没有 wheel，输入代理把滚量换算成一次单指拖拽。
+    # 需要可滚动页面（拖拽探针收尾时已移除自己的撑高块，这里自建）。
+    try:
+        await page.evaluate(
+            "() => { const d = document.createElement('div');"
+            " d.id = '__wheel_spacer'; d.style.cssText = 'height:4000px;width:1px';"
+            " document.body.appendChild(d); window.scrollTo(0, 0); }")
+        await asyncio.sleep(0.05)
+        before = await page.evaluate("() => window.scrollY")
+        await asyncio.wait_for(page.mouse.wheel(0, 400), 8)
+        await asyncio.sleep(0.4)
+        after = await page.evaluate("() => window.scrollY")
+        out["wheel_delta"] = after - before
+        out["wheel"] = await page.evaluate("() => (window.__ev || []).splice(0)")
+    except Exception as exc:  # noqa: BLE001
+        out["wheel_error"] = f"{type(exc).__name__}: {exc}"[:160]
     await page.evaluate(
         "() => { const el = document.getElementById('__mobile_input_probe');"
-        " if (el) el.remove(); }")
+        " if (el) el.remove();"
+        " const sp = document.getElementById('__wheel_spacer'); if (sp) sp.remove();"
+        " window.scrollTo(0, 0); }")
     return out
 
 
@@ -1534,7 +1552,9 @@ SENSOR_PROBE_JS = r"""async () => {
     counts: { motion: 0, motionNumeric: 0, orientation: 0, orientationNumeric: 0,
               orientationAbsolute: 0, orientationAbsoluteNumeric: 0 },
     lastMotion: null, lastOrientation: null, lastOrientationAbsolute: null,
+    orientationGaps: null,
   };
+  const oTimes = [];
   const num = (v) => typeof v === 'number' && isFinite(v);
   window.addEventListener('devicemotion', (e) => {
     S.counts.motion++;
@@ -1549,6 +1569,7 @@ SENSOR_PROBE_JS = r"""async () => {
                            abs: e.absolute });
   window.addEventListener('deviceorientation', (e) => {
     S.counts.orientation++;
+    oTimes.push(e.timeStamp);
     if (num(e.alpha) || num(e.beta) || num(e.gamma)) S.counts.orientationNumeric++;
     S.lastOrientation = orient(e);
   }, true);
@@ -1558,6 +1579,16 @@ SENSOR_PROBE_JS = r"""async () => {
     S.lastOrientationAbsolute = orient(e);
   }, true);
   await new Promise((r) => setTimeout(r, 1500));
+  // 派发节奏：相邻事件的 timeStamp 间隔（真机传感器采样抖动的直接读数）
+  const gaps = [];
+  for (let i = 1; i < oTimes.length; i++) gaps.push(+(oTimes[i] - oTimes[i - 1]).toFixed(1));
+  if (gaps.length) {
+    const sorted = [...gaps].sort((a, b) => a - b);
+    const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+    S.orientationGaps = { n: gaps.length, min: sorted[0], median: at(0.5),
+                          p90: at(0.9), max: sorted[sorted.length - 1],
+                          distinct: new Set(gaps).size };
+  }
   return S;
 }"""
 
@@ -1598,6 +1629,42 @@ async def sensor_probe(page) -> dict:
     out: dict = await page.evaluate(SENSOR_PROBE_JS)
     if (out.get("requestPermission") or {}).get("motion") == "function":
         out.update(await _request_permission_probe(page))
+    return out
+
+
+# 安全区读数：自定义属性接住 env()，未定义的变量读到空串、0 读 "0px"
+SAFE_AREA_JS = """() => {
+  const el = document.createElement('div');
+  el.style.setProperty('--t', 'env(safe-area-inset-top)');
+  el.style.setProperty('--b', 'env(safe-area-inset-bottom)');
+  el.style.setProperty('--tm', 'env(safe-area-max-inset-top)');
+  document.documentElement.appendChild(el);
+  const cs = getComputedStyle(el);
+  const out = {top: cs.getPropertyValue('--t').trim(),
+               bottom: cs.getPropertyValue('--b').trim(),
+               topMax: cs.getPropertyValue('--tm').trim(),
+               viewportFitCover: !!document.querySelector('meta[name="viewport" i]')
+                 && /viewport-fit=cover/i.test(
+                      document.querySelector('meta[name="viewport" i]').content || '')};
+  el.remove();
+  return out;
+}"""
+
+
+async def safe_area_probe(page, port: int) -> dict:
+    """安全区：cover 页面按机型取真机口径，普通页面为 0，跨导航不残留。"""
+    out: dict = {}
+    for name, path in (("cover", "/safe-area-cover"),
+                       ("plain", "/safe-area-plain"),
+                       ("coverAgain", "/safe-area-cover")):
+        try:
+            await page.goto(f"http://127.0.0.1:{port}{path}",
+                            wait_until="domcontentloaded", timeout=15000)
+            # 判定在 DOMContentLoaded 之后的 CDP 往返里完成，留一个短窗口
+            await asyncio.sleep(0.25)
+            out[name] = await page.evaluate(SAFE_AREA_JS)
+        except Exception as exc:  # noqa: BLE001
+            out[name] = {"error": f"{type(exc).__name__}: {exc}"[:120]}
     return out
 
 
@@ -1760,7 +1827,8 @@ async def race_test(ws_endpoint: str) -> dict:
 
 HEAL_PROBE_JS = (
     "(() => ({ touch: navigator.maxTouchPoints,"
-    " uaMobile: /Android|iPhone/.test(navigator.userAgent),"
+    # iPad 的 UA 既不含 Android 也不含 iPhone——漏掉会让 iPad 机型误判
+    " uaMobile: /Android|iPhone|iPad/.test(navigator.userAgent),"
     " coarse: matchMedia('(pointer: coarse)').matches,"
     " plat: (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform }))()"
 )
@@ -1936,7 +2004,9 @@ async def main() -> int:
 
     # ---- 新标签页竞态测试（原始 CDP；Playwright 尚未连接，仅本会话门控）----
     print("\n== 竞态测试：新标签页首个文档（原始 CDP，文档起点抓取）==")
-    probe = await race_test(res["ws_endpoint"])
+    # 竞态/自愈测的是仿真会话本身，走内核直连端点（绕过输入代理）
+    direct = res.get("ws_endpoint_direct") or res["ws_endpoint"]
+    probe = await race_test(direct)
     print(json.dumps(probe, ensure_ascii=False))
 
     frame_state: dict = {}
@@ -1946,6 +2016,7 @@ async def main() -> int:
     media_state: dict = {}
     event_state: dict = {}
     sensor_state: dict = {}
+    safe_area_state: dict = {}
     heal_state: dict = {}
 
     from playwright.async_api import async_playwright
@@ -2009,6 +2080,14 @@ async def main() -> int:
                         k.lower(): v for k, v in self.headers.items()}
                     body = ACCEPT_CH_HTML
                     extra_headers["Accept-CH"] = ACCEPT_CH_VALUE
+                elif self.path.startswith("/safe-area-cover"):
+                    body = ('<!doctype html><html><head><meta name="viewport" '
+                            'content="width=device-width,initial-scale=1,'
+                            'viewport-fit=cover"></head><body>cover</body></html>')
+                elif self.path.startswith("/safe-area-plain"):
+                    body = ('<!doctype html><html><head><meta name="viewport" '
+                            'content="width=device-width,initial-scale=1">'
+                            '</head><body>plain</body></html>')
                 else:
                     body = OOPIF_MAIN_HTML
                 data = body.replace("__PORT__", str(oopif_state["port"])).encode("utf-8")
@@ -2093,9 +2172,15 @@ async def main() -> int:
             print("\n== 传感器面（devicemotion / deviceorientation）==")
             print(json.dumps(sensor_state, ensure_ascii=False))
 
+            # ---- 安全区（P2-5 后半）：env(safe-area-inset-*) 计算值 ----
+            safe_area_state = await safe_area_probe(page, oopif_state["port"])
+            print("\n== 安全区（cover / 普通页面 / 二次 cover）==")
+            print(json.dumps(safe_area_state, ensure_ascii=False))
+
             # ---- 断线自愈回归：仿真通道静默断开 → 看门狗自动重连 → 全页面重放 ----
             print("\n== 断线自愈回归（看门狗：断开 → 自动重连 → 重放）==")
-            heal_state = await heal_test(manager, profile["id"], res["ws_endpoint"])
+            heal_state = await heal_test(manager, profile["id"],
+                                    res.get("ws_endpoint_direct") or res["ws_endpoint"])
             print(json.dumps(heal_state, ensure_ascii=False))
         finally:
             oopif_server.shutdown()
@@ -2107,6 +2192,7 @@ async def main() -> int:
     is_android = target_os == "android"
     ev_touch = [str(e) for e in (event_state.get("touch") or [])]
     ev_mouse = [str(e) for e in (event_state.get("mouse") or [])]
+    ev_wheel = [str(e) for e in (event_state.get("wheel") or [])]
     drag = event_state.get("drag") or {}
     drag_ts = drag.get("tsDeltas") or []
     drag_dy = drag.get("dy") or []
@@ -2131,9 +2217,18 @@ async def main() -> int:
         "事件层：触摸派发 → 兼容鼠标事件 + click:touch": (
             "mousedown" in ev_touch and "mouseup" in ev_touch
             and any(s.startswith("click") for s in ev_touch)),
-        "事件层：鼠标点击应答正常（未启用 emit-touch 转换）": (
+        "事件层：鼠标点击应答正常（代理回包，未挂起）": (
             event_state.get("mouse_ok") is True
             and any(s.split(":", 1)[0] == "mousedown" for s in ev_mouse)),
+        # ---- 输入代理（P2-3）：下游鼠标命令 → 触摸序列 ----
+        "输入代理：鼠标点击 → touchstart/pointerdown:touch": (
+            "touchstart" in ev_mouse and "pointerdown:touch" in ev_mouse),
+        "输入代理：鼠标点击不产生 pointerdown:mouse": (
+            "pointerdown:mouse" not in ev_mouse),
+        "输入代理：滚轮 → 触摸拖拽（滚动量 ≥ 100px）": (
+            (event_state.get("wheel_delta") or 0) >= 100
+            and "touchstart" in ev_wheel and "touchmove" in ev_wheel),
+        "输入代理：滚轮不产生 wheel 事件": "wheel" not in ev_wheel,
         # ---- 触摸拖拽剖面（P2-4）：速度曲线 / 压力曲线 / 原生 fling ----
         # 位移剖面：手指上滑时 clientY 递减，dy 为负；按绝对值比较。
         # 首帧位移必须明显小于匀速段（真机拖拽的起步加速段），且全程
@@ -2249,6 +2344,12 @@ async def main() -> int:
     rp = sensor.get("requestPermission") or {}
     rp_no_gesture = sensor.get("noGesture") or {}
     rp_gesture = sensor.get("gesture") or {}
+    # ---- 安全区（P2-5 后半）：cover 页面取机型口径，普通页面为 0 ----
+    sa = safe_area_state if isinstance(safe_area_state, dict) else {}
+    sa_cover = sa.get("cover") or {}
+    sa_plain = sa.get("plain") or {}
+    sa_again = sa.get("coverAgain") or {}
+    sa_spec = derive_spec(fpd, target_os).get("safeArea") or {}
     # ---- 引擎面「一行判假」信号（iOS 批次）----
     eng = state.get("engine") or {}
     ns = eng.get("ns") or {}
@@ -2429,6 +2530,17 @@ async def main() -> int:
             # ---- 传感器面：真机 Android 持续数值事件流（桌面内核只有 null 哨兵）----
             "传感器：devicemotion 连续数值流（60Hz 级）": (
                 sensor_counts.get("motionNumeric", 0) >= 30),
+            # P2-10：读数刷新率 60Hz。deviceorientation 按「读数变化」派发，
+            # 1.5s 观测窗内 20Hz 约 30 条、60Hz 约 90 条；但事件循环偶发停顿
+            # 与内核按帧合并会成片丢事件（实测同一实现 58~68 条），所以计数
+            # 只做「明显高于 20Hz」的下限，采样周期由下一条断言按中位数锁。
+            "传感器：读数刷新率明显高于 20Hz（orientation 1.5s ≥ 45 条）": (
+                sensor_counts.get("orientationNumeric", 0) >= 45),
+            # 事件条数会被内核按帧合并、也会被偶发的长停顿拉低，单看计数
+            # 分辨不出「40Hz 稳定」和「60Hz 带停顿」。中位数直接量采样周期：
+            # 20Hz 档 ≈ 50ms，60Hz 档 ≈ 16.7ms（抖动 ±20% 后 13~20ms）。
+            "传感器：读数间隔中位数落在 60Hz 档（≤ 20ms）": (
+                0 < (sensor_state.get("orientationGaps") or {}).get("median", 999) <= 20),
             "传感器：无全 null 哨兵事件（桌面内核无传感器特征）": (
                 sensor_counts.get("motion", 0) == sensor_counts.get("motionNumeric", 0)),
             "传感器：事件可信（isTrusted）且 interval 合理": (
@@ -2538,6 +2650,13 @@ async def main() -> int:
                 and eng_tf.get("ctl") == "undefined"
                 and "force" in (eng_tf.get("touchProto") or [])
                 and "webkitForce" not in (eng_tf.get("touchProto") or [])),
+            # Android Chrome 从不暴露安全区：显示开孔不换算成 env()，
+            # cover 页面同样是 0——「声明 Android 却带安全区」反而穿帮
+            "安全区：Android 恒为 0（cover 页面亦然，与真机 Chrome 一致）": (
+                sa_cover.get("viewportFitCover") is True
+                and sa_cover.get("top") == "0px"
+                and sa_cover.get("bottom") == "0px"
+                and sa_plain.get("top") == "0px"),
         })
     else:
         is_ios_chrome = extra.get("browser") == "chrome_ios"
@@ -2552,6 +2671,20 @@ async def main() -> int:
             "Worker（页面）：无 downlinkMax/ontypechange（整块缺席）": (
                 wk_main.get("connDlMax") == "<absent>"
                 and wk_main.get("connOnType") == "<absent>"),
+            # ---- P2-5 后半：env(safe-area-inset-*) 计算值 ----
+            "安全区：cover 页面 env() == 机型口径（top/bottom）": (
+                sa_cover.get("viewportFitCover") is True
+                and sa_cover.get("top") == f"{int(sa_spec.get('top', 0))}px"
+                and sa_cover.get("bottom") == f"{int(sa_spec.get('bottom', 0))}px"),
+            "安全区：普通页面 env() == 0（WebKit 只在 cover 下避让）": (
+                sa_plain.get("viewportFitCover") is False
+                and sa_plain.get("top") == "0px"
+                and sa_plain.get("bottom") == "0px"),
+            "安全区：跨导航不残留（二次 cover 与首次一致）": (
+                sa_again.get("top") == sa_cover.get("top")
+                and sa_again.get("bottom") == sa_cover.get("bottom")),
+            "安全区：max-inset 同步下发（与 inset 同值）": (
+                sa_cover.get("topMax") == sa_cover.get("top")),
             # ---- P1-3：iOS 真机口径（ogg/webm 整族不可播、HEVC 仅 hvc1）----
             "canPlayType：ogg/webm 全族 == ''（AVFoundation 容器表无此项）": all(
                 (state.get("canPlay") or {}).get(k) == ""

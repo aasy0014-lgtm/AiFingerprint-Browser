@@ -309,9 +309,26 @@ class LaunchManager:
                                  mobile_session.css_w, mobile_session.css_h,
                                  mobile_session.dpr, mobile_session.viewport_h)
                     
+                    # 输入翻译代理（P2-3）：下游自动化（Selenium/Puppeteer/
+                    # Playwright）经 ws_endpoint 发来的鼠标命令转成触摸序列。
+                    # 桌面环境不挂：鼠标就是桌面输入，翻译反而失真。
+                    input_proxy = None
+                    if is_mobile and info.get("ws_endpoint"):
+                        from .cdp_input_proxy import CdpInputProxy
+                        input_proxy = CdpInputProxy(info["ws_endpoint"])
+                        try:
+                            real_endpoint = info["ws_endpoint"]
+                            info["ws_endpoint"] = await input_proxy.start()
+                            info["ws_endpoint_direct"] = real_endpoint
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("CDP 输入代理启动失败，下游直连内核: %s", e)
+                            with contextlib.suppress(Exception):
+                                await input_proxy.close()
+                            input_proxy = None
+
                     # 异步建立仿真（不阻塞启动流程），句柄随实例生命周期管理
                     mobile_task = asyncio.create_task(_setup_mobile_context())
-                    
+
                     async def _stop_fpchromium() -> None:
                         if not mobile_task.done():
                             mobile_task.cancel()
@@ -321,6 +338,9 @@ class LaunchManager:
                         if sess is not None:
                             with contextlib.suppress(Exception):
                                 await sess.close()
+                        if input_proxy is not None:
+                            with contextlib.suppress(Exception):
+                                await input_proxy.close()
                         await fp_chromium_kernel.stop(result)
                         if _fwd:
                             await _fwd.stop()

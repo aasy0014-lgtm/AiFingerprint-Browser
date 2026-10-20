@@ -89,8 +89,11 @@ _ANDROID_WORKER_DROPS = list(_ANDROID_REMOVE_WORKER_GLOBALS)
 #   因此需要按节奏更新读数才能形成「活」的事件流。
 # 读数生成见 _SensorSimulator：姿态（beta/gamma）与重力矢量保持数学一致，
 # 避免「重力矢量与 deviceorientation 不符」的交叉校验命中。
-_SENSOR_TICK_SEC = 0.05          # 20Hz 名义更新率（±40% 抖动，见 _sensor_loop）
-_SENSOR_TICK_JITTER = 0.4        # 抖动幅度：真机传感器采样周期并非严格固定
+_SENSOR_TICK_SEC = 1.0 / 60.0    # 60Hz 名义更新率（与真机传感器采样率同档）
+_SENSOR_TICK_JITTER = 0.2        # 抖动幅度：真机采样周期并非严格定频
+# 每步随机游走幅度按 tick 缩放：20Hz 时代的步长 ÷ 3 保持同样的物理漂移速率
+# （°/s、m/s²/s），换更新频率不改变「手持姿态」的统计特征。
+_SENSOR_STEP_SCALE = _SENSOR_TICK_SEC / 0.05
 _SENSOR_TYPES = ("accelerometer", "linear-acceleration", "gyroscope",
                  "relative-orientation", "absolute-orientation")
 _GRAVITY = 9.80665               # m/s²
@@ -127,6 +130,8 @@ class _SensorSimulator:
       的欧拉角严格同源（真机自洽性正是高级检测的交叉校验点）；
     - 抖动：加速度 ±0.2 / 线性加速度 ±0.1 级 / 陀螺仪 ±0.005 rad/s——真机在
       1dp 量化后呈 0.0/±0.1 级变化，恒定常量是模拟器特征。
+      单步幅度随更新周期缩放（见 _SENSOR_STEP_SCALE）：60Hz 下每步更小、
+      每秒漂移量不变。
     """
 
     def __init__(self, rng: random.Random) -> None:
@@ -143,13 +148,16 @@ class _SensorSimulator:
 
     def step(self) -> Dict[str, Dict[str, float]]:
         """推进一步随机游走，返回各传感器类型的 CDP 读数参数。"""
-        self.alpha = (self.alpha + self._rng.uniform(-0.6, 0.6)) % 360.0
-        self.beta = max(35.0, min(85.0, self.beta + self._rng.uniform(-0.25, 0.25)))
-        self.gamma = max(-25.0, min(25.0, self.gamma + self._rng.uniform(-0.25, 0.25)))
+        # 步长按更新周期缩放：60Hz 下每秒步数 ×3，单步幅度 ÷3，
+        # 姿态与线速度的每秒漂移量与 20Hz 时代一致（真机静止手持的统计特征）
+        s = _SENSOR_STEP_SCALE
+        self.alpha = (self.alpha + self._rng.uniform(-0.6 * s, 0.6 * s)) % 360.0
+        self.beta = max(35.0, min(85.0, self.beta + self._rng.uniform(-0.25 * s, 0.25 * s)))
+        self.gamma = max(-25.0, min(25.0, self.gamma + self._rng.uniform(-0.25 * s, 0.25 * s)))
         beta = math.radians(self.beta)
         gamma = math.radians(self.gamma)
-        self._walk(self._linear, 0.12, 0.45)
-        self._walk(self._gyro, 0.004, 0.02)
+        self._walk(self._linear, 0.12 * s, 0.45)
+        self._walk(self._gyro, 0.004 * s, 0.02)
         quaternion = _quaternion_from_euler(self.alpha, self.beta, self.gamma)
         return {
             "accelerometer": {
@@ -237,6 +245,44 @@ def _android_webgpu(renderer: str) -> Optional[Dict[str, str]]:
         if re.search(r"\bGE\d{4}\b|Rogue", renderer):
             return {"vendor": "img-tec", "architecture": "rogue"}
     return None
+
+
+# ---- iOS 安全区（env(safe-area-inset-*)）口径 ----
+# Safari 竖屏 + viewport-fit=cover 时，页面铺到状态栏/Home Indicator 之下，
+# env() 返回的正是被系统 UI 占据的那条边（CSS px）：
+#   刘海机型状态栏 47、灵动岛 59、6.3"/6.9" 的 16 Pro/17 系 62；
+#   Home Indicator 34；SE（无刘海、无指示条）全 0；
+#   iPadOS 状态栏 24、Home Indicator 20。
+# 数值按 CSS 宽度分组（宽度是屏幕的确定属性，机型名会随指纹库增删漂移）。
+# Android Chrome 不暴露安全区：显示开孔不作为 env() 下发，恒为 0，故不覆盖。
+_IOS_SAFE_AREA_TOP = {
+    375: 44,   # iPhone X / XS / 11 Pro / 12 mini / 13 mini
+    390: 47,   # iPhone 12/13/14/16e（刘海）
+    393: 59,   # iPhone 15/16（灵动岛）
+    402: 62,   # iPhone 16 Pro / 17
+    414: 47,   # iPhone XR / 11 / XS Max / 11 Pro Max
+    420: 59,   # iPhone Air
+    428: 47,   # iPhone 12/13 Pro Max
+    430: 59,   # iPhone 14 Pro Max / 15 Pro Max
+    440: 62,   # iPhone 16 Pro Max / 17 Pro Max
+}
+
+
+def _ios_safe_area(css_w: int, css_h: int, device_type: str = "") -> Optional[Dict[str, int]]:
+    """真机竖屏安全区（Safari 非壳、viewport-fit=cover 口径）。"""
+    if device_type == "tablet" or css_w >= 700:
+        return {"top": 24, "bottom": 20}
+    if css_w <= 375 and css_h <= 700:
+        # SE 2/3：4.7" 屏、实体 Home 键，无刘海也无指示条
+        return {"top": 0, "bottom": 0}
+    return {"top": _IOS_SAFE_AREA_TOP.get(css_w, 47), "bottom": 34}
+
+
+# 读取主文档的 viewport meta（只读、无副作用；不在页面留下任何全局）
+_SAFE_AREA_META_JS = (
+    "(() => { const m = document.querySelector('meta[name=\"viewport\" i]');"
+    " return m ? String(m.getAttribute('content') || '') : ''; })()"
+)
 
 
 def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
@@ -361,6 +407,11 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
     except (TypeError, ValueError):
         color_depth = 0
 
+    # iOS 安全区：非 cover 页面在运行期置 0（见 _sync_safe_area）
+    safe_area = None
+    if target_os == "ios":
+        safe_area = _ios_safe_area(css_w, css_h, str(extra.get("deviceType") or ""))
+
     return {
         "ua": str(nav.get("userAgent") or ""),
         "platform": str(nav.get("platform") or ""),
@@ -387,6 +438,7 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
         "cssHeight": css_h,
         "viewportHeight": vp_h,
         "dpr": dpr,
+        "safeArea": safe_area,
     }
 
 
@@ -3449,6 +3501,7 @@ class MobileEmulationSession:
                 "mediaVideoInputs": 0,
                 "cssWidth": css_w, "cssHeight": css_h,
                 "viewportHeight": css_h, "dpr": scale,
+                "safeArea": None,
             }
 
         self.spec = spec
@@ -3460,6 +3513,7 @@ class MobileEmulationSession:
         self.css_h = spec["cssHeight"]
         self.viewport_h = spec["viewportHeight"]
         self.dpr = spec["dpr"]
+        self.safe_area = spec.get("safeArea") or None
 
         self._ws = None
         self._reader: Optional[asyncio.Task] = None
@@ -3471,6 +3525,9 @@ class MobileEmulationSession:
         self._worker_drop_waiters: dict[str, list] = {}
         self._attach_tasks: dict[str, asyncio.Task] = {}
         self._first_page_session: Optional[str] = None
+        # 安全区（P2-5 后半）：已挂安全区判定的页面会话（iOS）。
+        # 决策按主文档生效；跨域子帧保持 0（真机 iframe 的 env() 同样是 0）。
+        self._safe_sessions: set[str] = set()
         # Accept-CH：CDP session → {源: 该源已声明的高熵提示}（Fetch 域回送）
         self._accept_ch: dict[str, dict[str, set]] = {}
         # 传感器仿真（Android）：虚拟传感器是浏览器进程级全局对象，全会话
@@ -3523,6 +3580,7 @@ class MobileEmulationSession:
         self._applied_targets.clear()
         self._accept_ch.clear()
         self._worker_drop_waiters.clear()
+        self._safe_sessions.clear()
         self._sensor_supported = None
         self._sensor_session = None
 
@@ -3754,6 +3812,18 @@ class MobileEmulationSession:
                     info = (msg.get("params") or {}).get("targetInfo") or {}
                     if info.get("type") == "iframe" and info.get("targetId"):
                         asyncio.create_task(self._attach_frame(info.get("targetId", "")))
+                elif msg.get("method") == "Page.frameNavigated":
+                    # 主文档提交（同文档导航走 navigatedWithinDocument，不触发）：
+                    # 安全区覆盖跨导航保持（实测），必须清零后按新文档的
+                    # <meta viewport> 重新判定，否则无 cover 的页面继承上一页的值。
+                    sid_evt = msg.get("sessionId") or ""
+                    frame = (msg.get("params") or {}).get("frame") or {}
+                    if not frame.get("parentId") and sid_evt in self._safe_sessions:
+                        asyncio.create_task(self._safe_area_after_nav(sid_evt))
+                elif msg.get("method") == "Page.domContentEventFired":
+                    sid_evt = msg.get("sessionId") or ""
+                    if sid_evt in self._safe_sessions:
+                        asyncio.create_task(self._sync_safe_area(sid_evt))
                 elif msg.get("method") == "Fetch.requestPaused":
                     # Accept-CH：Document 响应解析声明；已声明源的请求回送高熵头
                     asyncio.create_task(self._on_fetch_paused(msg))
@@ -3923,6 +3993,9 @@ class MobileEmulationSession:
             # 永久挂起，且产出序列缺兼容鼠标事件与 click。移动端自动化应改用
             # Input.dispatchTouchEvent 派发（见 docs/移动端大厂检测对抗优化方案.md
             # §事件层）。
+            # 安全区不在这里下发：实测主文档的 setSafeAreaInsetsOverride 不会
+            # 传播到 OOPIF 会话（跨域子帧读数恒为 0），而真机 iframe 的 env()
+            # 同样按自身视口计算（也是 0）——保持一致，不做额外覆盖。
             # OOPIF 目标不单独启用传感器：虚拟传感器是浏览器级全局对象，
             # 页面目标的覆盖对所有帧一并生效；跨域子帧能否收到由 Permissions
             # Policy 决定（未声明 allow 的跨域子帧真机同样零事件）。
@@ -4180,6 +4253,16 @@ class MobileEmulationSession:
                     "features": [{"name": "color-gamut", "value": "p3"}],
                 }, session_id=sid)
 
+        # 2.6 安全区（P2-5 后半）：真机 iOS 在 viewport-fit=cover 页面把
+        #     刘海/灵动岛/Home Indicator 换算成 env(safe-area-inset-*) 计算值。
+        #     CDP 覆盖不受 viewport-fit 约束、且跨导航保持（实测 fp-chromium
+        #     148），因此挂载与每次主文档提交都先清零，由 _sync_safe_area
+        #     按该文档 <meta viewport> 静态判定（WebKit 只在解析 meta 时
+        #     决定是否避让，页面载入后改写 meta 不会重新生效）。
+        if self.ios and self.safe_area:
+            self._safe_sessions.add(sid)
+            await self._clear_safe_area(sid)
+
         # 3. UA 覆盖（内核层只会按桌面平台拼 UA，必须显式覆盖为移动端 UA）
         if self.ua:
             ua_params: dict[str, Any] = {"userAgent": self.ua}
@@ -4235,6 +4318,57 @@ class MobileEmulationSession:
         #    未授权时真机为零事件，模板层只按 WebKit 语义伪造静态方法）。
         await self._setup_sensors(sid)
 
+    # ---------------- 安全区（iOS）----------------
+
+    async def _clear_safe_area(self, sid: str) -> None:
+        """清零安全区覆盖（非 cover 页面 / 新文档起点 / 非 iOS 页面）。"""
+        if sid not in self._safe_sessions:
+            return
+        with contextlib.suppress(CDPError, asyncio.TimeoutError):
+            # 空 insets：未给出的边按 0 计算（实测 fp-chromium 148 下
+            # env() 均返回 0px，与真机非 cover 页面的计算值一致）
+            await self._send("Emulation.setSafeAreaInsetsOverride",
+                             {"insets": {}}, session_id=sid, timeout=5.0)
+
+    async def _sync_safe_area(self, sid: str) -> None:
+        """按当前主文档的 <meta viewport> 决定安全区数值（幂等）。
+
+        WebKit 的真机语义：viewport-fit=cover 时页面铺到系统 UI 之下，
+        env() 才为非 0；其余一律 0。内核不区分 viewport-fit，只能在此判定。
+        """
+        if sid not in self._safe_sessions or not self.safe_area:
+            return
+        try:
+            res = await self._send("Runtime.evaluate", {
+                "expression": _SAFE_AREA_META_JS, "returnByValue": True,
+            }, session_id=sid, timeout=5.0)
+        except (CDPError, asyncio.TimeoutError):
+            return
+        content = str(((res or {}).get("result") or {}).get("value") or "")
+        # 关键字大小写不敏感、允许 "viewport-fit = cover"（空白归一化后判定）
+        cover = "viewport-fit=cover" in "".join(content.lower().split())
+        with contextlib.suppress(CDPError, asyncio.TimeoutError):
+            await self._send("Emulation.setSafeAreaInsetsOverride", {
+                # max-inset 与 inset 同值：真机 Safari 竖屏下浏览器 UI 可收缩
+                # 的余量未观测到差异，取保守口径（见方案文档 §2.16.1）
+                "insets": {**self.safe_area,
+                           **{k + "Max": v for k, v in self.safe_area.items()}}
+                if cover else {},
+            }, session_id=sid, timeout=5.0)
+
+    async def _safe_area_after_nav(self, sid: str) -> None:
+        """主文档提交后：清零并按新文档重新判定。
+
+        解析早段就取一次读数——解析器在取外部资源时会交还主线程，此时
+        <head> 里的 meta 往往已解析，能让文档尾部的脚本读到真机口径；
+        DOMContentLoaded 再兜底一次（见 _read_loop）。
+        """
+        await self._clear_safe_area(sid)
+        for delay in (0.0, 0.03, 0.12):
+            if delay:
+                await asyncio.sleep(delay)
+            await self._sync_safe_area(sid)
+
     # ---------------- 传感器仿真（Android）----------------
 
     async def _setup_sensors(self, sid: str) -> None:
@@ -4277,25 +4411,40 @@ class MobileEmulationSession:
         """下发一步读数（xyz 用于加速度/角速度，四元数用于方向）。
 
         读数写入全局虚拟传感器，对所有页面/iframe 一并生效。
+        五类读数并发下发：60Hz 下每 tick 只有 ~16ms，串行等待五次往返
+        会把整个时间预算耗在 RTT 上（本地 ~0.3ms/条，尚可，但会累积漂移）。
         """
+        sends = []
         for sensor_type, values in readings.items():
             if sensor_type.endswith("orientation"):
                 reading = {"quaternion": values}
             else:
                 reading = {"xyz": values}
-            await self._send("Emulation.setSensorOverrideReadings",
-                             {"type": sensor_type, "reading": reading},
-                             session_id=sid, timeout=5.0)
+            sends.append(self._send("Emulation.setSensorOverrideReadings",
+                                    {"type": sensor_type, "reading": reading},
+                                    session_id=sid, timeout=5.0))
+        await asyncio.gather(*sends)
 
     async def _sensor_loop(self, simulator: _SensorSimulator) -> None:
         """按真机节奏持续更新读数（事件流随读数变化保持「活」）。"""
         failures = 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time()
         try:
             while not self._closed:
                 # 更新节奏带抖动：严格固定周期会让「事件内容变化」呈精确的
-                # 周期性（如连续 3 样本相同再跳变），真机传感器采样周期不固定
-                jitter = 1.0 + _SENSOR_TICK_JITTER * (random.random() * 2 - 1)
-                await asyncio.sleep(_SENSOR_TICK_SEC * jitter)
+                # 周期性（如连续 3 样本相同再跳变），真机传感器采样周期不固定。
+                # 按绝对时刻排程而不是「发完再 sleep」：60Hz 下每 tick 只有
+                # 16.7ms，sleep 的固定开销（实测 macOS 上每轮多睡 1–2ms）
+                # 会把更新率拖到 ~54Hz——读数变化频率本身就是检测面。
+                deadline += _SENSOR_TICK_SEC * (1.0 + _SENSOR_TICK_JITTER
+                                                * (random.random() * 2 - 1))
+                delay = deadline - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                else:
+                    # 落后超过一个周期（被挂起/阻塞）：重新对齐，避免追帧风暴
+                    deadline = loop.time()
                 sid = self._sensor_session
                 if sid is None:
                     return
