@@ -1351,11 +1351,57 @@ _ANDROID_TTS_VOICES: List[List[Any]] = [
 ]
 
 
-def _android_tts_voices(target_os: str) -> List[List[Any]]:
-    """Android 身份的 TTS 语音表；iOS 保持空列表（真机 Safari 无手势时为空）。"""
+def _android_tts_voices(target_os: str, locale: str = "") -> List[List[Any]]:
+    """Android 身份的 TTS 语音表；iOS 保持空列表（真机 Safari 无手势时为空）。
+
+    F-161：`default` 必须落在与 Intl locale 同语族的语音上。真机 Android
+    的默认 TTS 语音跟随系统语言，因此 en-US 出口设备上默认语音一定是
+    `en-*`。表原先写死 `zh-CN` 为 default，与 geoip 解析出的 `en-US` 并存
+    时，creepjs 的 `voiceLangMismatch`（默认语音语族 ≠ Intl locale 语族）
+    直接成立并把 Intl/Timezone 两行标红——这是比「语音表为空」更隐蔽的
+    一致性缺陷。
+
+    `locale` 为空时（旧调用方式）不设默认语音：宁可没有默认，也不给出与
+    运行期 Intl 可能冲突的那一条。默认语音只设**一条**——creepjs 仅在
+    `default && localService` 恰好 1 条时取默认值，多条会静默绕过判据。
+    """
     if target_os != "android":
         return []
-    return [list(v) for v in _ANDROID_TTS_VOICES]
+    rows = [list(v) for v in _ANDROID_TTS_VOICES]
+    want = str(locale or "").strip().lower()
+    default_idx = None
+    if want:
+        default_idx = _pick_default_voice(rows, want)
+    for i, row in enumerate(rows):
+        row[3] = (i == default_idx)
+    return rows
+
+
+def _pick_default_voice(rows: List[List[Any]], locale: str) -> Optional[int]:
+    """按 locale 挑默认 TTS 语音的下标；无匹配语族返回 None。
+
+    优先级：完全同 locale（`en-US` → `en-US`）＞ 同语族（`en-US` → `en-GB`
+    等）＞ `cmn-Hans-CN` 一类的汉字变体（`zh` ↔ `cmn`）。
+    """
+    base = locale.split("-")[0]
+    exact = None
+    same_family = None
+    for i, row in enumerate(rows):
+        lang = str(row[1] or "").lower()
+        if lang == locale:
+            exact = i
+            break
+        if same_family is None and lang.split("-")[0] == base:
+            same_family = i
+    if exact is not None:
+        return exact
+    if same_family is not None:
+        return same_family
+    if base == "zh":
+        for i, row in enumerate(rows):
+            if str(row[1] or "").lower().startswith("cmn-"):
+                return i
+    return None
 
 
 def _drop_proto_members(target_os: str,

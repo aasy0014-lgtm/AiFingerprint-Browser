@@ -489,8 +489,13 @@ def _ios_add_members_gated(add: Dict[str, Any], os_version: Any) -> Dict[str, An
     return add
 
 
-def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
-    """从存储的移动端 fingerprint 提取运行期仿真规格（兼容旧版结构）。"""
+def derive_spec(fingerprint: dict, target_os: str,
+                locale: str = "") -> Dict[str, Any]:
+    """从存储的移动端 fingerprint 提取运行期仿真规格（兼容旧版结构）。
+
+    `locale` 只影响 TTS 默认语音的语族（F-161）：真机 Android 的默认语音
+    跟随系统语言，而系统语言由 geoip 在运行期决定，存储指纹里没有。
+    """
     fp = fingerprint or {}
     nav = fp.get("navigator") or {}
     screen = fp.get("screen") or {}
@@ -739,7 +744,8 @@ def derive_spec(fingerprint: dict, target_os: str) -> Dict[str, Any]:
         "ios": target_os == "ios",
         "android": target_os == "android",
         # F-45：Android 的 TTS 语音表（iOS 侧为空表 → getVoices() 返回 []）
-        "androidVoices": _android_tts_voices(target_os),
+        # F-161：默认语音按 locale 选语族，避免与 Intl 的 locale 冲突
+        "androidVoices": _android_tts_voices(target_os, locale),
         "iosChrome": ios_chrome,
         "webgl": webgl,
         "webgpu": webgpu,
@@ -5286,6 +5292,53 @@ __MC_SRC__
                     return v;
                 };
                 var __voiceList = __voices.map(__makeVoice);
+                // F-161：默认语音必须与运行期 Intl locale 同语族。表在
+                // derive_spec 里已按 locale 选过，这里再兜一道——locale 的
+                // 最终值由 CDP setLocaleOverride 决定，若它没落到预期值
+                // （例如 setLocaleOverride 失败、或内核另有默认），表侧的
+                // 选择就会与实际 Intl 不一致。creepjs 的 voiceLangMismatch
+                // 只看这一条交叉一致性，故以运行期真值收敛为准。
+                try {
+                    var __loc = '';
+                    try {
+                        __loc = Intl.DateTimeFormat().resolvedOptions().locale || '';
+                    } catch (e0) {}
+                    var __base = String(__loc).toLowerCase().split('-')[0];
+                    if (__base) {
+                        var __defIdx = -1, __nDef = 0;
+                        for (var __i = 0; __i < __voices.length; __i++) {
+                            if (__voices[__i][3]) { __nDef++; __defIdx = __i; }
+                        }
+                        var __defBase = __defIdx >= 0
+                            ? String(__voices[__defIdx][1] || '')
+                                .toLowerCase().split('-')[0]
+                            : '';
+                        if (__nDef !== 1 || __defBase !== __base) {
+                            // 先挑完全同 locale，再挑同语族；都没有就不设默认
+                            var __pick = -1, __pickFam = -1;
+                            for (var __j = 0; __j < __voices.length; __j++) {
+                                var __vl = String(__voices[__j][1] || '')
+                                    .toLowerCase();
+                                if (__vl === String(__loc).toLowerCase()) {
+                                    __pick = __j;
+                                    break;
+                                }
+                                if (__pickFam < 0
+                                        && __vl.split('-')[0] === __base) {
+                                    __pickFam = __j;
+                                }
+                            }
+                            if (__pick < 0) { __pick = __pickFam; }
+                            for (var __k = 0; __k < __voiceList.length; __k++) {
+                                try {
+                                    Object.defineProperty(__voiceList[__k],
+                                        'default',
+                                        { value: (__k === __pick) });
+                                } catch (e1) {}
+                            }
+                        }
+                    }
+                } catch (e2) {}
                 if (SS && SS.getVoices) {
                     defineFn(SS, 'getVoices', function () {
                         return __voiceList.slice();
@@ -11704,7 +11757,7 @@ class MobileEmulationSession:
         self.start_url = start_url or ""
 
         if fingerprint:
-            spec = derive_spec(fingerprint, target_os)
+            spec = derive_spec(fingerprint, target_os, locale)
         else:
             # 旧调用方式：仅视口 / UA / platform
             phys = viewport or {}
@@ -11738,6 +11791,8 @@ class MobileEmulationSession:
                 "mseTypes": {"ios": target_os == "ios", "av1": False},
                 "webglProfile": _webgl_profile(target_os),
                 "ios": target_os == "ios", "android": target_os == "android",
+                # F-161：与 derive_spec 同口径，默认语音按 locale 选语族
+                "androidVoices": _android_tts_voices(target_os, locale),
                 "iosChrome": None, "webgl": None, "webgpu": None,
                 "mediaVideoInputs": 0,
                 "cssWidth": css_w, "cssHeight": css_h,
