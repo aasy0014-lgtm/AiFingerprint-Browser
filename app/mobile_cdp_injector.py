@@ -2404,15 +2404,22 @@ __MC_SRC__
                         && s.indexOf('[native code]') !== -1
                         && s.indexOf('\n') === -1) {
                     var m = /^function\s*([^(]*)\(/.exec(s);
-                    return 'function ' + (m ? m[1].trim() : '') + '() {\n    [native code]\n}';
+                    return 'function ' + __jscName(m ? m[1].trim() : '')
+                        + '() {\n    [native code]\n}';
                 }
                 return s;
+            };
+            // JSC 的访问器源码不带 get/set 前缀（`function volume()`），
+            // 与 V8 的 `function get volume()` 不同；Function#name 两侧都是
+            // 'get volume'，只有 toString 分叉（/tmp/f401）。
+            var __jscName = function (n) {
+                return String(n).replace(/^(?:get|set)\s+/, '');
             };
             var mask = function (fn, name, src) {
                 try {
                     if (typeof fn === 'function') {
                         registry.set(fn, src || (D && D.ios
-                            ? 'function ' + name + '() {\n    [native code]\n}'
+                            ? 'function ' + __jscName(name) + '() {\n    [native code]\n}'
                             : 'function ' + name + '() { [native code] }'));
                         try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e2) {}
                     }
@@ -7436,6 +7443,10 @@ __MC_SRC__
                                 value: len, configurable: true,
                             });
                         } catch (e) {}
+                        // 代理没有自己的函数体，Function#toString 会落到目标对象上，
+                        // 报成 V8 的 `function () { [native code] }`；JSC 的同名
+                        // 构造器是 `function MediaError() {...}`（/tmp/f404）。
+                        try { __maskNative(out, name); } catch (e) {}
                         try {
                             Object.defineProperty(proto, 'constructor', {
                                 value: out, writable: true,
@@ -7946,6 +7957,89 @@ __MC_SRC__
                     });
                     return ok;
                 };
+                // ---- F-155 残项：MediaError 面 ----
+                // 真机文案是固定串（WebKit 源码 hme.cpp 3012-3081 / 3561 /
+                // 7118，/tmp/f403 实测）：
+                //   code 1 → 'Load was aborted'      code 2 → 'Media failed to load'
+                //   code 3 → 'Media failed to decode' code 4 → 播放器 lastErrorMessage
+                //   code 5 → 'Media is encrypted'
+                // code 4 取播放器的 lastErrorMessage，实测是空串（WebKit 的
+                // MediaPlayerPrivateAVFoundationObjC 在该路径不填）。Blink 却把
+                // 内部串原样交给页面（'PipelineStatus::CHUNK_DEMUXER_ERROR_…'、
+                // 'MEDIA_ELEMENT_ERROR: …'），既泄漏引擎也偏离真机，一律改写。
+                // 构造文案与缺的 MEDIA_ERR_ENCRYPTED 走 _IOS_ADD_SPEC 的
+                // repair + constants；原型成员顺序因 Blink 的常量不可配置而
+                // 无法重排（属既有 own-name 顺序残差）。
+                if (typeof MediaError !== 'undefined' && MediaError.prototype) {
+                    var __meOrig = {};
+                    ['code', 'message'].forEach(function (n) {
+                        try {
+                            __meOrig[n] = Object.getOwnPropertyDescriptor(
+                                MediaError.prototype, n) || null;
+                        } catch (e) { __meOrig[n] = null; }
+                    });
+                    var __ME_MSG = { 1: 'Load was aborted',
+                                     2: 'Media failed to load',
+                                     3: 'Media failed to decode',
+                                     4: '',
+                                     5: 'Media is encrypted' };
+                    // 品牌判定直接用宿主 getter：非实例会抛 Illegal invocation。
+                    // F-156 的同步窗口要在原生级联之前交出 video.error，故留
+                    // 一条旁路：合成实例只把 code 记在 __meVirt 里，品牌、
+                    // 文案、toString 仍走真实原型（/tmp/f404 identity 组）。
+                    var __meVirt = new WeakMap();
+                    var __wkMediaError = function (code) {
+                        var o = Object.create(MediaError.prototype);
+                        __meVirt.set(o, code);
+                        return o;
+                    };
+                    var __meCode = function (recv) {
+                        if (__meVirt.has(recv)) { return __meVirt.get(recv); }
+                        var d = __meOrig.code;
+                        if (!d || !d.get) { return undefined; }
+                        return d.get.call(recv);
+                    };
+                    var __meOk = function (recv) {
+                        if (recv === null || recv === undefined) { return false; }
+                        if (__meVirt.has(recv)) { return true; }
+                        try { __meCode(recv); return true; }
+                        catch (e) { return false; }
+                    };
+                    if (__meOrig.code && __meOrig.code.get) {
+                        try {
+                            Object.defineProperty(MediaError.prototype, 'code', {
+                                get: __maskNative(function () {
+                                    if (!__meOk(this)) {
+                                        throw __wkBrandErr('MediaError', 'code',
+                                                           'getter');
+                                    }
+                                    return __meCode(this);
+                                }, 'get code'),
+                                enumerable: true, configurable: true,
+                            });
+                        } catch (e) {}
+                    }
+                    if (__meOrig.message && __meOrig.message.get) {
+                        try {
+                            Object.defineProperty(MediaError.prototype, 'message', {
+                                get: __maskNative(function () {
+                                    if (!__meOk(this)) {
+                                        throw __wkBrandErr('MediaError',
+                                                           'message', 'getter');
+                                    }
+                                    var c = __meCode(this);
+                                    if (Object.prototype.hasOwnProperty
+                                            .call(__ME_MSG, c)) {
+                                        return __ME_MSG[c];
+                                    }
+                                    return String(__meOrig.message.get
+                                                  .call(this) || '');
+                                }, 'get message'),
+                                enumerable: true, configurable: true,
+                            });
+                        } catch (e) {}
+                    }
+                }
                 // 判定顺序照 WebKit 源码（MediaSource::addSourceBuffer 695-759）：
                 // 空串 → 类型表 → readyState。类型先于状态，故 closed 态下不支持
                 // 的类型仍抛 NotSupportedError（实测 /tmp/f347 closed 组）。
@@ -8547,6 +8641,157 @@ __MC_SRC__
                     s.lists[slot] = L;
                     return L;
                 };
+                // ---- F-156 残项：MediaSource 与 HTMLMediaElement 的联动 ----
+                // 真机（/tmp/f405、/tmp/f408）：
+                //   无参 endOfStream()        → 元素 networkState 同步 1、error 仍 null
+                //   显式 endOfStream('decode'|'network')
+                //                             → 同步 3，且 video.error 同步可读为
+                //                               code 4 + 空 message
+                // Blink 两种情形都停在 2（LOADING），错误对象要等原生级联落地
+                // 才出现，且 message 是引擎内部串。故这里虚拟这两个读数。
+                // 元素与 MediaSource 的关联宿主不暴露，靠 createObjectURL /
+                // src / srcObject 三处挂钩建立——探针与实际页面都走这条路。
+                var __wk156Urls = null, __wk156Els = new WeakMap();
+                try { __wk156Urls = new Map(); } catch (e) {}
+                var __wk156Link = function (el, ms) {
+                    if (!el || !ms) { return; }
+                    try { __wk156Els.set(ms, el); } catch (e) {}
+                };
+                var __wk156El = function (ms) {
+                    try { return __wk156Els.get(ms) || null; } catch (e) { return null; }
+                };
+                var __wk156ErrCode = new WeakMap();
+                // err：undefined = 沿用原生；null = 强制 null；数字 = 合成
+                // MediaError（同一元素同一 code 恒等，/tmp/f404 identity：
+                // 真机实例零自有属性，故 code 记在旁路表里）。
+                var __wk156Mark = function (el, ns, err) {
+                    var st = __wkSt(el);
+                    st.ns156 = ns;
+                    if (err === undefined) { return; }
+                    st.err156 = err;
+                    if (err === null) { st.err156Obj = null; return; }
+                    if (typeof __wkMediaError !== 'function') {
+                        st.err156 = undefined; st.err156Obj = null; return;
+                    }
+                    if (!st.err156Obj || __wk156ErrCode.get(st.err156Obj) !== err) {
+                        var o = __wkMediaError(err);
+                        __wk156ErrCode.set(o, err);
+                        st.err156Obj = o;
+                    }
+                };
+                var __wk156Unmark = function (el) {
+                    var st = __wkSt(el);
+                    st.ns156 = undefined;
+                    st.err156 = undefined;
+                    st.err156Obj = null;
+                };
+                try {
+                    if (typeof URL !== 'undefined'
+                            && typeof URL.createObjectURL === 'function') {
+                        var __wk156Cou = URL.createObjectURL;
+                        var __wk156CouImpl = function (obj) {
+                            var u = __wk156Cou.apply(this, arguments);
+                            try {
+                                if (__wk156Urls && obj && typeof MediaSource !== 'undefined'
+                                        && (obj instanceof MediaSource)) {
+                                    __wk156Urls.set(u, obj);
+                                }
+                            } catch (e) {}
+                            return u;
+                        };
+                        try {
+                            Object.defineProperty(__wk156CouImpl, 'length', {
+                                value: __wk156Cou.length, configurable: true,
+                            });
+                        } catch (e) {}
+                        Object.defineProperty(URL, 'createObjectURL', {
+                            value: __maskNative(__wk156CouImpl,
+                                                'createObjectURL'),
+                            writable: true, enumerable: false, configurable: true,
+                        });
+                    }
+                } catch (e) {}
+                if (typeof HTMLMediaElement !== 'undefined'
+                        && HTMLMediaElement.prototype) {
+                    var __hm156 = HTMLMediaElement.prototype;
+                    var __hm156Orig = {};
+                    ['networkState', 'error', 'src', 'srcObject', 'load']
+                        .forEach(function (n) {
+                            try {
+                                __hm156Orig[n] = Object.getOwnPropertyDescriptor(
+                                    __hm156, n) || null;
+                            } catch (e) { __hm156Orig[n] = null; }
+                        });
+                    ['src', 'srcObject'].forEach(function (n) {
+                        var d = __hm156Orig[n];
+                        if (!d || !d.set) { return; }
+                        var set0 = d.set;
+                        try {
+                            Object.defineProperty(__hm156, n, {
+                                get: d.get ? __maskNative(function () {
+                                    return d.get.call(this);
+                                }, 'get ' + n) : undefined,
+                                set: __maskNative(function (v) {
+                                    var ms = null;
+                                    if (n === 'srcObject') {
+                                        ms = v;
+                                    } else if (__wk156Urls) {
+                                        try { ms = __wk156Urls.get(String(v)) || null; }
+                                        catch (e) { ms = null; }
+                                    }
+                                    __wk156Unmark(this);
+                                    var r = set0.call(this, v);
+                                    __wk156Link(this, ms);
+                                    return r;
+                                }, 'set ' + n),
+                                enumerable: d.enumerable, configurable: true,
+                            });
+                        } catch (e) {}
+                    });
+                    if (__hm156Orig.load && typeof __hm156Orig.load.value === 'function') {
+                        var load0 = __hm156Orig.load.value;
+                        try {
+                            Object.defineProperty(__hm156, 'load', {
+                                value: __maskNative(function () {
+                                    __wk156Unmark(this);
+                                    return load0.apply(this, arguments);
+                                }, 'load'),
+                                writable: true,
+                                enumerable: __hm156Orig.load.enumerable,
+                                configurable: true,
+                            });
+                        } catch (e) {}
+                    }
+                    if (__hm156Orig.networkState && __hm156Orig.networkState.get) {
+                        var ns0 = __hm156Orig.networkState.get;
+                        try {
+                            Object.defineProperty(__hm156, 'networkState', {
+                                get: __maskNative(function () {
+                                    var st = __wkSt(this);
+                                    if (st.ns156 !== undefined) { return st.ns156; }
+                                    return ns0.call(this);
+                                }, 'get networkState'),
+                                enumerable: true, configurable: true,
+                            });
+                        } catch (e) {}
+                    }
+                    if (__hm156Orig.error && __hm156Orig.error.get) {
+                        var err0 = __hm156Orig.error.get;
+                        try {
+                            Object.defineProperty(__hm156, 'error', {
+                                get: __maskNative(function () {
+                                    var st = __wkSt(this);
+                                    if (st.err156 === null) { return null; }
+                                    if (st.err156 !== undefined) {
+                                        return st.err156Obj || null;
+                                    }
+                                    return err0.call(this);
+                                }, 'get error'),
+                                enumerable: true, configurable: true,
+                            });
+                        } catch (e) {}
+                    }
+                }
                 if (typeof MediaSource !== 'undefined' && MediaSource.prototype) {
                     var __wk156Orig = {};
                     ['readyState', 'duration', 'sourceBuffers',
@@ -8625,6 +8870,8 @@ __MC_SRC__
                             s.phase = 'closed';
                             s.eosDur = NaN;
                             s.sbs.forEach(__wk156Evict);
+                            var elX = __wk156El(ms);
+                            if (elX) { __wk156Mark(elX, 3, 4); }
                         } else {
                             // 无参**不调原生**：Blink 无数据会直接 close 并把
                             // video.error 置 4，真机只停在 ended、SB 仍活着。
@@ -8633,6 +8880,8 @@ __MC_SRC__
                             // /tmp/f396）。故同步把原生 duration 也置 0。
                             s.phase = 'ended';
                             s.eosDur = 0;
+                            var elY = __wk156El(ms);
+                            if (elY) { __wk156Mark(elY, 1, null); }
                             try {
                                 var dd = __wk156Orig.duration;
                                 if (dd && dd.set) { dd.set.call(ms, 0); }
@@ -9037,15 +9286,22 @@ _WORKER_PATCH_TEMPLATE = r"""
                         && s.indexOf('[native code]') !== -1
                         && s.indexOf('\n') === -1) {
                     var m = /^function\s*([^(]*)\(/.exec(s);
-                    return 'function ' + (m ? m[1].trim() : '') + '() {\n    [native code]\n}';
+                    return 'function ' + __jscName(m ? m[1].trim() : '')
+                        + '() {\n    [native code]\n}';
                 }
                 return s;
+            };
+            // JSC 的访问器源码不带 get/set 前缀（`function volume()`），
+            // 与 V8 的 `function get volume()` 不同；Function#name 两侧都是
+            // 'get volume'，只有 toString 分叉（/tmp/f401）。
+            var __jscName = function (n) {
+                return String(n).replace(/^(?:get|set)\s+/, '');
             };
             var mask = function (fn, name, src) {
                 try {
                     if (typeof fn === 'function') {
                         registry.set(fn, src || (D && D.ios
-                            ? 'function ' + name + '() {\n    [native code]\n}'
+                            ? 'function ' + __jscName(name) + '() {\n    [native code]\n}'
                             : 'function ' + name + '() { [native code] }'));
                         try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e2) {}
                     }

@@ -1465,6 +1465,9 @@ _IOS_ADD_SPEC: Dict[str, Any] = {
         {"ctor": "SVGViewSpec", "name": "SVG_ZOOMANDPAN_UNKNOWN", "value": 0},
         {"ctor": "SVGViewSpec", "name": "SVG_ZOOMANDPAN_DISABLE", "value": 1},
         {"ctor": "SVGViewSpec", "name": "SVG_ZOOMANDPAN_MAGNIFY", "value": 2},
+        # F-155 残项：WebKit 的 MediaError 多一个 MEDIA_ERR_ENCRYPTED=5
+        # （/tmp/f404 实测：构造函数与原型两侧都有、可枚举、不可写）。
+        {"ctor": "MediaError", "name": "MEDIA_ERR_ENCRYPTED", "value": 5},
     ] + (
         # CSSPrimitiveValue / SVGPathSeg 的枚举族：真机实测为连续 0..N，
         # 顺序即 WebKit CSSPrimitiveValue.idl / SVGPathSeg.idl 的声明顺序。
@@ -1711,6 +1714,13 @@ _IOS_ADD_SPEC: Dict[str, Any] = {
                              "repair": True, "extends": "EventTarget",
                              "members": ["length", "=onaddsourcebuffer",
                                          "=onremovesourcebuffer", "!item"]},
+        # F-155 残项：真机 MediaError 比 Blink 多 MEDIA_ERR_ENCRYPTED（=5），
+        # 构造文案是裸 Illegal constructor，接收者校验也走真机文案
+        # （/tmp/f404）。常量走 constants 表；原型成员顺序因 Blink 的
+        # 常量不可配置而无法重排，属既有 own-name 顺序残差。
+        "MediaError": {"construct": "illegal", "length": 0,
+                       "repair": True,
+                       "members": ["code", "message"]},
         "AudioTrackConfiguration": {
             "construct": "illegal", "length": 0,
             "members": ["codec", "sampleRate", "numberOfChannels", "bitrate"]},
