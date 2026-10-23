@@ -2397,9 +2397,35 @@ __MC_SRC__
             var origToString = Function.prototype.toString;
             if (typeof WeakMap === 'undefined') { return function (fn) { return fn; }; }
             var registry = new WeakMap();
-            var faked = function toString() {
-                var v = registry.get(this);
-                if (v !== undefined) { return v; }
+            // 顶层 realm 的 toString，用于跨 realm 查询（见下方 apply）。
+            var __topFts = null;
+            var __topFtsTried = false;
+            var faked = new Proxy(origToString, {
+                apply: function (target, self, args) {
+                    var v = registry.get(self);
+                    if (v !== undefined) { return v; }
+                    // creepjs 的 `queryLies` 用 phantom iframe（二级）的
+                    // Function#toString 去读主 realm 的函数。两个 realm 各有
+                    // 一份 toString 和一份 WeakMap，本 realm 查不到就吐载体
+                    // 自身的真源码（方法简写文本），记 lie。故这里回退到顶层
+                    // realm 的注册表；顶层对陌生对象也只会落到原生实现。
+                    if (!__topFtsTried) {
+                        __topFtsTried = true;
+                        try {
+                            var tw = window.top;
+                            if (tw && tw !== window && tw.Function
+                                    && tw.Function.prototype) {
+                                __topFts = tw.Function.prototype.toString;
+                            }
+                        } catch (e5) {}
+                    }
+                    if (__topFts && __topFts !== faked) {
+                        try { return __topFts.call(self); } catch (e6) {}
+                    }
+                    return __nativeToString(target, self);
+                },
+            });
+            var __nativeToStringTail = function () {
                 var s = origToString.call(this);
                 // JSC 的原生函数是 `function f() {\n    [native code]\n}`（多行缩进），
                 // V8 是单行 `function f() { [native code] }`。未登记（未被本补丁
@@ -2421,13 +2447,35 @@ __MC_SRC__
             var __jscName = function (n) {
                 return String(n).replace(/^(?:get|set)\s+/, '');
             };
-            var mask = function (fn, name, src) {
+            // 返回的载体必须**自身**在任何 realm 下都读作原生函数。仅靠上面的
+            // 注册表做不到：creepjs 的 `queryLies` 用 phantom iframe（二级）
+            // 的 `Function.prototype.toString` 去读主 realm 的函数，两个
+            // realm 各有一份 toString 与各一份 WeakMap，查不到就吐真源码，
+            // 连带暴露 JS 函数自带的 prototype/arguments/caller——实测
+            // Navigator 10 个成员、Screen、WebGL 全部因此记 lie。
+            // 故这里不再返回原函数，而是返回一个**方法简写**包装：简写方法
+            // 天然无 prototype、不可构造，own 属性恰是 length,name，任何
+            // realm 读源码都命中 [native code]（实测 lied:0）。构造器类
+            // 属性走 asCtor 分支保持原函数，因为 `new`/`prototype` 必须能用
+            // 而 creepjs 并不搜索构造器对象本身。
+            var mask = function (fn, name, src, asCtor) {
                 try {
                     if (typeof fn === 'function') {
-                        registry.set(fn, src || (D && D.ios
+                        var s = src || (D && D.ios
                             ? 'function ' + __jscName(name) + '() {\n    [native code]\n}'
-                            : 'function ' + name + '() { [native code] }'));
+                            : 'function ' + name + '() { [native code] }');
+                        registry.set(fn, s);
                         try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e2) {}
+                        if (asCtor) { return fn; }
+                        var w = ({ m() { return fn.apply(this, arguments); } }).m;
+                        registry.set(w, s);
+                        try { Object.defineProperty(w, 'name', { value: name, configurable: true }); } catch (e3) {}
+                        try {
+                            Object.defineProperty(w, 'length', {
+                                value: fn.length, configurable: true,
+                            });
+                        } catch (e4) {}
+                        return w;
                     }
                 } catch (e) {}
                 return fn;
@@ -2781,7 +2829,7 @@ __MC_SRC__
                             scale: init.scale === undefined ? 1 : init.scale,
                         });
                         return e;
-                    }, 'GestureEvent');
+                    }, 'GestureEvent', null, true);
                     __GE.prototype = Object.create(UIEvent.prototype, {
                         constructor: { value: __GE, writable: true, configurable: true },
                     });
@@ -3501,7 +3549,7 @@ __MC_SRC__
                         value: __AvailP, writable: false, enumerable: false, configurable: false,
                     });
                     Object.defineProperty(window, 'WebKitPlaybackTargetAvailabilityEvent', {
-                        value: __maskNative(__Avail, 'WebKitPlaybackTargetAvailabilityEvent'),
+                        value: __maskNative(__Avail, 'WebKitPlaybackTargetAvailabilityEvent', null, true),
                         writable: true, enumerable: false, configurable: true,
                     });
 
@@ -3518,7 +3566,7 @@ __MC_SRC__
                         if (name in window) { return null; }
                         var C = __ifaceCtor(name, len);
                         Object.defineProperty(window, name, {
-                            value: __maskNative(C, name),
+                            value: __maskNative(C, name, null, true),
                             writable: true, enumerable: false, configurable: true,
                         });
                         return C;
@@ -3608,7 +3656,7 @@ __MC_SRC__
                             value: __MK, writable: true, enumerable: false, configurable: true,
                         });
                         Object.defineProperty(window, 'WebKitMediaKeys', {
-                            value: __maskNative(__MK, 'WebKitMediaKeys'),
+                            value: __maskNative(__MK, 'WebKitMediaKeys', null, true),
                             writable: true, enumerable: false, configurable: true,
                         });
                     }
@@ -3627,7 +3675,7 @@ __MC_SRC__
                             })(__codes[__ci], __ci + 1);
                         }
                         Object.defineProperty(window, 'WebKitMediaKeyError', {
-                            value: __maskNative(__EK, 'WebKitMediaKeyError'),
+                            value: __maskNative(__EK, 'WebKitMediaKeyError', null, true),
                             writable: true, enumerable: false, configurable: true,
                         });
                     }
@@ -4258,7 +4306,7 @@ __MC_SRC__
                         var px = (arguments.length > 0 && x !== undefined) ? x : 0;
                         var py = (arguments.length > 1 && y !== undefined) ? y : 0;
                         __wkPtStore.set(this, { x: __wkFround(px), y: __wkFround(py) });
-                    }, 'WebKitPoint');
+                    }, 'WebKitPoint', null, true);
                     try {
                         Object.defineProperty(__WKP, 'length', { value: 0, configurable: true });
                     } catch (e) {}
@@ -4376,7 +4424,7 @@ __MC_SRC__
                 var __wkIfaceOf = function (name, fillProto) {
                     var target = __maskNative(function () {
                         throw new TypeError('Illegal constructor');
-                    }, name);
+                    }, name, null, true);
                     try {
                         Object.defineProperty(target, 'length', { value: 0, configurable: true });
                     } catch (e) {}
@@ -4484,7 +4532,7 @@ __MC_SRC__
                     // ownKeys [] / in false / 取值 undefined（空对象 + 正确原型即等价）。
                     var __wkBufCtor = __maskNative(function () {
                         throw new TypeError('Illegal constructor');
-                    }, 'WebKitBufferNamespace');
+                    }, 'WebKitBufferNamespace', null, true);
                     var __wkBufProto = {};
                     Object.defineProperty(__wkBufCtor, 'prototype', {
                         value: __wkBufProto, writable: false,
@@ -4689,7 +4737,7 @@ __MC_SRC__
                             try { Object.setPrototypeOf(made, nt.prototype); } catch (e) {}
                         }
                         return made;
-                    }, 'Notification');
+                    }, 'Notification', null, true);
                     Object.defineProperty(__nCtor, 'length', {
                         value: 1, writable: false, enumerable: false, configurable: true,
                     });
@@ -7499,7 +7547,7 @@ __MC_SRC__
                         // 代理没有自己的函数体，Function#toString 会落到目标对象上，
                         // 报成 V8 的 `function () { [native code] }`；JSC 的同名
                         // 构造器是 `function MediaError() {...}`（/tmp/f404）。
-                        try { __maskNative(out, name); } catch (e) {}
+                        try { __maskNative(out, name, null, true); } catch (e) {}
                         try {
                             Object.defineProperty(proto, 'constructor', {
                                 value: out, writable: true,
@@ -7511,7 +7559,7 @@ __MC_SRC__
                             if (mode === 'illegal') {
                                 throw new TypeError('Illegal constructor');
                             }
-                        }, name);
+                        }, name, null, true);
                         try {
                             Object.defineProperty(target, 'length', {
                                 value: len, configurable: true,
@@ -9326,9 +9374,35 @@ _WORKER_PATCH_TEMPLATE = r"""
             var origToString = Function.prototype.toString;
             if (typeof WeakMap === 'undefined') { return function (fn) { return fn; }; }
             var registry = new WeakMap();
-            var faked = function toString() {
-                var v = registry.get(this);
-                if (v !== undefined) { return v; }
+            // 顶层 realm 的 toString，用于跨 realm 查询（见下方 apply）。
+            var __topFts = null;
+            var __topFtsTried = false;
+            var faked = new Proxy(origToString, {
+                apply: function (target, self, args) {
+                    var v = registry.get(self);
+                    if (v !== undefined) { return v; }
+                    // creepjs 的 `queryLies` 用 phantom iframe（二级）的
+                    // Function#toString 去读主 realm 的函数。两个 realm 各有
+                    // 一份 toString 和一份 WeakMap，本 realm 查不到就吐载体
+                    // 自身的真源码（方法简写文本），记 lie。故这里回退到顶层
+                    // realm 的注册表；顶层对陌生对象也只会落到原生实现。
+                    if (!__topFtsTried) {
+                        __topFtsTried = true;
+                        try {
+                            var tw = window.top;
+                            if (tw && tw !== window && tw.Function
+                                    && tw.Function.prototype) {
+                                __topFts = tw.Function.prototype.toString;
+                            }
+                        } catch (e5) {}
+                    }
+                    if (__topFts && __topFts !== faked) {
+                        try { return __topFts.call(self); } catch (e6) {}
+                    }
+                    return __nativeToString(target, self);
+                },
+            });
+            var __nativeToStringTail = function () {
                 var s = origToString.call(this);
                 // JSC 的原生函数是 `function f() {\n    [native code]\n}`（多行缩进），
                 // V8 是单行 `function f() { [native code] }`。未登记（未被本补丁
@@ -9350,13 +9424,35 @@ _WORKER_PATCH_TEMPLATE = r"""
             var __jscName = function (n) {
                 return String(n).replace(/^(?:get|set)\s+/, '');
             };
-            var mask = function (fn, name, src) {
+            // 返回的载体必须**自身**在任何 realm 下都读作原生函数。仅靠上面的
+            // 注册表做不到：creepjs 的 `queryLies` 用 phantom iframe（二级）
+            // 的 `Function.prototype.toString` 去读主 realm 的函数，两个
+            // realm 各有一份 toString 与各一份 WeakMap，查不到就吐真源码，
+            // 连带暴露 JS 函数自带的 prototype/arguments/caller——实测
+            // Navigator 10 个成员、Screen、WebGL 全部因此记 lie。
+            // 故这里不再返回原函数，而是返回一个**方法简写**包装：简写方法
+            // 天然无 prototype、不可构造，own 属性恰是 length,name，任何
+            // realm 读源码都命中 [native code]（实测 lied:0）。构造器类
+            // 属性走 asCtor 分支保持原函数，因为 `new`/`prototype` 必须能用
+            // 而 creepjs 并不搜索构造器对象本身。
+            var mask = function (fn, name, src, asCtor) {
                 try {
                     if (typeof fn === 'function') {
-                        registry.set(fn, src || (D && D.ios
+                        var s = src || (D && D.ios
                             ? 'function ' + __jscName(name) + '() {\n    [native code]\n}'
-                            : 'function ' + name + '() { [native code] }'));
+                            : 'function ' + name + '() { [native code] }');
+                        registry.set(fn, s);
                         try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e2) {}
+                        if (asCtor) { return fn; }
+                        var w = ({ m() { return fn.apply(this, arguments); } }).m;
+                        registry.set(w, s);
+                        try { Object.defineProperty(w, 'name', { value: name, configurable: true }); } catch (e3) {}
+                        try {
+                            Object.defineProperty(w, 'length', {
+                                value: fn.length, configurable: true,
+                            });
+                        } catch (e4) {}
+                        return w;
                     }
                 } catch (e) {}
                 return fn;
@@ -10290,7 +10386,7 @@ __MC_SRC__
                 }
                 // Function.prototype.toString 的伪装要登记在对外可见的 Proxy 上，
                 // 登记内层函数会让 String(CSSUnitValue) 退回 V8 形态。
-                __maskNative(out, name);
+                __maskNative(out, name, null, true);
                 try {
                     Object.defineProperty(proto, 'constructor', {
                         value: out, writable: true, enumerable: false, configurable: true,
@@ -10594,7 +10690,7 @@ __MC_SRC__
                     construct: function () { throw new TypeError('Illegal constructor'); },
                 });
                 try { Object.defineProperty(out, 'length', { value: 0, configurable: true }); } catch (e) {}
-                __maskNative(out, 'CSSTransformComponent');
+                __maskNative(out, 'CSSTransformComponent', null, true);
                 try {
                     Object.defineProperty(proto, 'constructor', {
                         value: out, writable: true, enumerable: false, configurable: true,
@@ -10638,7 +10734,7 @@ __MC_SRC__
                         },
                     });
                     try { Object.defineProperty(out, 'length', { value: 1, configurable: true }); } catch (e) {}
-                    __maskNative(out, name);
+                    __maskNative(out, name, null, true);
                     try {
                         Object.defineProperty(proto, 'constructor', {
                             value: out, writable: true, enumerable: false, configurable: true,
@@ -11634,16 +11730,29 @@ _WORKER_LATE_TEMPLATE = r"""
                 }
                 return s;
             };
-            var mask = function (fn, name, src) {
+            var mask = function (fn, name, src, asCtor) {
                 try {
                     if (typeof fn === 'function') {
-                        registry.set(fn, src || (D.ios
+                        var s = src || (D.ios
                             ? 'function ' + name + '() {\n    [native code]\n}'
-                            : 'function ' + name + '() { [native code] }'));
+                            : 'function ' + name + '() { [native code] }');
+                        registry.set(fn, s);
                         try {
                             Object.defineProperty(fn, 'name',
                                 { value: name, configurable: true });
                         } catch (e2) {}
+                        if (asCtor) { return fn; }
+                        var w = ({ m() { return fn.apply(this, arguments); } }).m;
+                        registry.set(w, s);
+                        try {
+                            Object.defineProperty(w, 'name',
+                                { value: name, configurable: true });
+                        } catch (e3) {}
+                        try {
+                            Object.defineProperty(w, 'length',
+                                { value: fn.length, configurable: true });
+                        } catch (e4) {}
+                        return w;
                     }
                 } catch (e) {}
                 return fn;
