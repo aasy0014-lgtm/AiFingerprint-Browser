@@ -455,7 +455,11 @@ async function startProfile(id) {
     if (info.kernel === "chromium" && info.ws_endpoint) {
       toast(`已启动，CDP 端点：${info.ws_endpoint}`);
     } else toast("环境已启动");
-  } catch (e) { toast(`启动失败：${e.message}`, "err"); }
+  } catch (e) {
+    // 「已在运行 / 正在启动中」是重复点击的必然结果，不是启动失败。
+    if (/已在运行|正在启动中/.test(e.message)) toast(e.message, "ok");
+    else toast(`启动失败：${e.message}`, "err");
+  }
   await Promise.all([loadProfiles(), loadStatus()]);
 }
 

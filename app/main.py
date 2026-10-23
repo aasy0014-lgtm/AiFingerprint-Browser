@@ -925,7 +925,9 @@ async def browser_start(request: Request, body: BrowserStartRequest) -> dict:
             raise ApiError(404, result["error"])
         if result.get("code") == 403:
             raise ApiError(403, result["error"])
-        if "已在运行" in result["error"]:
+        # 「已在运行」「正在启动中」都是并发/重复点击的必然结果，不是故障：
+        # 落到 500 会让前端把用户自己的第二次点击报成启动失败。
+        if "已在运行" in result["error"] or "正在启动中" in result["error"]:
             raise ApiError(409, result["error"])
         raise ApiError(500, result["error"])
     audit("browser.start", result.get("name", body.profile_id), member=member)
