@@ -29,7 +29,8 @@ async def cdp_eval(debug_port: int, js: str):
     async with httpx.AsyncClient() as c:
         targets = (await c.get(f"http://127.0.0.1:{debug_port}/json")).json()
     page = next(t for t in targets if t["type"] == "page")
-    async with websockets.connect(page["webSocketDebuggerUrl"], max_size=8 << 20) as ws:
+    async with websockets.connect(page["webSocketDebuggerUrl"], max_size=8 << 20,
+                                  proxy=None) as ws:
         await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
                                   "params": {"expression": js, "returnByValue": True}}))
         while True:

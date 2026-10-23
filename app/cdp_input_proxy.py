@@ -144,7 +144,8 @@ class CdpInputProxy:
     async def _handle(self, client: Any) -> None:
         try:
             upstream = await websockets.connect(
-                self._upstream, max_size=_MAX_FRAME, ping_interval=None)
+                self._upstream, max_size=_MAX_FRAME, ping_interval=None,
+                proxy=None)
         except Exception as e:  # noqa: BLE001
             log.warning("CDP 输入代理无法连接上游：%s", e)
             await client.close(code=1011, reason="upstream unavailable")

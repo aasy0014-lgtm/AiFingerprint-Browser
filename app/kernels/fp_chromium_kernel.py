@@ -20,6 +20,7 @@
 """
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -198,7 +199,7 @@ async def start(
     # 加噪即回到真机口径（详见 docs/移动端大厂检测对抗优化方案.md §2.9）。
     disabled_spoofing = [s for s in (launch.fp_disable_spoofing or "").split(",") if s]
     if mobile_mode or mobile_target_os in ("android", "ios"):
-        for forced in ("canvas", "audio"):
+        for forced in ("canvas", "audio", "font"):
             if forced not in disabled_spoofing:
                 disabled_spoofing.append(forced)
     if disabled_spoofing:
@@ -320,6 +321,136 @@ def _kill(proc: subprocess.Popen) -> None:
         )
     else:
         proc.terminate()
+
+
+# ---- F-15：孤儿实例回收 ----
+# 宿主进程被 kill、探针脚本异常退出、或服务端崩溃时，浏览器子进程与
+# profile 目录锁（SingletonLock/SingletonCookie/SingletonSocket 三个符号
+# 链接）会一直留存：同一环境再次启动会撞锁，profile 目录被永久占住。
+# 这里在服务启动时扫一遍「本工作台起的浏览器进程」，只回收父进程已经
+# 不在的——父进程还活着说明那是另一个正在跑的实例（多实例部署共用
+# FPWB_HOME 时尤其要守住这条），绝不能动。
+_PROFILE_ROOT_ARG = "--user-data-dir="
+
+
+def _iter_browser_processes() -> list[tuple[int, int, str]]:
+    """(pid, ppid, user-data-dir) —— 只认命令行带 --user-data-dir 的浏览器。
+
+    额外要求 `--remote-debugging-port=`：本内核启动时必带（见 start()），
+    而包装脚本的 `python -c "...--user-data-dir=..."` 只是**提到**这个
+    字符串，不该被当成浏览器——否则回收时会把拉起它的父进程一起杀掉。
+    """
+    if sys.platform == "win32":
+        return []
+    try:
+        out = subprocess.run(  # nosec B603 无外部输入
+            ["ps", "-eo", "pid=,ppid=,args="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in out.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) < 3:
+            continue
+        pid_s, ppid_s, args = fields
+        if "--remote-debugging-port=" not in args:
+            continue
+        marker = args.find(_PROFILE_ROOT_ARG)
+        if marker < 0:
+            continue
+        data_dir = args[marker + len(_PROFILE_ROOT_ARG):].split()[0]
+        if not data_dir:
+            continue
+        try:
+            found.append((int(pid_s), int(ppid_s), data_dir))
+        except ValueError:
+            continue
+    return found
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def reclaim_orphans(profile_root: Path) -> list[int]:
+    """回收本工作台遗留的孤儿浏览器，返回被终止的 pid 列表。
+
+    判据（两条同时成立才动手）：
+      1. 浏览器进程的 --user-data-dir 落在 profile_root 下——是本工作台的；
+      2. 它的父进程已经不是本工作台的浏览器——孤儿。
+
+    只杀「父进程已消失」的：探针脚本异常退出后子进程会被 reparent 到
+    launchd(1)；而正常运行的实例父进程是 Python 服务进程，仍然存活。
+    收尾时顺手清掉 profile 目录里的三个 Singleton* 符号链接——目标
+    （hostname-pid 与临时 socket 路径）早已失效，留着会让下一次启动
+    误判「已有实例在用」。
+    """
+    # macOS 上 /tmp 是 /private/tmp 的符号链接：进程命令行里出现的可能是
+    # 任一种写法，两个前缀都要认，否则 profile 目录会被判成「不属于本工作台」。
+    roots = []
+    for candidate in (profile_root, Path(os.path.abspath(profile_root))):
+        text = str(candidate)
+        if text not in roots:
+            roots.append(text)
+        try:
+            resolved = str(candidate.resolve())
+        except OSError:
+            resolved = ""
+        if resolved and resolved not in roots:
+            roots.append(resolved)
+    if not roots:
+        return []
+
+    def _owned(data_dir: str) -> bool:
+        return any(data_dir.startswith(r + os.sep) for r in roots)
+
+    procs = _iter_browser_processes()
+    by_pid = {pid: (ppid, data_dir) for pid, ppid, data_dir in procs}
+    killed: list[int] = []
+    orphan_dirs: set[str] = set()
+    for pid, ppid, data_dir in procs:
+        if not _owned(data_dir):
+            continue
+        # 父进程仍是本工作台的浏览器 → 这是它的子进程，不是孤儿
+        parent = by_pid.get(ppid)
+        if parent is not None and _owned(parent[1]):
+            continue
+        # 父进程活着且不是 launchd：可能由探针脚本或另一个服务实例直接
+        # 拉起，归属不明，保守起见不动。
+        if ppid != 1 and _alive(ppid):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            continue
+        killed.append(pid)
+        orphan_dirs.add(data_dir)
+    if orphan_dirs:
+        _clear_singleton_links(roots, orphan_dirs)
+    return killed
+
+
+def _clear_singleton_links(roots: list, dirs: set) -> None:
+    """清掉孤儿 profile 目录里残留的 Singleton* 符号链接。"""
+    for data_dir in dirs:
+        path = Path(data_dir)
+        if not any(str(path).startswith(r + os.sep) for r in roots):
+            continue
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            link = path / name
+            try:
+                if link.is_symlink():
+                    link.unlink()
+            except OSError:
+                continue
 
 
 async def stop(instance: dict[str, Any]) -> None:

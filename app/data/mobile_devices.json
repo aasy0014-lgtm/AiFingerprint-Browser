@@ -9,7 +9,7 @@
     {"major": "154", "full": "154.0.7861.102", "weight": 16},
     {"major": "153", "full": "153.0.7763.98", "weight": 14}
   ],
-  "grease_brand": {"brand": "Not_A Brand", "version": "8"},
+  "grease_brand": {"brand": "Not/A)Brand", "version": "99"},
   "devices": [
     {
       "brand": "Samsung", "platform": "android", "type": "phone",

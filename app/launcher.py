@@ -92,11 +92,13 @@ class LaunchManager:
         return False
 
     def emulation_state(self, profile_id: str) -> Optional[str]:
-        """移动端仿真通道状态：ok / reconnecting；None = 非移动端或未运行。
+        """移动端仿真通道状态：ok / reconnecting / degraded；None = 非移动端或未运行。
 
         通道断开期间内核会还原全部 CDP 覆盖，已打开页面退化为仅 JS 补丁
         （媒体查询回落宿主值）、新标签页完全裸奔；看门狗会自动重连自愈，
-        面板据此提示用户。
+        面板据此提示用户。degraded = 通道在线但首屏读数校验失败
+        （maxTouchPoints/pointer 不符），即 F-01 那种「浏览器起来了但一条
+        仿真都没挂上」的静默失效形态。
         """
         inst = self._running.get(profile_id)
         if inst is None:
@@ -104,7 +106,9 @@ class LaunchManager:
         sess = inst.extra.get("mobile_session")
         if sess is None:
             return None
-        return "ok" if sess.healthy else "reconnecting"
+        if not sess.healthy:
+            return "reconnecting"
+        return "degraded" if sess.emulation_verified is False else "ok"
 
     async def start(
         self,
@@ -256,9 +260,11 @@ class LaunchManager:
                     # 桌面环境不建立移动仿真会话：内核 info 的 mobile_ua 字段对
                     # 桌面环境同样有值（通用 UA 回填），不能作为「需要移动仿真」的
                     # 判据——否则桌面 fp-chromium 启动会因缺少屏幕尺寸而失败。
-                    elif is_mobile and (viewport or ua):
+                    elif is_mobile:
                         mobile_session = MobileEmulationSession(
                             info["ws_endpoint"],
+                            fingerprint=None,
+                            target_os=target_os,
                             viewport=viewport, dpr=dpr, ua=ua, platform=platform,
                             max_touch_points=max_touch,
                             locale=launch.locale or "",

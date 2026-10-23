@@ -277,8 +277,8 @@ async def run_one(target_os: str, browser: str | None) -> None:
                           and battery is None, json.dumps(battery)[:80])
                     check("iOS 无 NetworkInformation",
                           state["hasConnection"] is False)
-                    check("iOS 无 pdfViewerEnabled",
-                          state["pdfViewer"] is None, str(state["pdfViewer"]))
+                    check("iOS pdfViewerEnabled === true（Safari 16.4+ 能力位）",
+                          state["pdfViewer"] is True, str(state["pdfViewer"]))
                     check("iOS UA 口径正确",
                           ("CriOS/" in state["ua"]) if browser == "chrome_ios"
                           else ("CriOS/" not in state["ua"] and "Safari/" in state["ua"]),

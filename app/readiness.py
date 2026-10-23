@@ -77,7 +77,8 @@ class _CdpPage:
             r = await c.put(f"http://127.0.0.1:{self.port}/json/new?about:blank", timeout=10)
             info = r.json()
         self.target_id = info["id"]
-        self.ws = await websockets.connect(info["webSocketDebuggerUrl"], max_size=8 << 20)
+        self.ws = await websockets.connect(
+            info["webSocketDebuggerUrl"], max_size=8 << 20, proxy=None)
 
     async def _send(self, method: str, params: dict | None = None) -> dict:
         self._id += 1

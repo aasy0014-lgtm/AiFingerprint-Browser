@@ -13,8 +13,8 @@
   6. Android：navigator.userAgentData（UA-CH）完整可用 + Sec-CH-UA* 请求头；
      architecture/bitness 恒为空字符串（Chromium 源码的 Android 手机端行为）
   7. Android：navigator.deviceMemory（上报桶）+ Battery API（数值一致）
-  8. iOS Safari：navigator.userAgentData / connection / pdfViewerEnabled 不存在，
-     plugins/mimeTypes 为空，navigator.standalone 存在且为 false，
+  8. iOS Safari：navigator.userAgentData / connection 不存在，
+     plugins/mimeTypes 为空、pdfViewerEnabled 为 true（Safari 16.4+），navigator.standalone 存在且为 false，
      无 __gCrWeb / webkit.messageHandlers
   8b. iOS Chrome（CriOS）：UA 含 CriOS、__gCrWeb（windowId + 成员族）、
      webkit.messageHandlers、被改写的 history/print/scrollTo（toString 痕迹）
@@ -56,7 +56,12 @@ from app.config import ensure_dirs
 from app.fingerprint_engine import create_fingerprint
 from app.kernels.fp_chromium_kernel import is_available
 from app.launcher import LaunchManager
-from app.mobile_cdp_injector import derive_spec, sec_ch_headers
+from app.mobile_cdp_injector import (
+    _parse_ios_version,
+    derive_spec,
+    sec_ch_headers,
+)
+from app.mobile_fingerprints import _ios_av1_capable, _IOS_WORKER_NAV_PROTO
 
 STATE_JS = """async () => {
     const nav = navigator;
@@ -188,9 +193,302 @@ STATE_JS = """async () => {
         hasMidiAccess: typeof nav.requestMIDIAccess === 'function',
         hasPresentation: 'presentation' in nav,
         hasRelatedApps: typeof nav.getInstalledRelatedApps === 'function',
+        // F-87：无手柄时真机 WebKit 返回 []（length 0），Blink 固定 4 槽位。
+        gamepads: (function () {
+            try {
+                var g = nav.getGamepads();
+                return [Array.isArray(g), g.length,
+                        Array.prototype.map.call(g, function (x) {
+                            return x === null ? 'null' : typeof x; })[0] || null,
+                        nav.getGamepads.length];
+            } catch (e) { return 'err'; }
+        })(),
         hasVibrate: typeof nav.vibrate === 'function',
+        // F-92：iOS 无 Gamepad 震动扩展（WebKit 开关默认 false）
+        gamepadVibActuator: (typeof Gamepad === 'undefined')
+            ? false : ('vibrationActuator' in Gamepad.prototype),
         hasOpenFilePicker: typeof window.showOpenFilePicker === 'function',
         hasPerfMemory: typeof performance.memory !== 'undefined',
+        // ---- F-04 / F-05 / F-08 / F-09 / F-10：桌面 Chromium 残留面 ----
+        hasDoNotTrack: 'doNotTrack' in nav,
+        hasScheduling: 'scheduling' in nav,
+        hasStorageBuckets: 'storageBuckets' in nav,
+        hasWco: 'windowControlsOverlay' in nav,
+        // 反向保留：iOS 真机存在的成员不得误删
+        // F-90：setAppBadge/clearAppBadge 由 AppBadgeEnabled 门控，iOS 默认关，
+        // 普通浏览上下文缺席（Android 侧 setAppBadge 亦缺席，见 F-78）。
+        hasSetAppBadge: typeof nav.setAppBadge === 'function',
+        hasClearAppBadge: typeof nav.clearAppBadge === 'function',
+        hasDevicePosture: 'devicePosture' in nav,
+        gExternal: typeof window.External,
+        gInputDeviceCaps: typeof window.InputDeviceCapabilities,
+        gStyleMedia: typeof window.styleMedia,
+        gCrashReport: typeof window.crashReport,
+        gViewport: typeof window.viewport,
+        gCredentialless: typeof window.credentialless,
+        gUAData: typeof window.NavigatorUAData,
+        gNetworkInfo: typeof window.NetworkInformation,
+        gBackgroundFetch: typeof window.BackgroundFetchManager,
+        gSyncManager: typeof window.SyncManager,
+        gBeforeInstall: typeof window.BeforeInstallPromptEvent,
+        gWco: typeof window.WindowControlsOverlay,
+        gIdleCb: typeof window.requestIdleCallback,
+        gEditContext: typeof window.EditContext,
+        gSanitizer: typeof window.Sanitizer,
+        gLaunchQueue: typeof window.LaunchQueue,
+        gSuppressedError: typeof window.SuppressedError,
+        gDisposableStack: typeof window.DisposableStack,
+        gWebSocketError: typeof window.WebSocketError,
+        gWebkitMediaStream: typeof window.webkitMediaStream,
+        gWebkitRTCPeer: typeof window.webkitRTCPeerConnection,
+        gWebkitSpeechGrammar: typeof window.webkitSpeechGrammar,
+        // 反向保留：iOS 真机支持的接口对象
+        gBarcodeDetector: typeof window.BarcodeDetector,
+        gPaymentRequest: typeof window.PaymentRequest,
+        gSpeechRecognition: typeof window.SpeechRecognition,
+        gTrackProcessor: typeof window.MediaStreamTrackProcessor,
+        gDigitalCredential: typeof window.DigitalCredential,
+        gDevicePostureCtor: typeof window.DevicePosture,
+        // F-82：WebGPU 整族按 iOS 版本门控（BCD safari_ios=26）。抽样三类：
+        // navigator 成员、接口对象、常量命名空间；再给一个整族在册计数。
+        hasNavigatorGpu: 'gpu' in nav,
+        gGPU: typeof window.GPU,
+        gGPUAdapter: typeof window.GPUAdapter,
+        gGPUCanvasContext: typeof window.GPUCanvasContext,
+        gGPUBufferUsage: typeof window.GPUBufferUsage,
+        gpuFamilyCount: (function () {
+            var ns = ["GPU", "GPUAdapter", "GPUAdapterInfo", "GPUBindGroup",
+                "GPUBindGroupLayout", "GPUBuffer", "GPUBufferUsage",
+                "GPUCanvasContext", "GPUColorWrite", "GPUCommandBuffer",
+                "GPUCommandEncoder", "GPUCompilationInfo", "GPUCompilationMessage",
+                "GPUComputePassEncoder", "GPUComputePipeline", "GPUDevice",
+                "GPUDeviceLostInfo", "GPUExternalTexture", "GPUInternalError",
+                "GPUMapMode", "GPUOutOfMemoryError", "GPUPipelineError",
+                "GPUPipelineLayout", "GPUQuerySet", "GPUQueue", "GPURenderBundle",
+                "GPURenderBundleEncoder", "GPURenderPassEncoder", "GPURenderPipeline",
+                "GPUSampler", "GPUShaderModule", "GPUShaderStage",
+                "GPUSupportedFeatures", "GPUSupportedLimits", "GPUTexture",
+                "GPUTextureUsage", "GPUTextureView", "GPUUncapturedErrorEvent",
+                "GPUValidationError", "WGSLLanguageFeatures"];
+            var n = 0;
+            for (var i = 0; i < ns.length; i++) { if (typeof window[ns[i]] !== 'undefined') { n++; } }
+            return n;
+        })(),
+        // F-85 余量族（WebTransport / Trusted Types / Navigation / WebCodecs
+        // 音频侧 / CSS Position-Try / Streams BYOB / 单丁）——全部 BCD 26.x。
+        gated26: (function () {
+            var ns = ["WebTransport", "WebTransportBidirectionalStream",
+                "WebTransportDatagramDuplexStream", "WebTransportError",
+                "TrustedHTML", "TrustedScript", "TrustedScriptURL",
+                "TrustedTypePolicy", "TrustedTypePolicyFactory", "trustedTypes",
+                "Navigation", "NavigateEvent", "NavigationActivation",
+                "NavigationCurrentEntryChangeEvent", "NavigationDestination",
+                "NavigationHistoryEntry", "NavigationTransition", "navigation",
+                "AudioData", "AudioDecoder", "AudioEncoder", "EncodedAudioChunk",
+                "CSSPositionTryDescriptors", "CSSPositionTryRule",
+                "ReadableByteStreamController", "ReadableStreamBYOBReader",
+                "ReadableStreamBYOBRequest", "CaretPosition", "CommandEvent",
+                "EventCounts", "FileSystemWritableFileStream",
+                "LargestContentfulPaint", "Origin", "PerformanceEventTiming",
+                "ScrollTimeline", "URLPattern", "ViewTimeline"];
+            var out = {};
+            for (var i = 0; i < ns.length; i++) {
+                out[ns[i]] = typeof window[ns[i]];
+            }
+            return out;
+        })(),
+        // ---- F-40 / F-49 / F-51 / F-52 / F-55 / F-56：对象子属性与返回值面 ----
+        mdGdm: typeof (navigator.mediaDevices || {}).getDisplayMedia,
+        paintWorklet: typeof (window.CSS && CSS.paintWorklet),
+        selectShowPicker: typeof HTMLSelectElement.prototype.showPicker,
+        inputShowPicker: typeof HTMLInputElement.prototype.showPicker,
+        canvasWebp: (function () {
+            try {
+                var c = document.createElement('canvas');
+                c.width = 8; c.height = 8;
+                return c.toDataURL('image/webp').slice(0, 16);
+            } catch (e) { return 'err'; }
+        })(),
+        canvasAvif: (function () {
+            try {
+                var c = document.createElement('canvas');
+                c.width = 8; c.height = 8;
+                return c.toDataURL('image/avif').slice(0, 16);
+            } catch (e) { return 'err'; }
+        })(),
+        mrWebm: MediaRecorder.isTypeSupported('video/webm'),
+        mrVp8: MediaRecorder.isTypeSupported('video/webm;codecs=vp8'),
+        mrVp9Opus: MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus'),
+        mrWebmH264: MediaRecorder.isTypeSupported('video/webm;codecs=h264'),
+        mrMp4: MediaRecorder.isTypeSupported('video/mp4'),
+        ctx2dAttrs: (function () {
+            try {
+                var c = document.createElement('canvas');
+                return Object.keys(c.getContext('2d').getContextAttributes()).sort();
+            } catch (e) { return null; }
+        })(),
+        // ---- F-58 / F-59 / F-60 / F-61：事件 legacy 面与命令面 ----
+        uiEventProto: Object.getOwnPropertyNames(UIEvent.prototype).sort(),
+        uiPageX: (function () {
+            try { return 'pageX' in new UIEvent('x'); } catch (e) { return null; }
+        })(),
+        animHasAnimation: (function () {
+            try { return 'animation' in new AnimationEvent('x'); } catch (e) { return null; }
+        })(),
+        transHasAnimation: (function () {
+            try { return 'animation' in new TransitionEvent('x'); } catch (e) { return null; }
+        })(),
+        execCopyNoSel: (function () {
+            try { return document.execCommand('copy'); } catch (e) { return null; }
+        })(),
+        acStateNoGesture: (function () {
+            try {
+                var C = window.AudioContext || window.webkitAudioContext;
+                return C ? new C().state : null;
+            } catch (e) { return 'err'; }
+        })(),
+        qcsPaste: document.queryCommandSupported('paste'),
+        // ---- F-43：zh/ja 排版口径（星期空格 / 时区名空格 / dayPeriod）----
+        intlZh: (function () {
+            try {
+                var tz = 'America/Los_Angeles';
+                // 固定 UTC 时刻：断言不随宿主时区漂移
+                var d = new Date(Date.UTC(2026, 9, 20, 6, 5, 9)); // 23:05 LA
+                var mk = function (loc, o) {
+                    return new Intl.DateTimeFormat(loc,
+                        Object.assign({ timeZone: tz }, o));
+                };
+                var full = mk('zh-CN', { dateStyle: 'full', timeStyle: 'full' });
+                var dateFull = mk('zh-CN', { dateStyle: 'full' });
+                var timeFull = mk('zh-CN', { timeStyle: 'full' });
+                var h12 = mk('zh-CN', { dateStyle: 'full', timeStyle: 'full',
+                                        hour12: true });
+                var out = {
+                    full: full.format(d),
+                    dateFull: dateFull.format(d),
+                    timeFull: timeFull.format(d),
+                    h12: h12.format(d),
+                    tls: d.toLocaleString('zh-CN',
+                        { timeZone: tz, dateStyle: 'full', timeStyle: 'full' }),
+                    join: full.format(d) === full.formatToParts(d)
+                        .map(function (p) { return p.value; }).join(''),
+                    tldErr: (function () {
+                        try {
+                            d.toLocaleDateString('zh-CN',
+                                { timeZone: tz, timeStyle: 'full' });
+                            return false;
+                        } catch (e) { return e instanceof TypeError; }
+                    })(),
+                    fmtGetter: typeof Object.getOwnPropertyDescriptor(
+                        Intl.DateTimeFormat.prototype, 'format').get,
+                    fmtIsFn: typeof full.format,
+                    fmtLen: full.format.length,
+                };
+                // 各 locale 的星期空格口径（真机 WebKit）
+                out.locales = {};
+                ['zh-CN', 'zh-Hans-CN', 'zh-SG', 'zh-HK', 'zh-MO', 'zh-TW',
+                 'zh-Hant', 'zh-Hant-HK', 'ja-JP'].forEach(function (loc) {
+                    out.locales[loc] = {
+                        dateFull: mk(loc, { dateStyle: 'full' }).format(d),
+                        exp: mk(loc, { year: 'numeric', month: 'long',
+                                       day: 'numeric', weekday: 'long' })
+                            .format(d),
+                        dy: mk(loc, { day: 'numeric', weekday: 'long' })
+                            .format(d),
+                        narrow: mk(loc, { year: 'numeric', month: 'long',
+                                          day: 'numeric', weekday: 'narrow' })
+                            .format(d),
+                        // 时区名位置：显式 timeZoneName 时真机把名字提到
+                        // 时刻之前（港澳台繁），dateStyle 路径只有台繁提
+                        tzExp: mk(loc, { hour: 'numeric', minute: '2-digit',
+                                         timeZoneName: 'short' }).format(d),
+                        tzStyle: mk(loc, { dateStyle: 'full',
+                                           timeStyle: 'full' }).format(d),
+                    };
+                });
+                // 日文：带分钟时星期前置，12 小时制里 12 时写作「0 时」
+                out.ja = {
+                    reorder: mk('ja-JP', { weekday: 'long', hour: 'numeric',
+                                           minute: '2-digit' }).format(d),
+                    zero: mk('ja-JP', { hour: 'numeric', hour12: true })
+                        .format(new Date(Date.UTC(2026, 9, 20, 19, 5, 9))),
+                };
+                // 简-SG（新马）默认 12 小时制，且时区名后无空格
+                out.sg = {
+                    full: mk('zh-SG', { dateStyle: 'full', timeStyle: 'full' })
+                        .format(d),
+                    week: mk('zh-SG', { weekday: 'long', hour: 'numeric',
+                                        minute: '2-digit' }).format(d),
+                };
+                // 逐时 dayPeriod（本地小时 → 真机分区值）
+                out.dpHours = {};
+                var f24 = new Intl.DateTimeFormat('en-US', {
+                    timeZone: tz, hour: '2-digit', hourCycle: 'h23' });
+                ['zh-CN', 'zh-TW', 'zh-HK'].forEach(function (loc) {
+                    var f = mk(loc, { hour: 'numeric', minute: '2-digit',
+                                      hour12: true });
+                    var rows = [];
+                    for (var u = 0; u < 48; u++) {
+                        var dd = new Date(Date.UTC(2026, 9, 19, 0, u * 30, 9));
+                        var lh = parseInt(f24.format(dd), 10);
+                        if (rows[lh]) { continue; }
+                        rows[lh] = f.format(dd).replace(/[0-9:]/g, '');
+                    }
+                    out.dpHours[loc] = rows;
+                });
+                // formatRange 两端各自取 dayPeriod（不含时区名：区间模板
+                // 的分隔符与时区名位置是另一套 CLDR 数据，不属于本项）
+                var a = new Date(Date.UTC(2026, 9, 20, 6, 5, 9));
+                var b = new Date(Date.UTC(2026, 9, 20, 18, 5, 9));
+                var rf = mk('zh-CN', { hour: 'numeric', minute: '2-digit',
+                                       hour12: true });
+                out.range = rf.formatRange(a, b);
+                out.rangeJoin = out.range === rf.formatRangeToParts(a, b)
+                    .map(function (p) { return p.value; }).join('');
+                // 非 zh/ja 不受影响（CLDR 数据差异不属于本项）
+                out.en = mk('en-US', { dateStyle: 'full', timeStyle: 'full' })
+                    .format(d);
+                return out;
+            } catch (e) { return 'ERR:' + e; }
+        })(),
+        // ---- F-48：visualViewport 与 innerHeight 的关系 ----
+        innerH: window.innerHeight,
+        vvH: (window.visualViewport ? window.visualViewport.height : null),
+        // ---- F-46 / F-47：控件 UA 样式表计算值 ----
+        uaFormStyles: (function () {
+            try {
+                var host = document.createElement('div');
+                host.style.cssText = 'position:fixed;left:-9999px;top:0';
+                document.body.appendChild(host);
+                var out = {};
+                ['textarea', 'input', 'select', 'button'].forEach(function (t) {
+                    var el = document.createElement(t);
+                    if (t === 'input') { el.type = 'text'; }
+                    host.appendChild(el);
+                    var cs = getComputedStyle(el);
+                    out[t] = {
+                        fontFamily: cs.fontFamily,
+                        fontSize: cs.fontSize,
+                        overflow: cs.overflow,
+                        userSelect: cs.getPropertyValue('-webkit-user-select')
+                            || cs.userSelect,
+                        height: cs.height,
+                    };
+                });
+                out.bodyUserSelect = getComputedStyle(document.body)
+                    .getPropertyValue('-webkit-user-select')
+                    || getComputedStyle(document.body).userSelect;
+                return out;
+            } catch (e) { return null; }
+        })(),
+        evSearch: 'onsearch' in window,
+        evContextLost: 'oncontextlost' in window,
+        evContextRestored: 'oncontextrestored' in window,
+        evBeforeInstall: 'onbeforeinstallprompt' in window,
+        evAppInstalled: 'onappinstalled' in window,
+        docWebkitHidden: 'webkitHidden' in document,
+        docWebkitVisibility: 'webkitVisibilityState' in document,
+        screenIsExtended: 'isExtended' in screen,
         pdfViewerValue: nav.pdfViewerEnabled,
         connTypeIn: !!(nav.connection && ('type' in nav.connection)),
         connType: (nav.connection && ('type' in nav.connection)) ? nav.connection.type : null,
@@ -248,6 +546,75 @@ STATE_JS = """async () => {
                 })(),
             };
         })(),
+        // ---- F-130 / F-134：ManagedMediaSource 静态 isTypeSupported ----
+        mms: (function () {
+            var C = window.ManagedMediaSource;
+            if (typeof C !== 'function') { return {absent: true}; }
+            var d = Object.getOwnPropertyDescriptor(C, 'isTypeSupported');
+            var out = {
+                absent: false,
+                type: typeof C.isTypeSupported,
+                own: !!d,
+                desc: d ? [d.enumerable, d.configurable, d.writable, typeof d.value] : null,
+                length: (typeof C.isTypeSupported === 'function') ? C.isTypeSupported.length : null,
+                native: (typeof C.isTypeSupported === 'function') ? nativeStr(C.isTypeSupported) : null,
+                inheritsMS: Object.getPrototypeOf(C) === window.MediaSource,
+            };
+            if (typeof C.isTypeSupported !== 'function') { return out; }
+            var probe = function (t) {
+                try { return C.isTypeSupported(t); } catch (e) { return 'ERR:' + e.name; }
+            };
+            out.cases = {
+                mp4: probe('video/mp4'),
+                mp4Codecs: probe('video/mp4; codecs="avc1.42E01E"'),
+                audioMp4: probe('audio/mp4'),
+                mp2t: probe('video/mp2t'),
+                webm: probe('video/webm'),
+                webmVp9: probe('video/webm; codecs="vp9"'),
+                audioWebm: probe('audio/webm'),
+                ogg: probe('audio/ogg'),
+                mkv: probe('video/x-matroska'),
+                upper: probe('VIDEO/MP4'),
+                spaces: probe('  video/mp4  '),
+                // F-142 验收串（清单 §46）：MediaSource 与 ManagedMediaSource
+                // 同表，逐条固定 ledger 里点名的取值。
+                webmVp8: probe('video/webm;codecs=vp8'),
+                webmVp9NoQ: probe('video/webm;codecs=vp9'),
+                webmVp9Full: probe('video/webm;codecs="vp09.00.10.08"'),
+                webmOpus: probe('audio/webm;codecs="opus"'),
+                mp4Dovi: probe('video/mp4;codecs="dvh1.05.06"'),
+                mp4Opus: probe('audio/mp4;codecs="opus"'),
+                mp4Flac: probe('audio/mp4;codecs="flac"'),
+                mp4Av1: probe('video/mp4;codecs="av01.0.05M.08"'),
+            };
+            try { C.isTypeSupported(); out.noArg = 'no-throw'; }
+            catch (e) { out.noArg = e.name + ':' + e.message; }
+            out.undef = probe(undefined);
+            out.nul = probe(null);
+            // 与 MediaSource 同源：同一串两面必须一致
+            out.msMp4 = MediaSource.isTypeSupported('video/mp4');
+            out.msWebm = MediaSource.isTypeSupported('video/webm');
+            // F-142：MediaSource 是**另一个**自有静态（真机实测两者
+            // 各自 length 1、函数不校验 this），必须单独包装、单独验收。
+            out.msCases = {
+                webmVp9: (function () {
+                    try { return MediaSource.isTypeSupported('video/webm;codecs=vp9'); }
+                    catch (e) { return 'ERR:' + e.name; }
+                })(),
+                webmVp8: MediaSource.isTypeSupported('video/webm;codecs=vp8'),
+                webmOpus: MediaSource.isTypeSupported('audio/webm;codecs="opus"'),
+                ogg: MediaSource.isTypeSupported('audio/ogg'),
+                // F-123：MSE 的 av01 与 canPlayType 面同步跟随机型能力位
+                mp4Av1: MediaSource.isTypeSupported('video/mp4;codecs="av01.0.05M.08"'),
+                noArg: (function () {
+                    try { MediaSource.isTypeSupported(); return 'no-throw'; }
+                    catch (e) { return e.name + ':' + e.message; }
+                })(),
+            };
+            out.msLen = MediaSource.isTypeSupported.length;
+            out.msNative = nativeStr(MediaSource.isTypeSupported);
+            return out;
+        })(),
         // ---- WebGL 参数上限与扩展集（P2-1）：桌面专属扩展必须缺席 ----
         webglSurface: (function () {
             var o = {extCount: null, exts: null, limits: {}, getExtS3tc: null,
@@ -261,7 +628,18 @@ STATE_JS = """async () => {
                 o.exts = exts;
                 o.getExtS3tc = g.getExtension('WEBGL_compressed_texture_s3tc');
                 o.getExtCaseInsensitive = g.getExtension('webgl_compressed_texture_S3TC');
+                o.getExtS3tcBool = !!o.getExtS3tc;
+                o.getExtCaseInsensitiveBool = !!o.getExtCaseInsensitive;
                 o.getExtAstc = !!g.getExtension('WEBGL_compressed_texture_astc');
+                o.getExtPvrtc = !!g.getExtension('WEBKIT_WEBGL_compressed_texture_pvrtc');
+                try {
+                    var pv = g.getExtension('WEBKIT_WEBGL_compressed_texture_pvrtc');
+                    o.pvrtcConst = pv ? pv.COMPRESSED_RGBA_PVRTC_4BPPV1_IMG : null;
+                } catch (e) { o.pvrtcConst = 'ERR'; }
+                o.hasTimerQuery = exts.some(function (x) { return /disjoint_timer_query/i.test(x); });
+                o.glVersion = g.getParameter(g.VERSION);
+                o.glSL = g.getParameter(g.SHADING_LANGUAGE_VERSION);
+                o.ctxAttrs = Object.keys(g.getContextAttributes()).sort();
                 var P = function (n) {
                     try { var v = g.getParameter(g[n]); return (v && v.length !== undefined) ? Array.from(v) : v; }
                     catch (e) { return 'ERR'; }
@@ -282,6 +660,9 @@ STATE_JS = """async () => {
                     var e2 = g2.getSupportedExtensions() || [];
                     o.gl2ExtCount = e2.length;
                     o.gl2HasS3tc = e2.some(function (x) { return /s3tc/i.test(x); });
+                    o.gl2HasTimer = e2.some(function (x) { return /disjoint_timer_query/i.test(x); });
+                    o.gl2Version = g2.getParameter(g2.VERSION);
+                    o.gl2SL = g2.getParameter(g2.SHADING_LANGUAGE_VERSION);
                 }
             } catch (e) { o.error = String(e); }
             return o;
@@ -353,6 +734,166 @@ STATE_JS = """async () => {
             cssOscOneArg: CSS.supports('-webkit-overflow-scrolling: touch'),
             cssNativeTrue: CSS.supports('display', 'grid'),
             cssNativeFalse: CSS.supports('display', 'bogusvalue'),
+            // ---- F-07 / F-24：双向差集（deny 桌面独有 / allow WebKit 独有）----
+            cssDenyInterpolate: CSS.supports('interpolate-size', 'allow-keywords'),
+            cssDenyOverflowClip: CSS.supports('overflow-clip-margin', '4px'),
+            cssDenyCornerShape: CSS.supports('corner-shape', 'superellipse(1.2)'),
+            cssDenyReadingFlow: CSS.supports('reading-flow', 'grid-rows'),
+            cssDenyHostContext: CSS.supports('selector(:host-context(a))'),
+            cssAllowMarginTrim: CSS.supports('margin-trim', 'block'),
+            cssAllowTextAutospace: CSS.supports('text-autospace', 'ideograph-alpha'),
+            cssAllowBackdrop: CSS.supports('-webkit-backdrop-filter', 'blur(4px)'),
+            cssAllowSticky: CSS.supports('position', '-webkit-sticky'),
+            cssAllowHyphens: CSS.supports('-webkit-hyphens', 'auto'),
+            cssAllowApplePay: CSS.supports('-apple-pay-button-style', 'black'),
+            cssAllowMarginTrimCond: CSS.supports('(margin-trim: block)'),
+            cssDenyInterpolateCond: CSS.supports('(interpolate-size: allow-keywords)'),
+            // F-88：WebKit 专有属性必须校验值合法性（真机 notavalue 一律 false）
+            cssBadMarginTrim: CSS.supports('margin-trim', 'notavalue'),
+            cssBadTextAutospace: CSS.supports('text-autospace', 'notavalue'),
+            cssBadBackdrop: CSS.supports('-webkit-backdrop-filter', 'notavalue'),
+            cssBadHyphens: CSS.supports('-webkit-hyphens', 'notavalue'),
+            cssBadApplePay: CSS.supports('-apple-pay-button-style', 'notavalue'),
+            cssBadMarginTrimCond: CSS.supports('(margin-trim: notavalue)'),
+            cssBadBackdropCond: CSS.supports('(-webkit-backdrop-filter: notavalue)'),
+            // 合法值域的边界：inline 不在 margin-trim 值域、blur 必须带单位
+            cssMarginTrimInline: CSS.supports('margin-trim', 'inline'),
+            cssBackdropUnitless: CSS.supports('-webkit-backdrop-filter', 'blur(4)'),
+            cssBackdropMulti: CSS.supports('-webkit-backdrop-filter',
+                                           'blur(4px) brightness(50%)'),
+            cssMarginTrimCombo: CSS.supports('margin-trim',
+                                             'block-end block-start'),
+            cssTextAutospaceCombo: CSS.supports('text-autospace',
+                                                'ideograph-alpha ideograph-numeric'),
+            // F-101：复合条件里的非前缀 allow 项也要走改写（此前只有
+            // -webkit- 前缀键进 __wkPropNames，margin-trim 会落回原生 Blink）
+            cssComboMarginTrim: CSS.supports(
+                '(color: red) and (margin-trim: block)'),
+            cssComboMarginTrimBad: CSS.supports(
+                '(color: red) and (margin-trim: notavalue)'),
+            cssComboTextAutospace: CSS.supports(
+                '(text-autospace: ideograph-alpha) or (color: red)'),
+            cssComboHyphens: CSS.supports(
+                '(color: red) and (-webkit-hyphens: auto)'),
+            // F-98：WebKit 专有属性在 inline 声明里的读写 / 枚举 / computed
+            // 回读。真机口径（Playwright WebKit 27.2 移动上下文实测）：
+            // -webkit-hyphens 的规范名是 hyphens；-apple-pay-button-style 有
+            // 驼峰访问器（其余专有属性在 27.2 上已无驼峰名）；
+            // position: -webkit-sticky 的 inline 保留原文、computed 归一为
+            // sticky。
+            cssF98: (() => {
+                const el = document.createElement('div');
+                el.style.setProperty('color', 'red');
+                el.style.setProperty('-webkit-backdrop-filter', 'blur(4px)');
+                el.style.setProperty('margin-trim', 'block');
+                el.style.setProperty('-webkit-hyphens', 'auto');
+                el.style.setProperty('-apple-pay-button-style', 'black');
+                el.style.setProperty('margin-trim', 'notavalue');
+                document.body.appendChild(el);
+                const st = el.style;
+                const cs = getComputedStyle(el);
+                const items = [];
+                for (let i = 0; i < st.length; i++) { items.push(st[i]); }
+                const stick = document.createElement('div');
+                stick.style.setProperty('position', '-webkit-sticky');
+                document.body.appendChild(stick);
+                const out = {
+                    len: st.length,
+                    items: items,
+                    itemAt: st.item(1),
+                    inlineMT: st.getPropertyValue('margin-trim'),
+                    inlinePay: st.applePayButtonStyle,
+                    inlineHyphens: st.getPropertyValue('-webkit-hyphens'),
+                    compMT: cs.getPropertyValue('margin-trim'),
+                    compPay: cs.applePayButtonStyle,
+                    compHyphens: cs.getPropertyValue('-webkit-hyphens'),
+                    stickyInline: stick.style.getPropertyValue('position'),
+                    stickyComp: getComputedStyle(stick)
+                        .getPropertyValue('position'),
+                    removed: st.removeProperty('-webkit-backdrop-filter'),
+                    lenAfter: st.length,
+                    emptyIn: (0 in document.createElement('div').style),
+                };
+                el.remove();
+                stick.remove();
+                return out;
+            })(),
+            // F-99 / F-100：computed 值的序列化口径与 UA 默认值。真机口径
+            // （Playwright WebKit 27.2 移动上下文实测，含 rtl / vertical-rl /
+            // display:none 分支）：布局长度走 1/64px LayoutUnit（物理右侧外边距
+            // 例外，走 float32）；其余长度是 float32 按 %.6f 打印后去尾零；
+            // outline/border 宽度整数截断；-webkit-locale 是未加引号的 ident；
+            // 表单控件的 computed line-height 是 normal、cursor 文本类 auto /
+            // 按钮类 default。
+            cssF99: (() => {
+                const mk = (css, tag) => {
+                    const e = document.createElement(tag || 'div');
+                    if (css) e.setAttribute('style', css);
+                    document.body.appendChild(e);
+                    return e;
+                };
+                const d = mk('width:21.44px;height:33.3px;margin:21.44px;'
+                    + 'padding:21.44px;line-height:1.7;font-size:16px;'
+                    + 'border:1.5px solid;outline:2.5px solid;'
+                    + 'outline-offset:1.5px');
+                const c = getComputedStyle(d);
+                const rtl = mk('direction:rtl;margin-inline-start:21.44px;'
+                    + 'margin-inline-end:21.44px;margin-block-start:21.44px');
+                const cr = getComputedStyle(rtl);
+                const vert = mk('writing-mode:vertical-rl;margin:21.44px');
+                const cv = getComputedStyle(vert);
+                const hidden = mk('display:none;width:33.3px;margin:21.44px');
+                const ch = getComputedStyle(hidden);
+                const ell = mk('border-radius:10px/20px');
+                const inlineEl = mk('width:33.3px;line-height:1.7;'
+                    + 'margin-right:21.44px');
+                const out = {
+                    width: c.width,
+                    height: c.height,
+                    margin: c.margin,
+                    marginRight: c.marginRight,
+                    padding: c.padding,
+                    lineHeight: c.lineHeight,
+                    fontSize: c.fontSize,
+                    borderWidth: c.borderTopWidth,
+                    outlineWidth: c.outlineWidth,
+                    outlineOffset: c.outlineOffset,
+                    rtlInlineStart: cr.marginInlineStart,
+                    rtlInlineEnd: cr.marginInlineEnd,
+                    rtlBlockStart: cr.marginBlockStart,
+                    vertBlockStart: cv.marginBlockStart,
+                    vertBlockEnd: cv.marginBlockEnd,
+                    hiddenWidth: ch.width,
+                    hiddenMargin: ch.margin,
+                    radiusSlash: getComputedStyle(ell).borderRadius,
+                    inlineWidth: inlineEl.style.width,
+                    inlineLineHeight: inlineEl.style.lineHeight,
+                    compWidth: getComputedStyle(inlineEl).width,
+                    compLineHeight: getComputedStyle(inlineEl).lineHeight,
+                    locale: c.getPropertyValue('-webkit-locale'),
+                    localeCamel: c.webkitLocale,
+                    marginVP: c.getPropertyValue('margin-top'),
+                    marginCamel: c.marginTop,
+                };
+                for (const t of ['checkbox', 'radio', 'range', 'color',
+                                 'file', 'date']) {
+                    const i = document.createElement('input');
+                    i.type = t;
+                    document.body.appendChild(i);
+                    out['cur_' + t] = getComputedStyle(i).cursor;
+                    out['lh_' + t] = getComputedStyle(i).lineHeight;
+                }
+                const bt = mk('', 'button');
+                out.btnLH = getComputedStyle(bt).lineHeight;
+                out.btnCursor = getComputedStyle(bt).cursor;
+                const ta = mk('', 'textarea');
+                out.taLH = getComputedStyle(ta).lineHeight;
+                out.taCursor = getComputedStyle(ta).cursor;
+                const sel = mk('', 'select');
+                out.selLH = getComputedStyle(sel).lineHeight;
+                out.selCursor = getComputedStyle(sel).cursor;
+                return out;
+            })(),
             tcInStyle: 'webkitTouchCallout' in document.body.style,
             oscInStyle: 'webkitOverflowScrolling' in document.body.style,
             tcDefault: document.body.style.webkitTouchCallout,
@@ -626,11 +1167,22 @@ STATE_JS = """async () => {
                         'scheduler', 'OTPCredential', 'Ink', 'MediaStreamTrackGenerator',
                         'sharedStorage', 'SharedStorage', 'fence', 'Fence',
                         'HTMLFencedFrameElement', 'showSaveFilePicker',
-                        'showDirectoryPicker']),
+                        'showDirectoryPicker',
+                        // F-92：入口删了但类名仍在的漏项（BCD safari_ios=false
+                        // + Playwright WebKit 27.2 缺席 + 内核暴露）
+                        'PresentationAvailability', 'StorageBucket',
+                        // F-92：Gamepad 震动面。WebKit 的 GamepadVibrationActuatorEnabled
+                        // 默认值在 iOS 恒 false（仅 PLATFORM(MAC) 有
+                        // HAVE_WIDE_GAMECONTROLLER_SUPPORT），类名与
+                        // Gamepad.prototype.vibrationActuator 应双双缺席。
+                        'GamepadHapticActuator']),
                     doc: read(document, ['browsingTopics']),
                     nav: read(navigator, ['xr', 'virtualKeyboard', 'ink',
                         'runAdAuction', 'joinAdInterestGroup', 'leaveAdInterestGroup',
                         'deprecatedReplaceInURN', 'updateAdInterestGroups',
+                        // F-83：真名是 deprecatedRunAdAuction…（此前清单里
+                        // 少了一个 Ad，删除落空，18.6 上该 boolean 暴露）
+                        'deprecatedRunAdAuctionEnforcesKAnonymity',
                         'protectedAudience']),
                     // 双平台真机都存在、必须保持的面（防误删）
                     kept: read(window, ['VideoDecoder', 'VideoFrame', 'AudioDecoder',
@@ -1015,6 +1567,501 @@ STATE_JS = """async () => {
                 return out;
             })(),
         },
+        // ---- F-06 / F-17 / F-18 / F-31 / F-32 / F-33 / F-34：读数与成员面 ----
+        poTypes: (typeof PerformanceObserver === 'function'
+            && PerformanceObserver.supportedEntryTypes)
+            ? Array.from(PerformanceObserver.supportedEntryTypes) : null,
+        poFrozen: (typeof PerformanceObserver === 'function'
+            && PerformanceObserver.supportedEntryTypes)
+            ? Object.isFrozen(PerformanceObserver.supportedEntryTypes) : null,
+        poDesc: (() => {
+            try {
+                const d = descOf(PerformanceObserver, 'supportedEntryTypes');
+                if (!d) { return null; }
+                return {get: typeof d.get, writable: d.writable,
+                        enumerable: d.enumerable, configurable: d.configurable};
+            } catch (e) { return 'ERR:' + e.name; }
+        })(),
+        poWriteBlocked: (() => {
+            try {
+                PerformanceObserver.supportedEntryTypes = ['x'];
+                return JSON.stringify(PerformanceObserver.supportedEntryTypes);
+            } catch (e) { return 'throw:' + e.name; }
+        })(),
+        audioState: (() => {
+            try {
+                const Ctor = window.AudioContext || window.webkitAudioContext;
+                const c = new Ctor();
+                const o = {state: c.state, baseState: c.baseLatency !== undefined};
+                try { c.close(); } catch (e) {}
+                return o;
+            } catch (e) { return 'throw:' + e.name; }
+        })(),
+        audioMembers: (() => {
+            const proto = window.AudioContext ? window.AudioContext.prototype : null;
+            if (!proto) { return null; }
+            return {
+                sinkId: 'sinkId' in proto,
+                setSinkId: 'setSinkId' in proto,
+                onsinkchange: 'onsinkchange' in proto,
+                playbackStats: 'playbackStats' in proto,
+                basePlaybackStats: window.BaseAudioContext
+                    ? ('playbackStats' in window.BaseAudioContext.prototype) : null,
+            };
+        })(),
+        orientAngle: screen.orientation ? screen.orientation.angle : null,
+        orientType: screen.orientation ? screen.orientation.type : null,
+        // F-90：iOS 普通浏览上下文里 Notification 整体缺席（Android 侧存在，
+        // 故保留 permission 读值供 Android 断言）。
+        notifPerm: typeof Notification === 'function' ? Notification.permission : null,
+        notifAbsent: (() => {
+            const out = {
+                type: typeof Notification,
+                inWin: 'Notification' in window,
+                eventType: typeof NotificationEvent,
+                pushManager: typeof PushManager,
+                pushSub: typeof PushSubscription,
+                pushOpts: typeof PushSubscriptionOptions,
+                pushEvent: typeof PushEvent,
+                pushMsg: typeof PushMessageData,
+                winPushManager: (() => {
+                    try { return typeof window.pushManager; } catch (e) { return 'ERR'; }
+                })(),
+                swrPush: (() => {
+                    try {
+                        const C = window.ServiceWorkerRegistration;
+                        if (typeof C !== 'function') { return 'absent'; }
+                        return 'pushManager' in C.prototype;
+                    } catch (e) { return 'ERR'; }
+                })(),
+                // F-102：其余 Blink 专有 / pref 门控成员
+                swrDrops: (() => {
+                    try {
+                        const C = window.ServiceWorkerRegistration;
+                        if (typeof C !== 'function') { return 'absent'; }
+                        const P = C.prototype;
+                        const out = {};
+                        ['sync', 'periodicSync', 'backgroundFetch',
+                         'paymentManager', 'cookies', 'pushManager']
+                            .forEach((n) => { out[n] = n in P; });
+                        // 反向保留：navigationPreload 默认开，真机存在
+                        out.navigationPreload = 'navigationPreload' in P;
+                        return out;
+                    } catch (e) { return 'ERR'; }
+                })(),
+            };
+            return out;
+        })(),
+        consoleHasContext: 'context' in console,
+        consoleHasCreateTask: 'createTask' in console,
+        consoleHasMemory: 'memory' in console,
+        consoleNames: Object.getOwnPropertyNames(console).sort(),
+        // ---- F-26 / F-27：Chromium 专属原型成员应缺席 ----
+        protoDrop: (() => {
+            const pick = (ctorName, members) => {
+                const C = window[ctorName];
+                if (typeof C !== 'function') { return {ctor: 'absent'}; }
+                const r = {};
+                members.forEach((m) => { r[m] = m in C.prototype; });
+                return r;
+            };
+            return {
+                rtc: pick('RTCPeerConnection',
+                    ['addStream', 'removeStream', 'createDTMFSender',
+                     'getLocalStreams', 'getRemoteStreams',
+                     'onaddstream', 'onremovestream']),
+                fontFace: pick('FontFace', ['ascentOverride', 'descentOverride',
+                    'lineGapOverride', 'variationSettings', 'variant']),
+                inputIncremental: pick('HTMLInputElement', ['incremental']),
+                pointerEvent: pick('PointerEvent', ['persistentDeviceId']),
+                intersector: pick('IntersectionObserver', ['delay', 'trackVisibility']),
+                xhr: pick('XMLHttpRequest',
+                    ['setAttributionReporting', 'setPrivateToken']),
+                element: pick('Element',
+                    ['setHTML', 'moveBefore', 'elementTiming', 'fakeShadowRoot',
+                     'activeViewTransition']),
+                document: pick('Document',
+                    ['exitPointerLock', 'requestStorageAccessFor', 'featurePolicy',
+                     'hasPrivateToken', 'hasRedemptionRecord',
+                     'hasUnpartitionedCookieAccess', 'wasDiscarded', 'prerendering']),
+                screen: pick('Screen', ['isExtended', 'onchange']),
+                eventTarget: pick('EventTarget', ['when']),
+                anchor: pick('HTMLAnchorElement',
+                    ['attributionSrc', 'interestForElement', 'browsingTopics',
+                     'sharedStorageWritable']),
+                file: pick('File', ['lastModifiedDate']),
+                webgl: pick('WebGLRenderingContext',
+                    ['makeXRCompatible', 'drawingBufferStorage', 'drawingBufferFormat',
+                     'unpackColorSpace']),
+                // F-106：四项的真实宿主是 WebGL2RenderingContext
+                webgl2: pick('WebGL2RenderingContext',
+                    ['makeXRCompatible', 'drawingBufferStorage', 'drawingBufferFormat',
+                     'unpackColorSpace']),
+                // F-103 / F-104 / F-105 / F-108 / F-109 / F-111 / F-112 / F-113
+                mediaDevices: pick('MediaDevices', ['setCaptureHandleConfig']),
+                mediaTrack: pick('MediaStreamTrack',
+                    ['getCaptureHandle', 'oncapturehandlechange']),
+                canvas2d: pick('CanvasRenderingContext2D',
+                    ['fontKerning', 'fontStretch', 'fontVariantCaps', 'isContextLost',
+                     'lang', 'textRendering']),
+                // 对照：filter 自 iOS 18 起真机有，必须保留
+                canvas2dKeep: pick('CanvasRenderingContext2D', ['filter']),
+                mediaMetadata: pick('MediaMetadata', ['chapterInfo']),
+                mediaRecorder: pick('MediaRecorder', ['audioBitrateMode']),
+                mediaKeys: pick('MediaKeys', ['getStatusForPolicy']),
+                request: pick('Request', ['isHistoryNavigation', 'targetAddressSpace']),
+                htmlElement: pick('HTMLElement',
+                    ['editContext', 'virtualKeyboardPolicy', 'onpointerrawupdate',
+                     'onbeforexrselect', 'oncontextlost', 'oncontextrestored',
+                     'onscrollsnapchange', 'onscrollsnapchanging']),
+                mediaElement: pick('HTMLMediaElement',
+                    ['captureStream', 'controlsList', 'loading',
+                     'setSinkId', 'sinkId', 'audioTracks', 'videoTracks',
+                     'onsinkchange']),
+                iframe: pick('HTMLIFrameElement',
+                    ['adAuctionHeaders', 'allowPaymentRequest', 'browsingTopics',
+                     'credentialless', 'csp', 'featurePolicy', 'privateToken',
+                     'sharedStorageWritable']),
+                area: pick('HTMLAreaElement', ['attributionSrc', 'interestForElement']),
+                image: pick('HTMLImageElement',
+                    ['attributionSrc', 'interestForElement', 'browsingTopics',
+                     'sharedStorageWritable']),
+                elementExtra: pick('Element',
+                    ['startViewTransition', 'onbeforecopy', 'onbeforecut',
+                     'onbeforepaste', 'onsearch']),
+                // F-115 / F-117：WebKit 落点在 Element/HTMLElement，应保留
+                handlerKeep: {
+                    focusin: 'onfocusin' in document.body,
+                    beforecopyBody: 'onbeforecopy' in document.body,
+                    beforecopyRoot: 'onbeforecopy' in document.documentElement,
+                    beforecopyDoc: 'onbeforecopy' in document,
+                    ariaNotify: 'ariaNotify' in Element.prototype,
+                    docSVT: 'startViewTransition' in Document.prototype,
+                },
+                // F-118 / F-119：WebKit 独有处理器。F-118 的 5 名在 Element 上
+                // （[NotEnumerable]，root/body 按继承命中）；F-119 的 pageswap /
+                // pagereveal 只转发到 body/frameset，root 必须仍为 false。
+                webkitHandlers: (() => {
+                    const names = ['onbeforeload', 'onwebkitneedkey',
+                        'onwebkitpresentationmodechanged',
+                        'onwebkitcurrentplaybacktargetiswirelesschanged',
+                        'onwebkitplaybacktargetavailabilitychanged'];
+                    const out = {root: {}, body: {}, own: {}, enum: {}};
+                    for (const n of names) {
+                        out.root[n] = n in document.documentElement;
+                        out.body[n] = n in document.body;
+                        const d = Object.getOwnPropertyDescriptor(
+                            Element.prototype, n);
+                        out.own[n] = !!d;
+                        out.enum[n] = d ? d.enumerable : null;
+                    }
+                    out.pageswapBody = 'onpageswap' in document.body;
+                    out.pagerevealBody = 'onpagereveal' in document.body;
+                    out.pageswapRoot = 'onpageswap' in document.documentElement;
+                    out.pagerevealRoot = 'onpagereveal' in document.documentElement;
+                    out.pageswapWindow = 'onpageswap' in window;
+                    const bp = Object.getOwnPropertyDescriptor(
+                        HTMLBodyElement.prototype, 'onpageswap');
+                    const fp2 = Object.getOwnPropertyDescriptor(
+                        HTMLFrameSetElement.prototype, 'onpagereveal');
+                    out.bodyOwn = !!bp;
+                    out.frameOwn = !!fp2;
+                    out.bodyEnum = bp ? bp.enumerable : null;
+                    out.bodyNull = document.body.onpageswap;
+                    return out;
+                })(),
+                webglConst: (() => {
+                    const P = window.WebGLRenderingContext;
+                    if (!P) { return null; }
+                    return {RGB8: 'RGB8' in P, RGBA8: 'RGBA8' in P};
+                })(),
+                imageData: pick('ImageData', ['pixelFormat']),
+                viewport: pick('VisualViewport', ['onscrollend']),
+            };
+        })(),
+        // ---- F-31：storage.estimate 口径（异步，见下方 out.storageEstimate）----
+        // ---- F-19：container-only 查询应为 maybe（WebKit MIMETypeCache 语义）----
+        canPlayIos: (() => {
+            const v = document.createElement('video');
+            const probe = (t) => { try { return v.canPlayType(t); } catch (e) { return 'ERR'; } };
+            return {
+                mpeg: probe('audio/mpeg'),
+                mp3Codec: probe('audio/mpeg; codecs="mp3"'),
+                aac: probe('audio/aac'),
+                mp3: probe('audio/mp3'),
+                flac: probe('audio/flac'),
+                flacCodec: probe('audio/flac; codecs="flac"'),
+                flacMp4: probe('audio/mp4; codecs="flac"'),
+                quicktime: probe('video/quicktime'),
+                dvh1: probe('video/mp4; codecs="dvh1.05.06"'),
+                av01: probe('video/mp4; codecs="av01.0.05M.08"'),
+                mp4a405: probe('audio/mp4; codecs="mp4a.40.5"'),
+                avc1Codec: probe('video/mp4; codecs="avc1.42E01E"'),
+                hls: probe('application/vnd.apple.mpegurl'),
+                unknownH264: probe('video/h264'),
+                emptyStr: probe(''),
+                // ---- F-143：白名单语义验收串（清单 §49 修复顺序 2）----
+                // 这些串旧实现全部透传宿主 Blink：opus/mp3-in-mp4 → probably、
+                // x-matroska → maybe、hev1 版本化 → probably。
+                opusMp4: probe('audio/mp4; codecs="opus"'),
+                mp3Mp4: probe('audio/mp4; codecs="mp3"'),
+                mkv: probe('video/x-matroska'),
+                mkvCodec: probe('video/x-matroska; codecs="avc1"'),
+                hev1Full: probe('video/mp4; codecs="hev1.1.6.L93.B0"'),
+                avi: probe('video/avi'),
+                // 白名单容器族（F-125）：容器命中且无 codecs → maybe
+                gpp2: probe('video/3gpp2'),
+                aiff: probe('audio/aiff'),
+                basic: probe('audio/basic'),
+                xm4a: probe('audio/x-m4a'),
+                mp2t: probe('video/mp2t'),
+                caf: probe('audio/x-caf'),
+                aacp: probe('audio/aacp'),
+                wavePcm: probe('audio/wave; codecs="1"'),
+                // 白名单外 / 未知 codec 一律 ''
+                oggContainer: probe('audio/ogg'),
+                webmCodec: probe('video/webm; codecs="vp8"'),
+                noArg: (function () {
+                    try { return 'no-throw:' + v.canPlayType(); }
+                    catch (e) { return e.name + ':' + e.message; }
+                })(),
+            };
+        })(),
+        // ---- F-25 / F-36：真机有、Chromium 缺的 WebKit 面 ----
+        addMembers: (() => {
+            const has = (proto, names) => {
+                const r = {};
+                names.forEach((n) => {
+                    let v;
+                    try { v = proto[n]; } catch (e) { v = 'THROW'; }
+                    r[n] = {inn: n in proto, type: typeof v};
+                });
+                return r;
+            };
+            const P = (n) => window[n] && window[n].prototype;
+            const iface = {};
+            ['AudioSession', 'MediaController', 'XMLHttpRequestProgressEvent',
+             'SVGViewSpec', 'CSSValue', 'CSSPrimitiveValue', 'CSSValueList',
+             'RGBColor', 'Rect', 'Counter', 'SVGPathSeg', 'MathMLMathElement',
+             'DataCue', 'VTTRegion', 'ManagedMediaSource', 'ManagedSourceBuffer',
+             'BufferedChangeEvent', 'VideoTrack', 'AudioTrack', 'VideoTrackList',
+             'AudioTrackList', 'AudioTrackConfiguration', 'MediaRecorderErrorEvent',
+             'OverconstrainedErrorEvent', 'FileSystemEntry', 'FileSystemDirectoryEntry',
+             'FileSystemFileEntry', 'FileSystemDirectoryReader', 'Report',
+             'FontFaceSet', 'StylePropertyMapReadOnly', 'CSSMathValue',
+             'CSSNumericValue', 'CSSUnitValue', 'CSSKeywordValue', 'CSSImageValue',
+             'CSSTransformComponent', 'CSSStyleValue', 'SpeechRecognitionResultList',
+             'SpeechRecognitionResult', 'SpeechRecognitionAlternative',
+             'ApplePayError', 'FileSystem',
+             'TextTrack', 'TextTrackCue'].forEach((n) => {
+                const C = window[n];
+                if (typeof C !== 'function') { iface[n] = 'absent'; return; }
+                const d = Object.getOwnPropertyDescriptor(window, n);
+                const msgOf = (f) => {
+                    try { f(); return 'ok'; }
+                    catch (e) { return 'throw:' + e.name + ':'
+                        + String(e.message).slice(0, 24); }
+                };
+                iface[n] = {len: C.length, ctor: msgOf(() => new C()),
+                            noNew: msgOf(() => C()),
+                            en: d && d.enumerable,
+                            wr: d && d.writable,
+                            tag: Object.prototype.toString.call(C.prototype),
+                            proto: Object.getOwnPropertyNames(C.prototype)};
+            });
+            const c2d = document.createElement('canvas').getContext('2d');
+            const m = new MouseEvent('click');
+            const w = new WheelEvent('wheel');
+            const k = new KeyboardEvent('keydown');
+            const v = document.createElement('video');
+            const rng = new Range();
+            const ffn = new FontFace('x', 'url(x)');
+            return {
+                c2d: has(P('CanvasRenderingContext2D'),
+                    ['setLineWidth', 'setStrokeColor', 'setFillColor', 'setLineCap',
+                     'setLineJoin', 'setMiterLimit', 'setShadow', 'clearShadow',
+                     'webkitLineDash', 'webkitLineDashOffset']),
+                c2dLive: {dash: c2d.webkitLineDash, dashOffset: c2d.webkitLineDashOffset,
+                          // 这些是 iOS 专有面；Android 上不存在，探针不能炸。
+                          fillAfterSet: (() => {
+                              if (typeof c2d.setFillColor !== 'function') { return 'absent'; }
+                              c2d.setFillColor('#123456');
+                              return c2d.fillStyle; })(),
+                          shadowAfterSet: (() => {
+                              if (typeof c2d.setShadow !== 'function') { return 'absent'; }
+                              c2d.setShadow(3, 4, 5, 'red');
+                              return [c2d.shadowOffsetX,
+                                      c2d.shadowOffsetY,
+                                      c2d.shadowBlur,
+                                      c2d.shadowColor]; })(),
+                          clearShadow: (() => {
+                              if (typeof c2d.clearShadow !== 'function') { return 'absent'; }
+                              c2d.clearShadow();
+                              return [c2d.shadowOffsetX,
+                                      c2d.shadowBlur]; })()},
+                mouse: has(MouseEvent.prototype, ['webkitForce']),
+                mouseLive: m.webkitForce,
+                mouseConst: {own: MouseEvent.WEBKIT_FORCE_AT_MOUSE_DOWN,
+                             force: MouseEvent.WEBKIT_FORCE_AT_FORCE_MOUSE_DOWN,
+                             proto: MouseEvent.prototype.WEBKIT_FORCE_AT_MOUSE_DOWN},
+                wheel: {inn: 'webkitDirectionInvertedFromDevice'
+                            in WheelEvent.prototype,
+                        val: w.webkitDirectionInvertedFromDevice},
+                kbd: {inn: 'keyIdentifier' in KeyboardEvent.prototype,
+                      val: k.keyIdentifier},
+                media: (() => {
+                    // 整个媒体面是 iOS 专有补丁；Android 上多数成员不存在，
+                    // 探针逐项兜底，避免 TypeError 中断整个 state 采集。
+                    const safe = (f) => { try { return f(); } catch (e) { return 'absent'; } };
+                    return {
+                        fastSeek: 'fastSeek' in HTMLMediaElement.prototype,
+                        getStartDate: safe(() => String(v.getStartDate())),
+                        vpqKeys: safe(() => Object.keys(v.getVideoPlaybackQuality()).sort()),
+                        audioTracks: safe(() => String(v.audioTracks)),
+                        videoTracks: safe(() => String(v.videoTracks)),
+                        controller: safe(() => String(v.controller)),
+                        mediaGroup: safe(() => v.mediaGroup),
+                        wirelessDisabled: safe(() => v.webkitWirelessVideoPlaybackDisabled),
+                        autoPip: safe(() => v.autoPictureInPicture),
+                        showPicker: safe(() => typeof v.webkitShowPlaybackTargetPicker),
+                        curWireless: safe(() => v.webkitCurrentPlaybackTargetIsWireless),
+                        presMode: safe(() => v.webkitSupportsPresentationMode('inline')),
+                        setPres: safe(() => typeof v.webkitSetPresentationMode),
+                    };
+                })(),
+                srcBuf: has(P('SourceBuffer'),
+                    ['audioTracks', 'textTracks', 'videoTracks']),
+                range: {inn: 'compareNode' in Range.prototype,
+                        consts: [Range.NODE_BEFORE, Range.NODE_AFTER,
+                                 Range.NODE_BEFORE_AND_AFTER, Range.NODE_INSIDE],
+                        protoConst: Range.prototype.NODE_BEFORE},
+                metrics: (() => { const mm = c2d.measureText('Hg');
+                    return {asc: mm.emHeightAscent, desc: mm.emHeightDescent}; })(),
+                fontFace: {inn: 'width' in FontFace.prototype, val: ffn.width},
+                cssDecl: has(P('CSSStyleDeclaration'),
+                    ['cssRules', 'getPropertyCSSValue']),
+                track: {inn: 'onconfigurationchange'
+                            in MediaStreamTrack.prototype},
+                workerErr: {inn: 'onmessageerror' in Worker.prototype},
+                handlers: (() => {
+                    // F-77 D4：真机 27.2 实测，12 个事件属性在 Window /
+                    // Document / HTMLElement / SVGElement 四处都有；可枚举性
+                    // 只有 copy/cut/paste 为 true，Force Touch 与 touch 家族
+                    // 九个为 false（/tmp/f77p/hosts.py）。
+                    const names = ['oncopy', 'oncut', 'onpaste',
+                        'onwebkitmouseforcechanged', 'onwebkitmouseforcedown',
+                        'onwebkitmouseforceup', 'onwebkitmouseforcewillbegin',
+                        'ontouchforcechange', 'ontouchstart', 'ontouchmove',
+                        'ontouchend', 'ontouchcancel'];
+                    const hosts = {win: window, doc: Document.prototype,
+                                   el: HTMLElement.prototype,
+                                   svg: SVGElement.prototype};
+                    const out = {};
+                    Object.keys(hosts).forEach((h) => {
+                        const r = {};
+                        names.forEach((n) => {
+                            const d = Object.getOwnPropertyDescriptor(hosts[h], n);
+                            r[n] = d ? (d.enumerable ? 'e' : 'ne') : 'absent';
+                        });
+                        out[h] = r;
+                    });
+                    const before = window.oncopy;
+                    const fn = () => {};
+                    window.oncopy = fn;
+                    const after = window.oncopy;
+                    window.oncopy = null;
+                    return {hosts: out, before: String(before),
+                            assign: after === fn, reset: window.oncopy === null};
+                })(),
+                globals: (() => {
+                    // F-77 D3 三个全局项的真机形态：webkitIndexedDB 是只读
+                    // getter（同一对象）、openDatabase 是 get/set 访问器且
+                    // getter 返回 JSC 内部函数（typeof 为 "undefined"）、
+                    // safari 是普通数据属性。
+                    const d = (n) => {
+                        const x = Object.getOwnPropertyDescriptor(window, n);
+                        return x ? [x.enumerable, x.configurable,
+                                    typeof x.get, typeof x.set,
+                                    typeof x.value] : null;
+                    };
+                    const odb = window.openDatabase;
+                    const safari = window.safari;
+                    const gpc = Object.getOwnPropertyDescriptor(
+                        Navigator.prototype, 'globalPrivacyControl');
+                    const out = {
+                        webkitIndexedDB: typeof window.webkitIndexedDB,
+                        openDatabase: typeof window.openDatabase,
+                        gDesc: {webkitIndexedDB: d('webkitIndexedDB'),
+                                openDatabase: d('openDatabase'),
+                                safari: d('safari')},
+                        gpcDesc: gpc ? [gpc.enumerable, gpc.configurable,
+                                        typeof gpc.get, typeof gpc.set] : null,
+                        gpcVal: navigator.globalPrivacyControl,
+                        gpcNative: gpc && gpc.get ? nativeStr(gpc.get) : null,
+                        // F-84：AudioSession 是 Singleton 双暴露面。
+                        audio: (() => {
+                            const d = Object.getOwnPropertyDescriptor(
+                                Navigator.prototype, 'audioSession');
+                            const a = navigator.audioSession;
+                            return {
+                                desc: d ? [d.enumerable, d.configurable,
+                                           typeof d.get, typeof d.set,
+                                           d.get && d.get.length] : null,
+                                tag: a === undefined ? null
+                                    : Object.prototype.toString.call(a),
+                                same: navigator.audioSession === a,
+                                own: a ? Object.getOwnPropertyNames(a) : null,
+                                type: a ? a.type : null,
+                                inst: a ? (a instanceof window.AudioSession) : null,
+                            };
+                        })(),
+                        sameIDB: window.webkitIndexedDB === window.indexedDB,
+                        odbNull: odb == null,
+                        odbUndef: odb === undefined,
+                        odbLen: odb && typeof odb.length === 'number' ? odb.length : null,
+                        odbOwn: odb ? Object.getOwnPropertyNames(odb) : null,
+                        odbCall: (() => {
+                            try { odb(); return 'ok'; }
+                            catch (e) { return e.name + ':' + e.message; }
+                        })(),
+                        safariTag: safari && safari.pushNotification
+                            ? String(safari.pushNotification) : null,
+                    };
+                    // F-29 / F-30：表单控件默认样式（真机 system-ui + 18/21px）
+                    const mk = (tag) => {
+                        const el = document.createElement(tag);
+                        if (tag === 'button') { el.textContent = '确定'; }
+                        document.body.appendChild(el);
+                        return el;
+                    };
+                    const snap = (el) => {
+                        const cs = getComputedStyle(el);
+                        return {ff: cs.fontFamily, fs: cs.fontSize,
+                                h: el.getBoundingClientRect().height};
+                    };
+                    const btn = mk('button');
+                    const inp = mk('input');
+                    const sel = mk('select');
+                    const ta = mk('textarea');
+                    out.form = {button: snap(btn), input: snap(inp),
+                                select: snap(sel), textarea: snap(ta)};
+                    out.uaStyle = (() => {
+                        const st = document.getElementById('__wk_uaform');
+                        return st ? {present: true, len: st.textContent.length,
+                                     sheets: document.styleSheets.length}
+                                  : {present: false};
+                    })();
+                    [btn, inp, sel, ta].forEach((e) => e.remove());
+                    return out;
+                })(),
+                iface: iface,
+                staticAdd: {dvbpe: 'BYTES_PER_ELEMENT' in DataView,
+                            regMultiline: 'multiline' in RegExp,
+                            regDollar1: '$1' in RegExp,
+                            symDispose: 'dispose' in Symbol,
+                            symAsyncDispose: 'asyncDispose' in Symbol},
+            };
+        })(),
         ownProps: Object.getOwnPropertyNames(nav).filter((n) =>
             ['platform','userAgent','maxTouchPoints','mobile','deviceMemory',
              'userAgentData','vendor','getBattery','standalone','connection'].includes(n)),
@@ -1030,6 +2077,43 @@ STATE_JS = """async () => {
             uaDataOwnProps: nav.userAgentData ? Object.getOwnPropertyNames(nav.userAgentData) : null,
         },
     };
+    // ---- F-20：permissions.query 分州读数 ----
+    out.perms = {};
+    for (const name of ['geolocation', 'notifications', 'camera', 'microphone',
+                        'accelerometer', 'gyroscope', 'magnetometer', 'midi',
+                        'background-fetch', 'display-capture', 'background-sync',
+                        'clipboard-read', 'clipboard-write', 'persistent-storage',
+                        'local-fonts', 'window-management', 'payment-handler',
+                        'screen-wake-lock', 'storage-access', 'push',
+                        'bogus-permission-name']) {
+        try {
+            const st = await nav.permissions.query({name: name});
+            out.perms[name] = st.state;
+        } catch (e) { out.perms[name] = 'throw:' + e.name; }
+    }
+    // ---- F-31：storage.estimate 配额与字段集 ----
+    out.storageEstimate = null;
+    try {
+        if (nav.storage && nav.storage.estimate) {
+            const r = await nav.storage.estimate();
+            out.storageEstimate = {
+                quota: r.quota, usage: r.usage,
+                keys: Object.keys(r).sort(),
+                usageDetails: 'usageDetails' in r,
+            };
+        }
+    } catch (e) { out.storageEstimate = 'throw:' + e.name; }
+    // ---- F-32：enumerateDevices 应无 audiooutput ----
+    out.deviceKinds = (() => {
+        try {
+            if (!nav.mediaDevices || !nav.mediaDevices.enumerateDevices) { return null; }
+            return nav.mediaDevices.enumerateDevices();
+        } catch (e) { return 'throw:' + e.name; }
+    })();
+    out.deviceKinds = out.deviceKinds && typeof out.deviceKinds.then === 'function'
+        ? await out.deviceKinds.then((ds) => ds.map((d) => d.kind),
+                                   (e) => 'throw:' + e.name)
+        : out.deviceKinds;
     if (nav.userAgentData) {
         out.uaData = {
             brands: nav.userAgentData.brands,
@@ -1147,6 +2231,14 @@ STATE_JS = """async () => {
             // 不跨页面继承——新 page 目标需重新下发，故此处按当前页读。
             p3: q('(color-gamut: p3)'),
             srgb: q('(color-gamut: srgb)'),
+            // HDR 屏（F-12）：iPhone X/XS/11 Pro 及 12 以后全系为 true，
+            // SE 系列 false。CDP 不支持仿真该特性，由 matchMedia 补丁按机型给值。
+            dynamicRangeHigh: q('(dynamic-range: high)'),
+            dynamicRangeStandard: q('(dynamic-range: standard)'),
+            dynamicRangeMedia: (function () {
+                try { return matchMedia('(dynamic-range: high)').media; }
+                catch (e) { return null; }
+            })(),
         };
     })();
     // ---- 音频采样率：真机 OfflineAudioContext 采样率恒为精确整数；内核
@@ -1159,6 +2251,173 @@ STATE_JS = """async () => {
         try { r.s48000 = new OfflineAudioContext(1, 64, 48000).sampleRate; }
         catch (e) { r.s48000 = null; }
         return r;
+    })();
+    // ---- F-132：主世界 WebCodecs 静态 isConfigSupported（原生 Blink 类
+    // 只包静态，原型/构造器保持原生，VideoFrame 品牌校验不受影响）----
+    out.wcIcs = await (async function () {
+        try {
+            var C = window.VideoDecoder;
+            if (typeof C !== 'function') { return { absent: true }; }
+            var d = Object.getOwnPropertyDescriptor(C, 'isConfigSupported');
+            var msg = function (cfg) {
+                try { C.isConfigSupported(cfg); return 'no-throw'; }
+                catch (e) { return e.name + ':' + e.message; }
+            };
+            var A = window.AudioEncoder;
+            var amsg = function (cfg) {
+                try { A.isConfigSupported(cfg); return 'no-throw'; }
+                catch (e) { return e.name + ':' + e.message; }
+            };
+            var q = function (c) {
+                return C.isConfigSupported({ codec: c })
+                    .then(function (r) { return !!r.supported; },
+                          function () { return 'ERR'; });
+            };
+            var qe = function (c) {
+                return window.VideoEncoder.isConfigSupported(
+                    { codec: c, width: 640, height: 480 })
+                    .then(function (r) { return !!r.supported; },
+                          function () { return 'ERR'; });
+            };
+            var qa = function (c) {
+                return window.AudioDecoder.isConfigSupported(
+                    { codec: c, numberOfChannels: 2, sampleRate: 48000 })
+                    .then(function (r) { return !!r.supported; },
+                          function () { return 'ERR'; });
+            };
+            var m = await Promise.all([
+                q('vp8'), q('avc1.42E01E'), q('hvc1.1.6.L93.B0'),
+                q('hev1.1.6.L93.B0'), q('vp09.00.10.08'), q('vp09.02.10.10'),
+                q('av01.0.05M.08'), q('h264'), q('vp9'),
+                qe('avc1.42E01E'), qe('hvc1.1.6.L93.B0'), qe('av01.0.05M.08'),
+                qa('opus'), qa('pcm-s16'), qa('pcm-s20'),
+            ]);
+            return {
+                type: typeof C.isConfigSupported,
+                own: !!d,
+                desc: d ? [d.enumerable, d.configurable, d.writable] : null,
+                length: C.isConfigSupported.length,
+                native: nativeStr(C.isConfigSupported),
+                noArg: msg(),
+                emptyCfg: msg({}),
+                aeNoRate: amsg({ codec: 'opus', numberOfChannels: 2 }),
+                vp8: m[0], avc1: m[1], hvc1: m[2], hev1: m[3], vp09: m[4],
+                vp09p2: m[5], av01: m[6], h264: m[7], vp9: m[8],
+                eAvc1: m[9], eHevc: m[10], eAv01: m[11],
+                adOpus: m[12], adPcm: m[13], adPcmBad: m[14],
+                // 品牌校验未被破坏：VideoFrame 仍是原生类
+                vfNative: (function () {
+                    try {
+                        return typeof window.VideoFrame === 'function'
+                            && /\\[native code\\]/.test(String(window.VideoFrame));
+                    } catch (e) { return false; }
+                })(),
+            };
+        } catch (e) { return 'ERR:' + e.name; }
+    })();
+    // ---- F-135：mediaCapabilities 收口（原型两方法，构造器/实例保持原生）----
+    // 期望值锚定 Playwright WebKit 27.2 实测（见 mcDec/mcEnc 逐项注释）；
+    // 三态编码 S/m/p = supported/smooth/powerEfficient。
+    out.mcCap = (function () {
+        var C = window.MediaCapabilities;
+        var P = C && C.prototype;
+        var d = P ? descOf(P, 'decodingInfo') : null;
+        var e = P ? descOf(P, 'encodingInfo') : null;
+        return {
+            ctor: typeof C,
+            inst: !!(navigator.mediaCapabilities instanceof C),
+            decDesc: d ? [d.writable, d.enumerable, d.configurable] : null,
+            encDesc: e ? [e.writable, e.enumerable, e.configurable] : null,
+            decLen: P && P.decodingInfo ? P.decodingInfo.length : null,
+            encLen: P && P.encodingInfo ? P.encodingInfo.length : null,
+            ctorNative: nativeStr(C),
+        };
+    })();
+    out.mcDec = await (async function () {
+        var mc = navigator.mediaCapabilities;
+        if (!mc) { return { absent: true }; }
+        var t = function (cfg) {
+            return mc.decodingInfo(cfg).then(function (r) {
+                return (r.supported ? 'S' : '-') + (r.smooth ? 'm' : '-')
+                    + (r.powerEfficient ? 'p' : '-');
+            }, function (err) { return 'REJ:' + err.name + ':' + err.message; });
+        };
+        var V = function (ct) {
+            return {type: 'file', video: {contentType: ct, width: 1280,
+                    height: 720, bitrate: 2000000, framerate: 30}};
+        };
+        var A = function (ct) {
+            return {type: 'file', audio: {contentType: ct, channels: 2,
+                    samplerate: 48000, bitrate: 128000}};
+        };
+        var W = function (ct) {
+            return {type: 'webrtc', video: {contentType: ct, width: 1280,
+                    height: 720, bitrate: 2000000, framerate: 30}};
+        };
+        var o = {};
+        o.avc1 = await t(V('video/mp4; codecs="avc1.42E01E"'));
+        o.hvc1 = await t(V('video/mp4; codecs="hvc1.1.6.L93.B0"'));
+        o.hev1 = await t(V('video/mp4; codecs="hev1.1.6.L93.B0"'));
+        o.vp9mp4 = await t(V('video/mp4; codecs="vp09.00.10.08"'));
+        o.vp9webm = await t(V('video/webm; codecs="vp9"'));
+        o.av01 = await t(V('video/mp4; codecs="av01.0.05M.08"'));
+        o.mp4v = await t(V('video/mp4; codecs="mp4v.20.9"'));
+        o.mp4Bare = await t(V('video/mp4'));
+        o.mp4a = await t(A('audio/mp4; codecs="mp4a.40.2"'));
+        o.aacBare = await t(A('audio/mp4; codecs="aac"'));
+        o.flac = await t(A('audio/mp4; codecs="flac"'));
+        o.opusMp4 = await t(A('audio/mp4; codecs="opus"'));
+        o.oggOpus = await t(A('audio/ogg; codecs="opus"'));
+        o.alac = await t(A('audio/mp4; codecs="alac"'));
+        o.unqAvc1 = await t(V('video/mp4;codecs=avc1.42E01E'));
+        o.unqTrail = await t(V('video/mp4;codecs=avc1.42E01E;x=1'));
+        o.noArg = await mc.decodingInfo().then(function () { return 'no-throw'; },
+            function (err) { return 'REJ:' + err.name + ':' + err.message; });
+        o.badRecv = await window.MediaCapabilities.prototype.decodingInfo.call(
+            {}, V('video/mp4')).then(
+            function () { return 'no-throw'; },
+            function (err) { return 'REJ:' + err.name + ':' + err.message; });
+        // WebRTC 解码走 LibWebRTCProvider 的接收能力表（与 file 路径不同源）
+        o.rtcVp8 = await t(W('video/VP8'));
+        o.rtcVp9 = await t(W('video/VP9'));
+        o.rtcAv1 = await t(W('video/AV1'));
+        o.rtcH264 = await t(W('video/H264'));
+        o.rtcH265 = await t(W('video/H265'));
+        o.rtcFlexfec = await t(W('video/flexfec-03'));
+        return o;
+    })();
+    out.mcEnc = await (async function () {
+        var mc = navigator.mediaCapabilities;
+        if (!mc) { return { absent: true }; }
+        var t = function (cfg) {
+            return mc.encodingInfo(cfg).then(function (r) {
+                return (r.supported ? 'S' : '-') + (r.smooth ? 'm' : '-')
+                    + (r.powerEfficient ? 'p' : '-');
+            }, function (err) { return 'REJ:' + err.name + ':' + err.message; });
+        };
+        var V = function (ct) {
+            return {type: 'webrtc', video: {contentType: ct, width: 1280,
+                    height: 720, bitrate: 2000000, framerate: 30}};
+        };
+        var o = {};
+        o.h264 = await t(V('video/H264'));
+        o.h265 = await t(V('video/H265'));
+        o.vp8 = await t(V('video/VP8'));
+        o.vp9 = await t(V('video/VP9'));
+        o.av1 = await t(V('video/AV1'));
+        o.rtx = await t(V('video/rtx'));
+        o.red = await t(V('video/red'));
+        o.ulpfec = await t(V('video/ulpfec'));
+        // FEC 只收不发：接收能力表有 flexfec-03，发送能力表没有
+        o.flexfec = await t(V('video/flexfec-03'));
+        o.opus = await t({type: 'webrtc', audio: {contentType: 'audio/opus',
+                channels: 2, samplerate: 48000, bitrate: 128000}});
+        o.record = await t({type: 'record', video: {
+                contentType: 'video/mp4; codecs="avc1.42E01E"', width: 1280,
+                height: 720, bitrate: 2000000, framerate: 30}});
+        o.noArg = await mc.encodingInfo().then(function () { return 'no-throw'; },
+            function (err) { return 'REJ:' + err.name + ':' + err.message; });
+        return o;
     })();
     return out;
 }"""
@@ -1212,16 +2471,103 @@ try {
     + ' if (!g) { return null; } var e = g.getSupportedExtensions() || [];'
     + ' return {count: e.length, s3tc: e.some(function (x) { return /s3tc/i.test(x); }),'
     + ' bptc: e.some(function (x) { return /bptc/i.test(x); }),'
+    + ' pvrtc: e.some(function (x) { return /pvrtc/i.test(x); }),'
     + ' polygon: e.some(function (x) { return /polygon_mode/i.test(x); }),'
     + ' timer: e.some(function (x) { return /disjoint_timer_query/i.test(x); }),'
     + ' maxTex: g.getParameter(g.MAX_TEXTURE_SIZE)}; } catch (e) { return "ERR"; } })()'
-    + ' , platW: (function () { var ns = ["IdleDetector","WebSocketStream","ImageDecoder","FileSystemObserver","Scheduler","scheduler","VideoDecoder","BarcodeDetector","URLPattern","WebGL2RenderingContext"];'
+    + ' , platW: (function () { var ns = ["IdleDetector","WebSocketStream","ImageDecoder","FileSystemObserver","Scheduler","scheduler","VideoDecoder","BarcodeDetector","URLPattern","WebGL2RenderingContext","Notification","PushManager","PushSubscription","PushSubscriptionOptions"];'
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
     + ' , intlV8: (function () { try { return "v8BreakIterator" in Intl; } catch (e) { return "ERR"; } })()'
     + ' , intlOwn: (function () { try { return Object.getOwnPropertyNames(Intl).indexOf("v8BreakIterator") !== -1; } catch (e) { return "ERR"; } })()'
+    // Worker 作用域补建面（F-37 / F-38）：真机 WebKit Worker 有、Chromium
+    // Worker 没有的 43 个接口 + 真机 WorkerNavigator 的成员面 + 反方向删除。
+    + ' , wkAdd: (function () { var ns = ["FontFaceSet","CSSUnitValue","CSSMathSum","CSSTransformValue","CSSStyleValue","AudioDecoder","VideoDecoder","AudioEncoder","VideoEncoder","ManagedMediaSource","MediaStreamTrack","NavigationPreloadManager","Report","StylePropertyMapReadOnly","BufferedChangeEvent","VideoTrackGenerator","CSSSkewX","CSSTransformComponent","ServiceWorker","ServiceWorkerContainer","ServiceWorkerRegistration"];'
+    + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
+    + ' , wkNav: (function () { try { return Object.getOwnPropertyNames(WorkerNavigator.prototype); } catch (e) { return "ERR"; } })()'
+    // F-77 D3：真机 Worker 的 navigator.serviceWorker 是 WorkerNavigator
+    // 原型上的只读 getter，每次读同一个 ServiceWorkerContainer 实例；
+    // GPC 在 Worker 侧不存在（页面侧才有，见 pageGpc）。
+    + ' , wkSw: (function () { try {'
+    + ' var s = navigator.serviceWorker;'
+    + ' var d = Object.getOwnPropertyDescriptor(WorkerNavigator.prototype, "serviceWorker");'
+    + ' return {tag: Object.prototype.toString.call(s),'
+    + ' own: Object.getOwnPropertyNames(s),'
+    + ' same: s === navigator.serviceWorker,'
+    + ' ctrl: s.controller,'
+    + ' d: d ? [d.enumerable, d.configurable, typeof d.get, typeof d.set,'
+    + ' d.get && d.get.length] : null};'
+    + ' } catch (e) { return "ERR:" + e.name; } })()'
+    + ' , wkGpc: (function () { try { return "globalPrivacyControl" in WorkerNavigator.prototype; } catch (e) { return "ERR"; } })()'
+    + ' , wkCss: (function () { try { var v = new self.CSSUnitValue(5, "px");'
+    + ' var s = String(self.CSSStyleValue.prototype.toString); var L = String.fromCharCode(10);'
+    + ' return [String(v), v.type().length, String(new self.CSSMathSum(v, new self.CSSUnitValue(2, "px"))),'
+    + ' s === "function toString() {" + L + "    [native code]" + L + "}",'
+    + ' self.CSSNumericArray.prototype[Symbol.iterator] === self.CSSNumericArray.prototype.values];'
+    + ' } catch (e) { return "ERR:" + e.name; } })()'
+    + ' , wkBrand: (function () { try { self.CSSMathSum.prototype.values.get.call({}); return "no-throw"; }'
+    + ' catch (e) { return e.name + ":" + e.message; } })()'
+    + ' , wkLeak: (function () { return [typeof self.__wkStage, typeof self.__wkErr]; })()'
+    // F-130 / F-134：Worker 侧 ManagedMediaSource.isTypeSupported 与页面同口径
+    + ' , wkMms: (function () { try { var C = self.ManagedMediaSource;'
+    + ' if (typeof C !== "function") { return {absent: true}; }'
+    + ' var p = function (t) { try { return C.isTypeSupported(t); } catch (e) { return "ERR:" + e.name; } };'
+    + ' var d = Object.getOwnPropertyDescriptor(C, "isTypeSupported");'
+    + ' return {type: typeof C.isTypeSupported, own: !!d,'
+    + ' desc: d ? [d.enumerable, d.configurable, d.writable] : null,'
+    + ' length: typeof C.isTypeSupported === "function" ? C.isTypeSupported.length : null,'
+    + ' cases: {mp4: p("video/mp4"), mp4Codecs: p("video/mp4; codecs=avc1.42E01E"),'
+    + ' webm: p("video/webm"), webmVp9: p("video/webm; codecs=vp9"),'
+    + ' audioWebm: p("audio/webm"), ogg: p("audio/ogg"), upper: p("VIDEO/MP4")},'
+    + ' msMp4: self.MediaSource.isTypeSupported("video/mp4"),'
+    + ' msWebm: self.MediaSource.isTypeSupported("video/webm"),'
+    // F-142：Worker 侧 MediaSource.isTypeSupported 必须单独包装（它不是
+    // 补建出来的接口，走不到 __wkAddIfaceW），否则 Worker 仍是 Blink 口径。
+    + ' msOwn: !!Object.getOwnPropertyDescriptor(self.MediaSource, "isTypeSupported"),'
+    + ' msLen: self.MediaSource.isTypeSupported.length,'
+    + ' msNoArg: (function () { try { self.MediaSource.isTypeSupported(); return "no-throw"; }'
+    + ' catch (e) { return e.name + ":" + e.message; } })(),'
+    // F-133：Worker 的 WebCodecs 是 Blink 原生全局，补建链路会整条跳过，
+    // 静态 isConfigSupported 必须单独包成 WebKit 口径（异常文案 + 表）。
+    + ' msVp9: self.MediaSource.isTypeSupported("video/webm; codecs=vp9")};'
+    + ' } catch (e) { return "ERR:" + e.name; } })()'
+    + ' , wcIcs: (function () { try {'
+    + ' var C = self.VideoDecoder; if (typeof C !== "function") { return {absent: true}; }'
+    + ' var d = Object.getOwnPropertyDescriptor(C, "isConfigSupported");'
+    + ' var msg = function (cfg) { try { C.isConfigSupported(cfg); return "no-throw"; }'
+    + ' catch (e) { return e.name + ":" + e.message; } };'
+    + ' var A = self.AudioEncoder;'
+    + ' var amsg = function (cfg) { try { A.isConfigSupported(cfg); return "no-throw"; }'
+    + ' catch (e) { return e.name + ":" + e.message; } };'
+    + ' return {type: typeof C.isConfigSupported, own: !!d,'
+    + ' desc: d ? [d.enumerable, d.configurable, d.writable] : null,'
+    + ' length: C.isConfigSupported.length,'
+    + ' noArg: msg(), emptyCfg: msg({}),'
+    + ' aeNoRate: amsg({codec: "opus", numberOfChannels: 2}),'
+    + ' wcP: ((self.__wcP = (function () {'
+    + ' var E = self.VideoEncoder, A = self.AudioDecoder;'
+    + ' var q = function (c) { return C.isConfigSupported({codec: c})'
+    + ' .then(function (r) { return !!r.supported; }, function () { return "ERR"; }); };'
+    + ' var qe = function (c) { return E.isConfigSupported('
+    + ' {codec: c, width: 640, height: 480})'
+    + ' .then(function (r) { return !!r.supported; }, function () { return "ERR"; }); };'
+    + ' var qa = function (c) { return A.isConfigSupported('
+    + ' {codec: c, numberOfChannels: 2, sampleRate: 48000})'
+    + ' .then(function (r) { return !!r.supported; }, function () { return "ERR"; }); };'
+    + ' return Promise.all([q("vp8"), q("avc1.42E01E"), q("hvc1.1.6.L93.B0"),'
+    + ' q("hev1.1.6.L93.B0"), q("vp09.00.10.08"), q("vp09.02.10.10"),'
+    + ' q("av01.0.05M.08"), q("h264"), q("vp9"),'
+    + ' qe("avc1.42E01E"), qe("hvc1.1.6.L93.B0"), qe("av01.0.05M.08"),'
+    + ' qa("opus"), qa("pcm-s16"), qa("pcm-s20")]).then(function (v) {'
+    + ' return {vp8: v[0], avc1: v[1], hvc1: v[2], hev1: v[3], vp09: v[4],'
+    + ' vp09p2: v[5], av01: v[6], h264: v[7], vp9: v[8],'
+    + ' eAvc1: v[9], eHevc: v[10], eAv01: v[11],'
+    + ' adOpus: v[12], adPcm: v[13], adPcmBad: v[14]}; }); })()) && 0)};'
+    + ' } catch (e) { return "ERR:" + e.name; } })()'
     + ' , mediaW: (function () { var ns = ["WebKitPlaybackTargetAvailabilityEvent","WebKitMediaKeys","WebKitMediaKeySession","WebKitMediaKeyMessageEvent","WebKitMediaKeyNeededEvent","WebKitMediaKeyError","HTMLMediaElement","HTMLVideoElement"];'
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
-    + '}); }, 300);';
+    + '}); Promise.all([self.__wcP]).then(function (v) {'
+    + ' postMessage({wcCodecs: v[0]}); }, function () {'
+    + ' postMessage({wcCodecs: "ERR"}); }); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.workerData = {};
   w.onmessage = function (ev) { for (var k in ev.data) { window.workerData[k] = ev.data[k]; } };
@@ -1275,16 +2621,103 @@ try {
     + ' if (!g) { return null; } var e = g.getSupportedExtensions() || [];'
     + ' return {count: e.length, s3tc: e.some(function (x) { return /s3tc/i.test(x); }),'
     + ' bptc: e.some(function (x) { return /bptc/i.test(x); }),'
+    + ' pvrtc: e.some(function (x) { return /pvrtc/i.test(x); }),'
     + ' polygon: e.some(function (x) { return /polygon_mode/i.test(x); }),'
     + ' timer: e.some(function (x) { return /disjoint_timer_query/i.test(x); }),'
     + ' maxTex: g.getParameter(g.MAX_TEXTURE_SIZE)}; } catch (e) { return "ERR"; } })()'
-    + ' , platW: (function () { var ns = ["IdleDetector","WebSocketStream","ImageDecoder","FileSystemObserver","Scheduler","scheduler","VideoDecoder","BarcodeDetector","URLPattern","WebGL2RenderingContext"];'
+    + ' , platW: (function () { var ns = ["IdleDetector","WebSocketStream","ImageDecoder","FileSystemObserver","Scheduler","scheduler","VideoDecoder","BarcodeDetector","URLPattern","WebGL2RenderingContext","Notification","PushManager","PushSubscription","PushSubscriptionOptions"];'
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
     + ' , intlV8: (function () { try { return "v8BreakIterator" in Intl; } catch (e) { return "ERR"; } })()'
     + ' , intlOwn: (function () { try { return Object.getOwnPropertyNames(Intl).indexOf("v8BreakIterator") !== -1; } catch (e) { return "ERR"; } })()'
+    // Worker 作用域补建面（F-37 / F-38）：真机 WebKit Worker 有、Chromium
+    // Worker 没有的 43 个接口 + 真机 WorkerNavigator 的成员面 + 反方向删除。
+    + ' , wkAdd: (function () { var ns = ["FontFaceSet","CSSUnitValue","CSSMathSum","CSSTransformValue","CSSStyleValue","AudioDecoder","VideoDecoder","AudioEncoder","VideoEncoder","ManagedMediaSource","MediaStreamTrack","NavigationPreloadManager","Report","StylePropertyMapReadOnly","BufferedChangeEvent","VideoTrackGenerator","CSSSkewX","CSSTransformComponent","ServiceWorker","ServiceWorkerContainer","ServiceWorkerRegistration"];'
+    + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
+    + ' , wkNav: (function () { try { return Object.getOwnPropertyNames(WorkerNavigator.prototype); } catch (e) { return "ERR"; } })()'
+    // F-77 D3：真机 Worker 的 navigator.serviceWorker 是 WorkerNavigator
+    // 原型上的只读 getter，每次读同一个 ServiceWorkerContainer 实例；
+    // GPC 在 Worker 侧不存在（页面侧才有，见 pageGpc）。
+    + ' , wkSw: (function () { try {'
+    + ' var s = navigator.serviceWorker;'
+    + ' var d = Object.getOwnPropertyDescriptor(WorkerNavigator.prototype, "serviceWorker");'
+    + ' return {tag: Object.prototype.toString.call(s),'
+    + ' own: Object.getOwnPropertyNames(s),'
+    + ' same: s === navigator.serviceWorker,'
+    + ' ctrl: s.controller,'
+    + ' d: d ? [d.enumerable, d.configurable, typeof d.get, typeof d.set,'
+    + ' d.get && d.get.length] : null};'
+    + ' } catch (e) { return "ERR:" + e.name; } })()'
+    + ' , wkGpc: (function () { try { return "globalPrivacyControl" in WorkerNavigator.prototype; } catch (e) { return "ERR"; } })()'
+    + ' , wkCss: (function () { try { var v = new self.CSSUnitValue(5, "px");'
+    + ' var s = String(self.CSSStyleValue.prototype.toString); var L = String.fromCharCode(10);'
+    + ' return [String(v), v.type().length, String(new self.CSSMathSum(v, new self.CSSUnitValue(2, "px"))),'
+    + ' s === "function toString() {" + L + "    [native code]" + L + "}",'
+    + ' self.CSSNumericArray.prototype[Symbol.iterator] === self.CSSNumericArray.prototype.values];'
+    + ' } catch (e) { return "ERR:" + e.name; } })()'
+    + ' , wkBrand: (function () { try { self.CSSMathSum.prototype.values.get.call({}); return "no-throw"; }'
+    + ' catch (e) { return e.name + ":" + e.message; } })()'
+    + ' , wkLeak: (function () { return [typeof self.__wkStage, typeof self.__wkErr]; })()'
+    // F-130 / F-134：Worker 侧 ManagedMediaSource.isTypeSupported 与页面同口径
+    + ' , wkMms: (function () { try { var C = self.ManagedMediaSource;'
+    + ' if (typeof C !== "function") { return {absent: true}; }'
+    + ' var p = function (t) { try { return C.isTypeSupported(t); } catch (e) { return "ERR:" + e.name; } };'
+    + ' var d = Object.getOwnPropertyDescriptor(C, "isTypeSupported");'
+    + ' return {type: typeof C.isTypeSupported, own: !!d,'
+    + ' desc: d ? [d.enumerable, d.configurable, d.writable] : null,'
+    + ' length: typeof C.isTypeSupported === "function" ? C.isTypeSupported.length : null,'
+    + ' cases: {mp4: p("video/mp4"), mp4Codecs: p("video/mp4; codecs=avc1.42E01E"),'
+    + ' webm: p("video/webm"), webmVp9: p("video/webm; codecs=vp9"),'
+    + ' audioWebm: p("audio/webm"), ogg: p("audio/ogg"), upper: p("VIDEO/MP4")},'
+    + ' msMp4: self.MediaSource.isTypeSupported("video/mp4"),'
+    + ' msWebm: self.MediaSource.isTypeSupported("video/webm"),'
+    // F-142：Worker 侧 MediaSource.isTypeSupported 必须单独包装（它不是
+    // 补建出来的接口，走不到 __wkAddIfaceW），否则 Worker 仍是 Blink 口径。
+    + ' msOwn: !!Object.getOwnPropertyDescriptor(self.MediaSource, "isTypeSupported"),'
+    + ' msLen: self.MediaSource.isTypeSupported.length,'
+    + ' msNoArg: (function () { try { self.MediaSource.isTypeSupported(); return "no-throw"; }'
+    + ' catch (e) { return e.name + ":" + e.message; } })(),'
+    // F-133：Worker 的 WebCodecs 是 Blink 原生全局，补建链路会整条跳过，
+    // 静态 isConfigSupported 必须单独包成 WebKit 口径（异常文案 + 表）。
+    + ' msVp9: self.MediaSource.isTypeSupported("video/webm; codecs=vp9")};'
+    + ' } catch (e) { return "ERR:" + e.name; } })()'
+    + ' , wcIcs: (function () { try {'
+    + ' var C = self.VideoDecoder; if (typeof C !== "function") { return {absent: true}; }'
+    + ' var d = Object.getOwnPropertyDescriptor(C, "isConfigSupported");'
+    + ' var msg = function (cfg) { try { C.isConfigSupported(cfg); return "no-throw"; }'
+    + ' catch (e) { return e.name + ":" + e.message; } };'
+    + ' var A = self.AudioEncoder;'
+    + ' var amsg = function (cfg) { try { A.isConfigSupported(cfg); return "no-throw"; }'
+    + ' catch (e) { return e.name + ":" + e.message; } };'
+    + ' return {type: typeof C.isConfigSupported, own: !!d,'
+    + ' desc: d ? [d.enumerable, d.configurable, d.writable] : null,'
+    + ' length: C.isConfigSupported.length,'
+    + ' noArg: msg(), emptyCfg: msg({}),'
+    + ' aeNoRate: amsg({codec: "opus", numberOfChannels: 2}),'
+    + ' wcP: ((self.__wcP = (function () {'
+    + ' var E = self.VideoEncoder, A = self.AudioDecoder;'
+    + ' var q = function (c) { return C.isConfigSupported({codec: c})'
+    + ' .then(function (r) { return !!r.supported; }, function () { return "ERR"; }); };'
+    + ' var qe = function (c) { return E.isConfigSupported('
+    + ' {codec: c, width: 640, height: 480})'
+    + ' .then(function (r) { return !!r.supported; }, function () { return "ERR"; }); };'
+    + ' var qa = function (c) { return A.isConfigSupported('
+    + ' {codec: c, numberOfChannels: 2, sampleRate: 48000})'
+    + ' .then(function (r) { return !!r.supported; }, function () { return "ERR"; }); };'
+    + ' return Promise.all([q("vp8"), q("avc1.42E01E"), q("hvc1.1.6.L93.B0"),'
+    + ' q("hev1.1.6.L93.B0"), q("vp09.00.10.08"), q("vp09.02.10.10"),'
+    + ' q("av01.0.05M.08"), q("h264"), q("vp9"),'
+    + ' qe("avc1.42E01E"), qe("hvc1.1.6.L93.B0"), qe("av01.0.05M.08"),'
+    + ' qa("opus"), qa("pcm-s16"), qa("pcm-s20")]).then(function (v) {'
+    + ' return {vp8: v[0], avc1: v[1], hvc1: v[2], hev1: v[3], vp09: v[4],'
+    + ' vp09p2: v[5], av01: v[6], h264: v[7], vp9: v[8],'
+    + ' eAvc1: v[9], eHevc: v[10], eAv01: v[11],'
+    + ' adOpus: v[12], adPcm: v[13], adPcmBad: v[14]}; }); })()) && 0)};'
+    + ' } catch (e) { return "ERR:" + e.name; } })()'
     + ' , mediaW: (function () { var ns = ["WebKitPlaybackTargetAvailabilityEvent","WebKitMediaKeys","WebKitMediaKeySession","WebKitMediaKeyMessageEvent","WebKitMediaKeyNeededEvent","WebKitMediaKeyError","HTMLMediaElement","HTMLVideoElement"];'
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
-    + '}); }, 300);';
+    + '}); Promise.all([self.__wcP]).then(function (v) {'
+    + ' postMessage({wcCodecs: v[0]}); }, function () {'
+    + ' postMessage({wcCodecs: "ERR"}); }); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.__workerData = {};
   w.onmessage = function (ev) { for (var k in ev.data) { window.__workerData[k] = ev.data[k]; } };
@@ -1341,6 +2774,36 @@ ACCEPT_CH_VALUE = (
 ACCEPT_CH_HTML = """<!doctype html><html><head><script>
 fetch('/accept-ch-second').catch(function () {});
 </script></head><body>accept-ch</body></html>"""
+
+# iOS Chrome POST 重放面（B1-7）：真机 CriOS 的 POST 导航由宿主重放，
+# 最终文档的 window 上带 __crPostRequestWorkaround 命名空间 + 两个回执通道；
+# GET 文档上这三者都不存在。表单提交是唯一能产生真实 POST 导航的途径。
+POST_FORM_HTML = """<!doctype html><html><head><meta charset="utf-8"></head><body>
+<form id="pf" method="POST" action="/post-target">
+<input name="a" value="1"><button type="submit">go</button></form>
+</body></html>"""
+POST_TARGET_HTML = """<!doctype html><html><body>posted</body></html>"""
+CRIOS_POST_JS = """() => {
+  const mh = window.webkit && window.webkit.messageHandlers;
+  const ns = window.__crPostRequestWorkaround;
+  const fn = ns && ns.runPostRequest;
+  return {
+    path: location.pathname,
+    present: typeof ns !== 'undefined',
+    type: typeof ns,
+    keys: ns ? Object.keys(ns) : null,
+    runLen: typeof fn === 'function' ? fn.length : null,
+    runNative: typeof fn === 'function' ? /\\[native code\\]/.test(String(fn)) : null,
+    chanSuccess: mh ? ('POSTSuccessHandler' in mh) : null,
+    chanError: mh ? ('POSTErrorHandler' in mh) : null,
+    chanInvoke: mh ? ('crwebinvoke' in mh) : null,
+    chanOwn: mh ? Object.getOwnPropertyNames(mh) : null,
+    mhProtoOwn: mh ? Object.getOwnPropertyNames(Object.getPrototypeOf(mh)) : null,
+    flagLeak: Object.prototype.hasOwnProperty.call(window, '__fpwbPostNav'),
+    runSrc: typeof fn === 'function' ? String(fn) : null,
+    cookie: document.cookie,
+  };
+}"""
 
 # WebGPU 适配器信息：安全上下文（localhost/127.0.0.1）下读取 GPUAdapterInfo；
 # 真机 Android Chrome 报内核 Dawn gpu_info 映射的代际级架构名（qualcomm/
@@ -1634,6 +3097,122 @@ async def sensor_probe(page) -> dict:
     return out
 
 
+# 自动播放策略（F-28）：无用户激活时未静音媒体 play() 必拒，静音放行。
+AUTOPLAY_JS = """async () => {
+  // 1x1 静音 wav
+  const WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwA'
+            + 'AIhYAQACABAAZGF0YQAAAAA=';
+  const attempt = async (opts) => {
+    const a = document.createElement('audio');
+    a.src = WAV;
+    if (opts.muted) { a.muted = true; }
+    if (opts.playsInline) { a.playsInline = true; }
+    if (opts.volume !== undefined) { a.volume = opts.volume; }
+    document.body.appendChild(a);
+    let r;
+    try {
+      r = await Promise.race([
+        a.play().then(() => 'resolved',
+                      (e) => 'rejected:' + e.name + ':' + e.message),
+        new Promise((res) => setTimeout(() => res('pending'), 600)),
+      ]);
+    } catch (e) {
+      r = 'sync-throw:' + e.name;
+    } finally { try { a.remove(); } catch (e) {} }
+    return r;
+  };
+  const act = navigator.userActivation;
+  return {
+    active: !!(act && act.isActive),
+    plain: await attempt({}),
+    muted: await attempt({muted: true, playsInline: true}),
+    volumeZero: await attempt({volume: 0}),
+  };
+}"""
+
+
+async def autoplay_probe(ws_endpoint: str) -> dict:
+    """自动播放策略（F-28）：在全新标签页上以原始 CDP 测量。
+
+    必须绕开 Playwright：其 evaluate 固定带 userGesture=true，页面永远
+    处于「有激活」状态，量不到无手势那一侧。
+    """
+    import itertools
+
+    import websockets
+
+    probe: dict = {}
+    async with websockets.connect(ws_endpoint, max_size=64 * 1024 * 1024,
+                                  ping_interval=None, proxy=None) as ws:
+        ids = itertools.count(1)
+        pending: dict = {}
+
+        async def reader():
+            async for raw in ws:
+                msg = json.loads(raw)
+                mid = msg.get("id")
+                if mid is None:
+                    continue
+                fut = pending.pop(mid, None)
+                if fut and not fut.done():
+                    fut.set_result(msg)
+
+        rt = asyncio.create_task(reader())
+        async def send(method: str, params: dict | None = None,
+                       sid: str | None = None, timeout: float = 15.0) -> dict:
+            mid = next(ids)
+            msg: dict = {"id": mid, "method": method}
+            if params:
+                msg["params"] = params
+            if sid:
+                msg["sessionId"] = sid
+            fut = asyncio.get_running_loop().create_future()
+            pending[mid] = fut
+            await ws.send(json.dumps(msg))
+            try:
+                return await asyncio.wait_for(fut, timeout)
+            except asyncio.TimeoutError:
+                return {"__timeout__": True}
+
+        try:
+            res = await send("Target.createTarget", {"url": "about:blank"})
+            target_id = (res.get("result") or {}).get("targetId")
+            if not target_id:
+                return {"__stage__": "createTarget", "__res__": res}
+            at = await send("Target.attachToTarget",
+                            {"targetId": target_id, "flatten": True})
+            sid = (at.get("result") or {}).get("sessionId")
+            if not sid:
+                return {"__stage__": "attach", "__res__": at}
+            await send("Runtime.enable", {}, sid=sid)
+            # 等 mobile session 的 targetCreated 处理器把补丁挂到该 target 上
+            # （与 race_test 同理，轮询一个已知补丁标记）。
+            for _ in range(40):
+                chk = await send("Runtime.evaluate", {
+                    "expression": "typeof window.__mobilePatch === 'number'",
+                    "returnByValue": True,
+                }, sid=sid, timeout=3.0)
+                if ((chk.get("result") or {}).get("result") or {}).get("value"):
+                    break
+                await asyncio.sleep(0.15)
+            r = await send("Runtime.evaluate", {
+                # AUTOPLAY_JS 是函数表达式；原始 CDP 不会自动调用（Playwright
+                # 的 evaluate 才会），这里显式执行。
+                "expression": "(" + AUTOPLAY_JS + ")()",
+                "awaitPromise": True,
+                "returnByValue": True, "userGesture": False,
+            }, sid=sid, timeout=20.0)
+            val = (((r.get("result") or {}).get("result")) or {}).get("value")
+            if isinstance(val, dict):
+                probe = val
+            else:
+                probe = {"__raw__": r}
+            await send("Target.closeTarget", {"targetId": target_id})
+        finally:
+            rt.cancel()
+    return probe
+
+
 # 安全区读数：自定义属性接住 env()，未定义的变量读到空串、0 读 "0px"
 SAFE_AREA_JS = """() => {
   const el = document.createElement('div');
@@ -1733,6 +3312,109 @@ def _aig_from_orientation(beta_deg: float, gamma_deg: float) -> tuple:
             9.80665 * math.cos(beta) * math.cos(gamma))
 
 
+# F-43：各 locale 的星期空格口径（真机 WebKit 实测，2026-10-21）
+# 表里是「显式组合（year+month+day+weekday）是否在『日』后留空格」；
+# dateStyle full 一律留空格（引擎模板自带）
+_INTL_WEEK_SPACE = {
+    "zh-CN": True, "zh-Hans-CN": True, "zh-SG": True, "zh-MO": True,
+    "zh-HK": True, "zh-Hant-HK": True, "ja-JP": True,
+    "zh-TW": False, "zh-Hant": False,
+}
+# 真机里窄星期（narrow）也有空格的 locale
+_INTL_NARROW_SPACE = {
+    "zh-CN", "zh-Hans-CN", "zh-SG", "zh-MO", "zh-HK", "zh-Hant-HK",
+}
+# F-43：真机时区名位置口径（显式 timeZoneName / dateStyle full 两条路径）
+# 2026-10-20T06:05:09Z @ America/Los_Angeles → 本地 2026-10-19 23:05:09
+_INTL_TZ_EXP = {
+    "zh-CN": "GMT-7 23:05",
+    "zh-SG": "GMT-7晚上11:05",
+    "zh-HK": "下午11:05 [PDT]",
+    "zh-MO": "晚上11:05 [PDT]",
+    "zh-TW": "PDT 晚上11:05",
+    "zh-Hant": "PDT 晚上11:05",
+    "zh-Hant-HK": "下午11:05 [PDT]",
+    "ja-JP": "23:05 GMT-7",
+}
+_INTL_TZ_STYLE = {
+    "zh-CN": "2026年10月19日 星期一 北美太平洋夏令时间23:05:09",
+    "zh-SG": "2026年10月19日 星期一 北美太平洋夏令时间晚上11:05:09",
+    "zh-HK": "2026年10月19日 星期一 下午11:05:09 [北美太平洋夏令時間]",
+    "zh-MO": "2026年10月19日 星期一 晚上11:05:09 [北美太平洋夏令時間]",
+    "zh-TW": "2026年10月19日 星期一 太平洋夏令時間 晚上11:05:09",
+    "zh-Hant": "2026年10月19日 星期一 太平洋夏令時間 晚上11:05:09",
+    "zh-Hant-HK": "2026年10月19日 星期一 北美太平洋夏令時間 下午11:05:09",
+    "ja-JP": "2026年10月19日 月曜日 23時05分09秒 米国太平洋夏時間",
+}
+
+
+def _intl_tz_ok(locales: dict) -> bool:
+    """逐 locale 核对时区名位置（显式 timeZoneName / dateStyle 两条路径）。"""
+    if not locales:
+        return False
+    for loc, want in _INTL_TZ_EXP.items():
+        row = locales.get(loc)
+        if not isinstance(row, dict) or row.get("tzExp") != want:
+            return False
+    for loc, want in _INTL_TZ_STYLE.items():
+        row = locales.get(loc)
+        if not isinstance(row, dict) or row.get("tzStyle") != want:
+            return False
+    return True
+
+
+# F-43：真机 12 小时制 dayPeriod（下标 = 本地小时）
+_INTL_DP_HOURS = {
+    "zh-CN": ["凌晨"] * 5 + ["早上"] * 3 + ["上午"] * 4 + ["中午"]
+             + ["下午"] * 6 + ["晚上"] * 5,
+    "zh-TW": ["凌晨"] * 5 + ["清晨"] * 3 + ["上午"] * 4 + ["中午"]
+             + ["下午"] * 6 + ["晚上"] * 5,
+    "zh-HK": ["上午"] * 12 + ["下午"] * 12,
+}
+
+
+def _intl_locale_ok(locales: dict) -> bool:
+    """逐 locale 核对「日 星期」空格：full/显式/mdy 一致，narrow 按表。"""
+    if not locales:
+        return False
+    for loc, want in _INTL_WEEK_SPACE.items():
+        row = locales.get(loc)
+        if not isinstance(row, dict):
+            return False
+        full = row.get("dateFull", "")
+        exp = row.get("exp", "")
+        dy = row.get("dy", "")
+        narrow = row.get("narrow", "")
+        if want:
+            # 真机：dateStyle 与显式组合都在「日」后留空格
+            if "日 " not in full or "日 " not in exp:
+                return False
+            # 只有「日」而无月份时简繁把「日」换成空格（19 星期一）；
+            # 日文的「19日」是日期后缀，不在此列
+            if loc != "ja-JP" and "日" in dy and "日 " not in dy:
+                return False
+        else:
+            # zh-TW/zh-Hant：dateStyle 有空格（引擎自带），显式组合没有
+            if "日 " in exp or "日 " in dy:
+                return False
+        # 窄星期：只有表里的 locale 插空格
+        if ("日 " in narrow) != (loc in _INTL_NARROW_SPACE):
+            return False
+    return True
+
+
+def _intl_dp_ok(rows_by_loc: dict) -> bool:
+    if not rows_by_loc:
+        return False
+    for loc, want in _INTL_DP_HOURS.items():
+        got = rows_by_loc.get(loc)
+        if not isinstance(got, list) or len(got) != 24:
+            return False
+        if list(got) != want:
+            return False
+    return True
+
+
 async def race_test(ws_endpoint: str) -> dict:
     """模拟用户新开标签页：目标被本会话门控 → 首个文档必须在补丁生效后执行。
 
@@ -1764,7 +3446,7 @@ async def race_test(ws_endpoint: str) -> dict:
     probe: dict = {}
     try:
         async with websockets.connect(ws_endpoint, max_size=64 * 1024 * 1024,
-                                      ping_interval=None) as ws:
+                                      ping_interval=None, proxy=None) as ws:
             ids = itertools.count(1)
             pending: dict = {}
 
@@ -1857,12 +3539,13 @@ async def heal_test(manager, profile_id: str, ws_endpoint: str) -> dict:
         return out
 
     # 断开：模拟通道静默死亡。读循环立即标记不健康（看门狗 1s 内进入重连）
+    out["verified_before"] = getattr(sess, "emulation_verified", None)
     await sess._ws.close()
     await asyncio.sleep(0.1)
     out["state_down"] = manager.emulation_state(profile_id)
 
     async with websockets.connect(ws_endpoint, max_size=64 * 1024 * 1024,
-                                  ping_interval=None) as ws:
+                                  ping_interval=None, proxy=None) as ws:
         ids = itertools.count(1)
         pending: dict = {}
 
@@ -1920,6 +3603,7 @@ async def heal_test(manager, profile_id: str, ws_endpoint: str) -> dict:
                     break
             out["healthy"] = bool(sess.healthy)
             out["reconnects"] = int(getattr(sess, "reconnect_count", 0))
+            out["ua_guard_count"] = int(getattr(sess, "ua_guard_count", 0))
             out["state_after"] = manager.emulation_state(profile_id)
             await asyncio.sleep(0.5)
             out["outage_healed"] = await read_page(outage_tid) if outage_tid else {}
@@ -2018,7 +3702,9 @@ async def main() -> int:
     media_state: dict = {}
     event_state: dict = {}
     sensor_state: dict = {}
+    autoplay_state: dict = {}
     safe_area_state: dict = {}
+    post_state: dict = {}
     heal_state: dict = {}
 
     from playwright.async_api import async_playwright
@@ -2090,6 +3776,8 @@ async def main() -> int:
                     body = ('<!doctype html><html><head><meta name="viewport" '
                             'content="width=device-width,initial-scale=1">'
                             '</head><body>plain</body></html>')
+                elif self.path.startswith("/post-form"):
+                    body = POST_FORM_HTML
                 else:
                     body = OOPIF_MAIN_HTML
                 data = body.replace("__PORT__", str(oopif_state["port"])).encode("utf-8")
@@ -2097,6 +3785,20 @@ async def main() -> int:
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 for hname, hvalue in extra_headers.items():
                     self.send_header(hname, hvalue)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                # 标记 cookie 是浏览器侧种的，请求阶段的实收头里不该出现
+                oopif_state.setdefault("post_cookies", []).append(
+                    self.headers.get("Cookie") or "")
+                data = (POST_TARGET_HTML if self.path.startswith("/post-target")
+                        else "not found").encode("utf-8")
+                self.send_response(200 if self.path.startswith("/post-target") else 404)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -2124,7 +3826,7 @@ async def main() -> int:
                     " worker: window.workerData || null,"
                     " workerErr: window.workerErr || null})")
                 wk = bundle.get("worker") or {}
-                if bundle.get("msgs") and "late" in wk:
+                if bundle.get("msgs") and "late" in wk and "wcCodecs" in wk:
                     break
                 await asyncio.sleep(0.25)
             worker_state = bundle.get("worker") or {}
@@ -2174,10 +3876,30 @@ async def main() -> int:
             print("\n== 传感器面（devicemotion / deviceorientation）==")
             print(json.dumps(sensor_state, ensure_ascii=False))
 
+            # ---- 自动播放策略（F-28）：全新页面，无用户激活 ----
+            autoplay_state = await autoplay_probe(direct)
+            print("\n== 自动播放策略（无手势）==")
+            print(json.dumps(autoplay_state, ensure_ascii=False))
+
             # ---- 安全区（P2-5 后半）：env(safe-area-inset-*) 计算值 ----
             safe_area_state = await safe_area_probe(page, oopif_state["port"])
             print("\n== 安全区（cover / 普通页面 / 二次 cover）==")
             print(json.dumps(safe_area_state, ensure_ascii=False))
+
+            # ---- 表单 POST 导航（B1-7）：对比 GET / POST 文档的 CriOS 重放面 ----
+            post_state: dict = {}
+            post_url = f"http://127.0.0.1:{oopif_state['port']}/post-form"
+            await page.goto(post_url, wait_until="domcontentloaded")
+            post_state["get_before"] = await page.evaluate(CRIOS_POST_JS)
+            async with page.expect_navigation(wait_until="domcontentloaded"):
+                await page.evaluate("() => document.getElementById('pf').submit()")
+            post_state["post"] = await page.evaluate(CRIOS_POST_JS)
+            await page.goto(post_url, wait_until="domcontentloaded")
+            post_state["get_after"] = await page.evaluate(CRIOS_POST_JS)
+            post_state["cookie_leak"] = any(
+                "__fpwb_pn_" in c for c in (oopif_state.get("post_cookies") or []))
+            print("\n== 表单 POST 导航（CriOS 重放面，GET 对照）==")
+            print(json.dumps(post_state, ensure_ascii=False))
 
             # ---- 断线自愈回归：仿真通道静默断开 → 看门狗自动重连 → 全页面重放 ----
             print("\n== 断线自愈回归（看门狗：断开 → 自动重连 → 重放）==")
@@ -2199,6 +3921,11 @@ async def main() -> int:
     drag_ts = drag.get("tsDeltas") or []
     drag_dy = drag.get("dy") or []
     drag_force = drag.get("force") or []
+
+    def _ua_guard_count() -> int:
+        """F-86：读仿真会话的 UA 竞态兜底次数（环境已停止 → 取 0）。"""
+        sess = (heal_state or {}).get("ua_guard_count")
+        return int(sess or 0)
 
     checks: dict[str, bool] = {
         "已按 start_url 导航": "example.com" in (state["url"] or ""),
@@ -2285,6 +4012,16 @@ async def main() -> int:
         "竞态：首文档触控已启用": int(probe.get("touch") or 0) >= 5,
         "竞态：首文档时区已对齐": probe.get("tz") == "America/Los_Angeles",
         "竞态：首文档 GPU 已替换": (probe.get("webgl") or "") == vc.get("renderer"),
+        # ---- F-86：UA 竞态兜底 ----
+        # 首文档 UA 一旦落成内核默认 iOS 形态（iPad 机型表现为 UA 与
+        # platform 自相矛盾），页面脚本读到的那一刻就已经错了——兜底只能在
+        # 提交后补发覆盖，因此这里断言的是「兜底通道在工作且没有反复触发」：
+        # 计数 ≤ 1 说明最多只遇到一次竞态，且补发后没有再次漂移。
+        "F-86：UA 竞态兜底未反复触发（≤1 次）": (
+            _ua_guard_count() <= 1),
+        "F-86：UA 与 platform 自洽（iPad 不得出现 iPhone 形态）": (
+            not ("iPhone" in (state.get("userAgent") or "")
+                 and state.get("platform") == "iPad")),
         # ---- 补丁函数原生性（BrowserScan「Canvas Tampering」的触发点）----
         "补丁函数 toString 呈原生": all([
             (state.get("integrity") or {}).get("webglGetParameterNative") is True,
@@ -2296,8 +4033,12 @@ async def main() -> int:
         "colorDepth getter 原生且 enumerable": (
             (state.get("integrity") or {}).get("colorDepthGetterNative") is True
             and (state.get("integrity") or {}).get("colorDepthEnumerable") is True),
-        # ---- BrowserScan 服务端 OS 判定输入：语音列表必须为空 ----
-        "speechSynthesis 语音列表为空": state.get("voices") == 0,
+        # ---- BrowserScan 服务端 OS 判定输入：语音列表口径 ----
+        # iOS：真机 Safari 无手势时为空列表；Android：真机 Chrome Android 预装
+        # Google TTS，返回数十条（F-45）——空列表本身就是 Android 身份的判据。
+        "speechSynthesis 语音列表符合平台口径（iOS 空 / Android 数十条）": (
+            state.get("voices") == 0 if target_os == "ios"
+            else 20 <= (state.get("voices") or 0) <= 80),
         # ---- BrowserScan webglNoise：readPixels 纯净（内核 canvas 伪装已关闭）----
         "WebGL readPixels 无噪声（R==A）": state.get("webglNoise") == 0,
         # ---- BrowserScan E()：getParameter 耗时须与原生同量级（Z<=100）----
@@ -2309,7 +4050,13 @@ async def main() -> int:
     fr = frame_state if isinstance(frame_state, dict) else {}
     fr_live = fr.get("live") if isinstance(fr.get("live"), dict) else {}
     fr_worker = fr.get("worker") if isinstance(fr.get("worker"), dict) else {}
+    # ---- 表单 POST 导航（B1-7）：GET / POST 文档的 CriOS 重放面对照 ----
+    post = post_state.get("post") if isinstance(post_state, dict) else None
+    post = post if isinstance(post, dict) else {}
     wk_main = worker_state if isinstance(worker_state, dict) else {}
+    state["wkIcs"] = wk_main.get("wcIcs")
+    state["wcCodecs"] = wk_main.get("wcCodecs")
+    state["wkSw"] = wk_main.get("wkSw")
     # ---- Accept-CH：声明后同源请求实际收到的头（真机 Chrome 补高熵）----
     ac_first = (accept_ch_state or {}).get("first") or {}
     ac_second = (accept_ch_state or {}).get("second") or {}
@@ -2360,6 +4107,9 @@ async def main() -> int:
     med = eng.get("media") or {}
     ntf = eng.get("notif") or {}
     tf = eng.get("touchFactory") or {}
+    f98 = eng.get("cssF98") if isinstance(eng.get("cssF98"), dict) else {}
+    f99 = eng.get("cssF99") if isinstance(eng.get("cssF99"), dict) else {}
+    mms = state.get("mms") if isinstance(state.get("mms"), dict) else {}
     aig_mag = _sensor_magnitude(last_motion.get("aig"))
     lin_mag = _sensor_magnitude(last_motion.get("acc"))
     gyro_mag = _sensor_magnitude(last_motion.get("rr"))
@@ -2406,6 +4156,78 @@ async def main() -> int:
             "WebHID 不存在（Android Chrome 未实现）": state["hasHid"] is False,
             "WebUSB 存在（Chrome Android 148 支持）": state["hasUsb"] is True,
             "Web Serial 存在（Chrome Android 148 支持）": state["hasSerial"] is True,
+            # ---- F-40 / F-49 / F-51：Android 侧同口径（BCD chrome_android）----
+            "navigator.mediaDevices.getDisplayMedia 不存在（BCD chrome_android=false）": (
+                state["mdGdm"] == "undefined"),
+            "CSS.paintWorklet 存在（Chrome Android 65+）": (
+                state["paintWorklet"] == "object"),
+            "select/input showPicker 均存在（Chrome Android 137/122+）": (
+                state["selectShowPicker"] == "function"
+                and state["inputShowPicker"] == "function"),
+            # ---- F-52 / F-55 / F-56：Android 侧保留 Blink 口径 ----
+            "canvas webp 编码可用（Chrome Android 32+）": (
+                str(state.get("canvasWebp") or "").startswith("data:image/webp")),
+            # ---- F-104 / F-108 / F-109 / F-111 / F-112 / F-113：Android 保留面 ----
+            "原型成员：Android 保留 Canvas 2D / HTMLMediaElement / iframe Blink 成员": (
+                (state.get("protoDrop") or {}).get("canvas2d", {})
+                    .get("fontKerning") is True
+                and (state.get("protoDrop") or {}).get("mediaElement", {})
+                    .get("controlsList") is True
+                and (state.get("protoDrop") or {}).get("iframe", {})
+                    .get("credentialless") is True
+                and (state.get("protoDrop") or {}).get("image", {})
+                    .get("sharedStorageWritable") is True),
+            # ---- F-120 / F-121：Android 媒体面（BCD chrome_android）----
+            # F-120 不是缺口：BCD 把 audioTracks/videoTracks 记在
+            # #enable-experimental-web-platform-features 之后，真机 Chrome
+            # Android 默认不暴露，仿真侧缺席才对。
+            "原型成员：Android audioTracks/videoTracks 缺席（实验特性门控，非缺口）": (
+                (state.get("protoDrop") or {}).get("mediaElement", {})
+                    .get("audioTracks") is False
+                and (state.get("protoDrop") or {}).get("mediaElement", {})
+                    .get("videoTracks") is False),
+            "原型成员：Android setSinkId/sinkId 缺席（桌面 Chrome 专有面）": (
+                (state.get("protoDrop") or {}).get("mediaElement", {})
+                    .get("setSinkId") is False
+                and (state.get("protoDrop") or {}).get("mediaElement", {})
+                    .get("sinkId") is False
+                and (state.get("protoDrop") or {}).get("mediaElement", {})
+                    .get("onsinkchange") is False),
+            # ---- F-103：Capture Handle 是桌面 Chrome 专有面，Android 也缺席 ----
+            "原型成员：Android Capture Handle 缺席（chrome_android=false）": (
+                (state.get("protoDrop") or {}).get("mediaDevices", {})
+                    .get("setCaptureHandleConfig") is False
+                and (state.get("protoDrop") or {}).get("mediaTrack", {})
+                    .get("getCaptureHandle") is False),
+            "MediaRecorder webm 系可用（Blink 口径）": (
+                state["mrWebm"] is True and state["mrWebmH264"] is True),
+            "2D getContextAttributes 保留 Blink 键集（含 alpha）": (
+                "alpha" in (state.get("ctx2dAttrs") or [])),
+            # ---- F-43：Android 侧保持 Blink ICU 口径（真机 Chrome Android）----
+            "Intl zh-CN full 无「日 星期」空格（Blink ICU）": (
+                isinstance(state.get("intlZh"), dict)
+                and "日星期" in state["intlZh"]["dateFull"]
+                and state["intlZh"]["timeFull"] ==
+                    "北美太平洋夏令时间 23:05:09"
+                and state["intlZh"]["h12"].endswith("下午11:05:09")),
+            # ---- F-58 / F-59：Android 侧与真机 Chrome Android 同引擎口径 ----
+            "UIEvent.prototype 无 pageX/sourceCapabilities 在 Blink 位置": (
+                "sourceCapabilities" in (state.get("uiEventProto") or [])
+                and state.get("uiPageX") is False),
+            "AnimationEvent/TransitionEvent 无 legacy animation（Blink 已移除）": (
+                state.get("animHasAnimation") is False
+                and state.get("transHasAnimation") is False),
+            # ---- F-48：Android 的 visualViewport 与 innerHeight 相等（正确形态）----
+            "visualViewport.height == innerHeight（Chrome Android 行为）": (
+                isinstance(state.get("vvH"), (int, float))
+                and state.get("vvH") == state.get("innerH")),
+            # ---- F-46：Android 控件字体为 Roboto（非宿主 Arial）----
+            "控件字体族为 Roboto（真机 Chrome Android 口径）": (
+                "Roboto" in (state.get("uaFormStyles") or {})
+                    .get("select", {}).get("fontFamily", "")),
+            # ---- F-54：无手势 AudioContext 为 suspended ----
+            "AudioContext 无手势时为 suspended（Chrome Android 自动播放策略）": (
+                state.get("acStateNoGesture") == "suspended"),
             "Web Bluetooth 存在（Chrome Android 支持）": state["hasBluetooth"] is True,
             "Web MIDI 存在（Chrome Android 支持）": state["hasMidiAccess"] is True,
             "performance.memory 存在（Chrome 非标准扩展，Android 亦有）": (
@@ -2659,12 +4481,189 @@ async def main() -> int:
                 and sa_cover.get("top") == "0px"
                 and sa_cover.get("bottom") == "0px"
                 and sa_plain.get("top") == "0px"),
+            # Worker 补建表只服务 iOS（WebKit Worker 面）；Android Chrome 的
+            # Worker 里这些接口本就不存在，误挂会反向穿帮。WebCodecs 四件套 /
+            # NavigationPreloadManager / CSSSkewX 是 Chromium Worker 原生就有的，
+            # 不在断言范围内。
+            "Worker：iOS 补建面在 Android 上全缺席（未误伤）": (
+                all((wk_main.get("wkAdd") or {}).get(n) == "undefined"
+                    for n in ("FontFaceSet", "CSSUnitValue", "CSSMathSum",
+                              "CSSTransformValue", "CSSStyleValue",
+                              "ManagedMediaSource", "MediaStreamTrack", "Report",
+                              "StylePropertyMapReadOnly", "BufferedChangeEvent",
+                              "VideoTrackGenerator", "CSSTransformComponent",
+                              "ServiceWorker", "ServiceWorkerContainer"))
+                and len(wk_main.get("wkAdd") or {}) == 21),
+            "Worker：WorkerNavigator 未被裁剪（Chromium 面保留）": (
+                isinstance(wk_main.get("wkNav"), list)
+                and "connection" in wk_main["wkNav"]
+                and "deviceMemory" in wk_main["wkNav"]
+                and "globalPrivacyControl" not in wk_main["wkNav"]),
         })
     else:
         is_ios_chrome = extra.get("browser") == "chrome_ios"
+        # F-73：版本门控后的保留面随 profile 的 iOS 版本变化——断言必须
+        # 用同一份门控表推导期望，不能写死「真机存在」。
+        _ios_ver = _parse_ios_version(extra.get("osVersion")) or (0,)
+        _ios_at_least = lambda major, minor=0: _ios_ver >= (major, minor)
         _is_ipad = (nav.get("platform") == "iPad"
                     or "iPad" in (nav.get("userAgent") or ""))
+        _av1 = _ios_av1_capable(str((extra or {}).get("model") or ""),
+                                str((extra or {}).get("marketName") or ""))
         checks.update({
+            # ---- Worker 作用域补建面（F-37 / F-38）----
+            # Worker 不继承页面 init 脚本：检测方在 Worker 里一行
+            # `'FontFaceSet' in self` 即可判假，所以补建必须发生在 Worker 全局。
+            # F-85：AudioDecoder / AudioEncoder 是 Safari 26 才有的 WebCodecs
+            # 音频侧，Worker 补建表同样按版本门控（低版本 profile 上必须缺席）。
+            "Worker：补建接口在页面 Worker 里全部存在": (
+                all(v == "function" for k, v in (wk_main.get("wkAdd") or {}).items()
+                    if k not in ("AudioDecoder", "AudioEncoder"))
+                and all((wk_main.get("wkAdd") or {}).get(n)
+                        == ("function" if _ios_at_least(26) else "undefined")
+                        for n in ("AudioDecoder", "AudioEncoder"))
+                and len(wk_main.get("wkAdd") or {}) == 21),
+            "Worker：跨域 iframe Worker 同口径补建": (
+                all(v == "function" for k, v in (fr_worker.get("wkAdd") or {}).items()
+                    if k not in ("AudioDecoder", "AudioEncoder"))
+                and all((fr_worker.get("wkAdd") or {}).get(n)
+                        == ("function" if _ios_at_least(26) else "undefined")
+                        for n in ("AudioDecoder", "AudioEncoder"))
+                and len(fr_worker.get("wkAdd") or {}) == 21),
+            "Worker：WorkerNavigator 只留真机 16 个成员（serviceWorker 在、GPC 不在）": (
+                isinstance(wk_main.get("wkNav"), list)
+                and wk_main["wkNav"][:1] == ["constructor"]
+                and wk_main["wkNav"][1:] == _IOS_WORKER_NAV_PROTO
+                and wk_main.get("wkGpc") is False),
+            # F-77 D3：真机 Worker 的 navigator.serviceWorker 是原型上的只读
+            # getter（enumerable true、无 setter、get.length 0），每次读同一个
+            # 实例；实例零自有属性、controller 为 null。
+            "Worker：navigator.serviceWorker 为 SameObject 的 ServiceWorkerContainer": (
+                (wk_main.get("wkSw") or {}).get("tag")
+                    == "[object ServiceWorkerContainer]"
+                and (wk_main.get("wkSw") or {}).get("own") == []
+                and (wk_main.get("wkSw") or {}).get("same") is True
+                and (wk_main.get("wkSw") or {}).get("ctrl") is None
+                and (wk_main.get("wkSw") or {}).get("d") == [True, True, "function", "undefined", 0]),
+            "Worker：CSS Typed OM 字符串化/iterator/原生外观与真机一致": (
+                wk_main.get("wkCss") == ["5px", 1, "calc(5px + 2px)", True, True]),
+            "Worker：品牌校验为 WebKit 文案": (
+                wk_main.get("wkBrand")
+                == "TypeError:The CSSMathSum.values getter can only be used on"
+                   " instances of CSSMathSum"),
+            "Worker：无调试残留（__wkStage/__wkErr 不挂在全局）": (
+                wk_main.get("wkLeak") == ["undefined", "undefined"]),
+            # ---- F-130 / F-134 / F-142：ManagedMediaSource 静态 isTypeSupported ----
+            # 真机（Playwright WebKit 27.2）：静态方法自有的数据属性
+            # {writable:true, enumerable:true, configurable:true}、length 1，
+            # 无参抛 'Not enough arguments'；判定走 F-142 的 MSE 独立真值表
+            # （WebM 解析器优先、否则 AVFoundation），与 canPlayType 不同源：
+            # webm 容器 true、其中 vp9 false（iOS 无 SW VP9）、vp8 true；
+            # ogg 容器 false（iOS 无 Ogg 解析器）；essence 大小写敏感。
+            # F-123：av01 与 WebM 的 av1HardwareDecoderAvailable() 同受
+            # VideoToolbox 硬解门控 → 跟随机型能力位，非恒 false。
+            "ManagedMediaSource.isTypeSupported：存在且为真机形态": (
+                isinstance(mms, dict) and mms.get("absent") is False
+                and mms.get("type") == "function"
+                and mms.get("own") is True
+                and mms.get("desc") == [True, True, True, "function"]
+                and mms.get("length") == 1
+                and mms.get("native") is True
+                and mms.get("inheritsMS") is True),
+            "ManagedMediaSource.isTypeSupported：mp4/webm 容器 true、vp9/ogg/mkv false": (
+                isinstance(mms, dict)
+                and mms.get("cases") == {
+                    "mp4": True, "mp4Codecs": True, "audioMp4": True,
+                    "mp2t": True, "webm": True, "webmVp9": False,
+                    "audioWebm": True, "ogg": False, "mkv": False,
+                    "upper": False, "spaces": True,
+                    "webmVp8": True, "webmVp9NoQ": False, "webmVp9Full": False,
+                    "webmOpus": True, "mp4Dovi": True, "mp4Opus": False,
+                    "mp4Flac": False, "mp4Av1": _av1}),
+            # F-142 验收串（清单 §46 点名的取值，两条 MSE 面同表）：
+            # vp9 false / vp8 true / opus-in-webm true / dvh1 true /
+            # mp4 内 opus false（AVFoundation 不认小写 opus，只认 'Opus'）/
+            # flac-in-mp4 false（MSE 与 canPlayType 不同源的关键反例）。
+            "ManagedMediaSource.isTypeSupported：ledger 验收串逐条命中（F-142）": (
+                isinstance(mms, dict)
+                and (mms.get("cases") or {}).get("webmVp8") is True
+                and (mms.get("cases") or {}).get("webmVp9NoQ") is False
+                and (mms.get("cases") or {}).get("webmVp9Full") is False
+                and (mms.get("cases") or {}).get("webmOpus") is True
+                and (mms.get("cases") or {}).get("mp4Dovi") is True
+                and (mms.get("cases") or {}).get("mp4Opus") is False
+                and (mms.get("cases") or {}).get("mp4Flac") is False),
+            "MediaSource.isTypeSupported：自有静态、与 ManagedMediaSource 同表（F-142）": (
+                (mms.get("msLen") == 1)
+                and (mms.get("msNative") is True)
+                and (mms.get("msCases") == {
+                    "webmVp9": False, "webmVp8": True, "webmOpus": True,
+                    "ogg": False, "mp4Av1": _av1,
+                    "noArg": "TypeError:Not enough arguments"})),
+            # 不与原生 MediaSource.isTypeSupported 对拍：fp-chromium 内核
+            # 未编入 MSE 解码器，原生面一律 false（video/mp4 也 false），
+            # 在本环境里当不了真机口径的参照物。msMp4/msWebm 仅作读数保留。
+            "ManagedMediaSource.isTypeSupported：无参抛 WebKit 文案、非字符串参数不抛": (
+                isinstance(mms, dict)
+                and mms.get("noArg") == "TypeError:Not enough arguments"
+                and mms.get("undef") is False
+                and mms.get("nul") is False),
+            "Worker：ManagedMediaSource.isTypeSupported 与页面同口径（F-134/F-142）": (
+                isinstance(wk_main.get("wkMms"), dict)
+                and wk_main["wkMms"].get("type") == "function"
+                and wk_main["wkMms"].get("length") == 1
+                and wk_main["wkMms"].get("desc") == [True, True, True]
+                and wk_main["wkMms"].get("cases") == {
+                    "mp4": True, "mp4Codecs": True, "webm": True,
+                    "webmVp9": False, "audioWebm": True, "ogg": False,
+                    "upper": False}),
+            # F-142：Worker 的 MediaSource 是原生 Blink 全局，不经过补建路径，
+            # 必须单独包装；否则 Worker 面 webm 家族 true、无参文案为 Blink 版。
+            "Worker：MediaSource.isTypeSupported 走同一张 MSE 真值表（F-142）": (
+                isinstance(wk_main.get("wkMms"), dict)
+                and wk_main["wkMms"].get("msOwn") is True
+                and wk_main["wkMms"].get("msLen") == 1
+                and wk_main["wkMms"].get("msNoArg")
+                    == "TypeError:Not enough arguments"
+                and wk_main["wkMms"].get("msMp4") is True
+                and wk_main["wkMms"].get("msVp9") is False),
+            # F-133：Worker 的 WebCodecs 静态面。fp-chromium 的 Worker 原生
+            # 就带这四个类，补建链路（existing && !repair）整条跳过，因此
+            # isConfigSupported 必须单独包一层——否则异常文案与 codec 表都是
+            # Blink 口径。av01 由 WebCodecsAV1Enabled（COCOA 默认 false，
+            # status: preview）门控，与机型有无 AV1 硬解无关。
+            "Worker：VideoDecoder.isConfigSupported 走 WebKit 口径（F-133）": (
+                isinstance(wk_main.get("wcIcs"), dict)
+                and wk_main["wcIcs"].get("type") == "function"
+                and wk_main["wcIcs"].get("own") is True
+                and wk_main["wcIcs"].get("desc") == [True, True, True]
+                and wk_main["wcIcs"].get("length") == 1
+                and wk_main["wcIcs"].get("noArg")
+                    == "TypeError:Not enough arguments"
+                and wk_main["wcIcs"].get("emptyCfg")
+                    == "TypeError:Member WebCodecsVideoDecoderConfig.codec is"
+                       " required and must be an instance of DOMString"),
+            "Worker：AudioEncoder.isConfigSupported 校验顺序 codec→ch→rate（F-133）": (
+                isinstance(wk_main.get("wcIcs"), dict)
+                and wk_main["wcIcs"].get("aeNoRate")
+                    == "TypeError:Member WebCodecsAudioEncoderConfig.sampleRate is"
+                       " required and must be an instance of unsigned long"),
+            # F-133 表：WebKit main 的 isSupported*Codec 谓词。av01 由
+            # WebCodecsAV1Enabled（COCOA 默认 false）门控——与机型 AV1 硬解
+            # 无关，所以这里不按 _ios_av1_capable 分叉。
+            "Worker：VideoDecoder/Encoder 的 codec 矩阵 == WebKit 谓词（F-133）": (
+                isinstance(wk_main.get("wcCodecs"), dict)
+                and wk_main["wcCodecs"] == {
+                    "vp8": True, "avc1": True, "hvc1": True, "hev1": True,
+                    "vp09": True, "vp09p2": False, "av01": False,
+                    "h264": False, "vp9": False,
+                    "eAvc1": True, "eHevc": True, "eAv01": False,
+                    "adOpus": True, "adPcm": True, "adPcmBad": False}),
+            "Worker：AudioDecoder 认 opus / pcm-s16，不认 pcm-s20（F-133）": (
+                isinstance(wk_main.get("wcCodecs"), dict)
+                and wk_main["wcCodecs"].get("adOpus") is True
+                and wk_main["wcCodecs"].get("adPcm") is True
+                and wk_main["wcCodecs"].get("adPcmBad") is False),
             "UA-CH 不存在（Safari/CriOS 均无该 API）": state["uaData"] == "ABSENT",
             "getBattery 不存在（WKWebView 无该 API）": state["hasGetBattery"] is False,
             "deviceMemory 不暴露（WKWebView 无该 API）": state["deviceMemory"] is None,
@@ -2704,18 +4703,126 @@ async def main() -> int:
                 (state.get("canPlay") or {}).get("native") is True
                 and (state.get("canPlay") or {}).get("length") == 1
                 and (state.get("canPlay") or {}).get("illegal") == "TypeError"),
-            # ---- P2-1：iOS 额外剔除计时扩展（Apple 物理封禁 Spectre 侧信道）----
-            "WebGL：S3TC/BPTC/polygon_mode 缺席": (
-                (state.get("webglSurface") or {}).get("getExtS3tc") is None
-                and not any(re.search(r"s3tc|bptc|polygon_mode", x, re.I)
-                            for x in ((state.get("webglSurface") or {}).get("exts") or []))),
-            "WebGL：EXT_disjoint_timer_query 缺席（iOS）": not any(
-                re.search(r"disjoint_timer_query", x, re.I)
-                for x in ((state.get("webglSurface") or {}).get("exts") or [])),
+            # ---- F-132：主世界 WebCodecs 静态面（原生 Blink 类只包静态）----
+            "WebCodecs：VideoDecoder.isConfigSupported 走 WebKit 文案（F-132）": (
+                isinstance(state.get("wcIcs"), dict)
+                and state["wcIcs"].get("type") == "function"
+                and state["wcIcs"].get("own") is True
+                and state["wcIcs"].get("desc") == [True, True, True]
+                and state["wcIcs"].get("length") == 1
+                and state["wcIcs"].get("native") is True
+                and state["wcIcs"].get("noArg")
+                    == "TypeError:Not enough arguments"
+                and state["wcIcs"].get("emptyCfg")
+                    == "TypeError:Member WebCodecsVideoDecoderConfig.codec is"
+                       " required and must be an instance of DOMString"),
+            "WebCodecs：AudioEncoder 校验顺序 codec→ch→rate（F-132）": (
+                isinstance(state.get("wcIcs"), dict)
+                and state["wcIcs"].get("aeNoRate")
+                    == "TypeError:Member WebCodecsAudioEncoderConfig.sampleRate is"
+                       " required and must be an instance of unsigned long"),
+            "WebCodecs：codec 矩阵 == WebKit 谓词（F-132）": (
+                isinstance(state.get("wcIcs"), dict)
+                and {k: v for k, v in state["wcIcs"].items()
+                     if k in ("vp8", "avc1", "hvc1", "hev1", "vp09", "vp09p2",
+                              "av01", "h264", "vp9", "eAvc1", "eHevc",
+                              "eAv01", "adOpus", "adPcm", "adPcmBad")} == {
+                    "vp8": True, "avc1": True, "hvc1": True, "hev1": True,
+                    "vp09": True, "vp09p2": False, "av01": False,
+                    "h264": False, "vp9": False,
+                    "eAvc1": True, "eHevc": True, "eAv01": False,
+                    "adOpus": True, "adPcm": True, "adPcmBad": False}),
+            "WebCodecs：VideoFrame 构造器保持原生（品牌校验未破坏）": (
+                isinstance(state.get("wcIcs"), dict)
+                and state["wcIcs"].get("vfNative") is True),
+            # ---- F-135：mediaCapabilities 收口（只包原型两方法，构造器/实例留原生）----
+            # 期望值锚定 Playwright WebKit 27.2 实测；AV1 两行按机型硬解门控分叉。
+            "mediaCapabilities：构造器/实例原生，两方法可写可枚举可配置": (
+                isinstance(state.get("mcCap"), dict)
+                and state["mcCap"].get("ctor") == "function"
+                and state["mcCap"].get("inst") is True
+                and state["mcCap"].get("decDesc") == [True, True, True]
+                and state["mcCap"].get("encDesc") == [True, True, True]
+                and state["mcCap"].get("decLen") == 1
+                and state["mcCap"].get("encLen") == 1
+                and state["mcCap"].get("ctorNative") is True),
+            "mediaCapabilities：decodingInfo 文件面 == WebKit 27.2": (
+                isinstance(state.get("mcDec"), dict)
+                and {k: v for k, v in state["mcDec"].items()
+                     if k in ("avc1", "hvc1", "hev1", "vp9mp4", "vp9webm",
+                              "mp4v", "mp4a", "aacBare", "flac", "opusMp4",
+                              "oggOpus", "alac", "unqAvc1", "unqTrail")} == {
+                    "avc1": "Smp", "hvc1": "Smp", "hev1": "---",
+                    "vp9mp4": "Smp", "vp9webm": "---",
+                    "mp4v": "Sm-", "mp4a": "S--", "aacBare": "---",
+                    "flac": "S--", "opusMp4": "---", "oggOpus": "S--",
+                    "alac": "S--", "unqAvc1": "Smp", "unqTrail": "Smp"}),
+            "mediaCapabilities：AV1 解码按机型硬解门控（F-135）": (
+                isinstance(state.get("mcDec"), dict)
+                and state["mcDec"].get("av01") == ("Smp" if _av1 else "---")
+                and state["mcDec"].get("rtcAv1")
+                    == ("Smp" if _av1 else "S--")),
+            # iOS 的 WebRTC VP9 硬件解码位恒 false（LibWebRTCProvider 默认实现），
+            # 与 macOS 的 Smp 分叉，走软件解码表；flexfec-03 在接收表里。
+            "mediaCapabilities：decodingInfo WebRTC 面（VP9 走 iOS 软件口径）": (
+                isinstance(state.get("mcDec"), dict)
+                and {k: v for k, v in state["mcDec"].items()
+                     if k in ("rtcVp8", "rtcVp9", "rtcH264", "rtcH265",
+                              "rtcFlexfec")} == {
+                    "rtcVp8": "Sm-", "rtcVp9": "Sm-", "rtcH264": "Smp",
+                    "rtcH265": "Smp", "rtcFlexfec": "S--"}),
+            "mediaCapabilities：异常文案与坏 receiver 校验 == WebKit": (
+                isinstance(state.get("mcDec"), dict)
+                and state["mcDec"].get("mp4Bare")
+                    == "REJ:TypeError:Type error"
+                and state["mcDec"].get("noArg")
+                    == "REJ:TypeError:Not enough arguments"
+                and state["mcDec"].get("badRecv")
+                    == "REJ:TypeError:Can only call MediaCapabilities.decodingInfo"
+                       " on instances of MediaCapabilities"),
+            # 发送能力表取自 GetRtpSenderCapabilities：没有 flexfec-03（只收不发）
+            "mediaCapabilities：encodingInfo 全表 == WebKit 27.2（flexfec 只收不发）": (
+                isinstance(state.get("mcEnc"), dict)
+                and {k: v for k, v in state["mcEnc"].items()
+                     if k in ("h264", "h265", "vp8", "vp9", "av1", "rtx",
+                              "red", "ulpfec", "flexfec", "opus",
+                              "record")} == {
+                    "h264": "Smp", "h265": "Smp", "vp8": "S--", "vp9": "S--",
+                    "av1": "S--", "rtx": "S--", "red": "S--", "ulpfec": "S--",
+                    "flexfec": "---", "opus": "S--", "record": "---"}
+                and state["mcEnc"].get("noArg")
+                    == "REJ:TypeError:Not enough arguments"),
+            # ---- F-23：iOS 走 ANGLE-Metal，扩展集与 macOS WebKit 同源 ----
+            # 真机**有** S3TC/BPTC/polygon_mode（此前误按「移动 GPU 不导出」
+            # 剔除，属反向判据），只有 Spectre 侧信道计时扩展被 Apple 封禁。
+            "WebGL：S3TC/BPTC 等在位（iOS ANGLE-Metal 真机口径）": (
+                bool((state.get("webglSurface") or {}).get("getExtS3tcBool")) is True
+                and ((state.get("webglSurface") or {}).get("gl2HasS3tc") is True)),
+            "WebGL：EXT_disjoint_timer_query 缺席（iOS）": (
+                (state.get("webglSurface") or {}).get("hasTimerQuery") is False
+                and (state.get("webglSurface") or {}).get("gl2HasTimer") is False),
+            "WebGL：WEBKIT_WEBGL_compressed_texture_pvrtc 补入（iOS 家族特征）": (
+                (state.get("webglSurface") or {}).get("getExtPvrtc") is True
+                and (state.get("webglSurface") or {}).get("pvrtcConst") == 0x8C02
+                and any("pvrtc" in x.lower()
+                        for x in ((state.get("webglSurface") or {}).get("exts") or []))),
             "WebGL：移动纹理扩展保留（ASTC/ETC）": (
                 (state.get("webglSurface") or {}).get("getExtAstc") is True),
-            "WebGL：扩展数 ≤ 27（桌面宿主 39）": (
-                ((state.get("webglSurface") or {}).get("extCount") or 99) <= 27),
+            # F-16 / F-91：版本串按枚举映射为 WebKit 真值。WebGL1 的
+            # SHADING_LANGUAGE_VERSION 自带 `(1.0)` 版本后缀，不是 Chromium
+            # 后缀，不能被「剥尾部括号」的通用正则吃掉。
+            "WebGL：VERSION / SHADING_LANGUAGE_VERSION 为 WebKit 口径": (
+                (state.get("webglSurface") or {}).get("glVersion") == "WebGL 1.0"
+                and (state.get("webglSurface") or {}).get("glSL")
+                == "WebGL GLSL ES 1.0 (1.0)"
+                and (state.get("webglSurface") or {}).get("gl2Version") == "WebGL 2.0"
+                and (state.get("webglSurface") or {}).get("gl2SL") == "WebGL GLSL ES 3.00"),
+            # F-22：真机 WebGLContextAttributes 只有 8 个字段
+            "WebGL：getContextAttributes 仅 8 字段（无 desynchronized/xrCompatible）": (
+                (state.get("webglSurface") or {}).get("ctxAttrs") == [
+                    "alpha", "antialias", "depth", "failIfMajorPerformanceCaveat",
+                    "powerPreference", "premultipliedAlpha", "preserveDrawingBuffer",
+                    "stencil"]),
             "WebGL：MAX_* 为移动档且未知枚举仍为 null": (
                 (state.get("webglSurface") or {}).get("limits", {}).get("MAX_TEXTURE_SIZE") == 16384
                 and (state.get("webglSurface") or {}).get("limits", {}).get("MAX_VIEWPORT_DIMS") == [16384, 16384]
@@ -2724,25 +4831,461 @@ async def main() -> int:
                 (state.get("webglSurface") or {}).get("getParamLength") == 1
                 and (state.get("webglSurface") or {}).get("getExtListLength") == 0
                 and (state.get("webglSurface") or {}).get("badReceiver") == "TypeError"),
-            "WebGL2：同样剔除 S3TC": (
-                (state.get("webglSurface") or {}).get("gl2HasS3tc") is False),
+            "WebGL2：S3TC 同样在位（ANGLE-Metal 同源）": (
+                (state.get("webglSurface") or {}).get("gl2HasS3tc") is True),
             "Worker（页面）：WebGL 渲染器 == 主文档（OffscreenCanvas 同口径）": (
                 isinstance(wk_main.get("glRenderer"), list)
                 and wk_main["glRenderer"] == [gl.get("vendor"), gl.get("renderer")]),
             "Worker（跨域 iframe）：WebGL 渲染器 == 主文档": (
                 isinstance(fr_worker.get("glRenderer"), list)
                 and fr_worker["glRenderer"] == [gl.get("vendor"), gl.get("renderer")]),
-            "Worker（页面）：WebGL 扩展集与主文档同口径（无 S3TC/BPTC/计时）": (
+            "Worker（页面）：WebGL 扩展集与主文档同口径（S3TC 在位 / 计时缺席）": (
                 isinstance(wk_main.get("glExt"), dict)
-                and wk_main["glExt"].get("s3tc") is False
-                and wk_main["glExt"].get("bptc") is False
+                and wk_main["glExt"].get("s3tc") is True
+                and wk_main["glExt"].get("pvrtc") is True
                 and wk_main["glExt"].get("timer") is False
                 and wk_main["glExt"].get("count") == (state.get("webglSurface") or {}).get("extCount")),
             "Worker（跨域 iframe）：WebGL 扩展集同口径": (
                 isinstance(fr_worker.get("glExt"), dict)
-                and fr_worker["glExt"].get("s3tc") is False
-                and fr_worker["glExt"].get("bptc") is False),
-            "pdfViewerEnabled 不存在（Safari/CriOS 均无该 API）": state["hasPdfViewer"] is False,
+                and fr_worker["glExt"].get("s3tc") is True
+                and fr_worker["glExt"].get("timer") is False),
+            # ---- F-06：PerformanceObserver.supportedEntryTypes 静态面 ----
+            "supportedEntryTypes == WebKit 8 项定序": (
+                state.get("poTypes") == [
+                    "event", "first-input", "largest-contentful-paint",
+                    "mark", "measure", "navigation", "paint", "resource"]),
+            "supportedEntryTypes：FrozenArray 语义（冻结 + 数据属性 + 写入被拒）": (
+                state.get("poFrozen") is True
+                and (state.get("poDesc") or {}).get("get") == "undefined"
+                and (state.get("poDesc") or {}).get("writable") is False
+                and (state.get("poDesc") or {}).get("enumerable") is True
+                and (state.get("poDesc") or {}).get("configurable") is True
+                and (isinstance(state.get("poWriteBlocked"), str)
+                     and state["poWriteBlocked"].startswith('["event"'))),
+            # ---- F-17：AudioContext 状态机与成员面 ----
+            "AudioContext.state：无手势时为 suspended": (
+                (state.get("audioState") or {}).get("state") == "suspended"),
+            "AudioContext：playbackStats/sinkId/onsinkchange 缺席（Safari 未实现）": (
+                (state.get("audioMembers") or {}).get("sinkId") is False
+                and (state.get("audioMembers") or {}).get("setSinkId") is False
+                and (state.get("audioMembers") or {}).get("onsinkchange") is False
+                and (state.get("audioMembers") or {}).get("playbackStats") is False
+                and (state.get("audioMembers") or {}).get("basePlaybackStats") is False),
+            # ---- F-44（修正 F-18）：iPhone 自然方向是竖屏 ----
+            # WebKit naturalScreenOrientationType()：iPad → landscape-primary，
+            # 其余 iOS → portrait-primary；angle 按该表查，所以 iPhone 竖屏
+            # 恒 0、iPad 竖持恒 90。旧口径写死 90 会造出
+            # 「portrait-primary × angle=90」这种真机不存在的组合（自洽性即
+            # 一行判据）；反过来对 iPad 断言 0 也会误报——自然方向是横屏。
+            "screen.orientation.angle 与设备自然方向一致（iPhone 0 / iPad 90）": (
+                state.get("orientAngle")
+                == (90 if extra.get("deviceType") == "tablet" else 0)
+                and (state.get("orientType") or "").startswith("portrait")),
+            # ---- F-19：container-only 查询为 maybe，codecs 查询走扩展判定 ----
+            "canPlayType：容器名查询 == 'maybe'（无 codecs 不判死）": all(
+                (state.get("canPlayIos") or {}).get(k) == "maybe"
+                for k in ("mpeg", "aac", "mp3", "flac", "quicktime", "hls")),
+            "canPlayType：codecs 查询 == 'probably'（AVFoundation 可解码）": all(
+                (state.get("canPlayIos") or {}).get(k) == "probably"
+                for k in ("mp3Codec", "flacMp4", "mp4a405", "dvh1", "avc1Codec")),
+            "canPlayType：audio/flac 带 codecs 反而不可播（WebKit 实测 ''）": (
+                (state.get("canPlayIos") or {}).get("flacCodec") == ""),
+            "canPlayType：AV1 按机型能力位 / video-h264 == ''": (
+                (state.get("canPlayIos") or {}).get("av01") == (
+                    "probably" if _ios_av1_capable(
+                        str((extra or {}).get("model") or ""),
+                        str((extra or {}).get("marketName") or "")) else "")
+                and (state.get("canPlayIos") or {}).get("unknownH264") == ""
+                and (state.get("canPlayIos") or {}).get("emptyStr") == ""),
+            # ---- F-143：兜底改白名单语义（表外不再透传宿主 Blink）----
+            # 旧实现这几条全部继承 Blink：opus/mp3-in-mp4 → probably、
+            # x-matroska → maybe、hev1 版本化串 → probably（F-124）。
+            # 真机口径来自 WebKit MIMETypeCache::canDecodeType：
+            # opus-in-mp4 走 canDecodeExtendedType 的免责分支；mp3 只被
+            # audio/mpeg 的 shouldOverrideExtendedType 特例放行；x-matroska
+            # 不在 30 项容器白名单内；hev1 版本化串不被 AVFoundation 接受。
+            "canPlayType（F-143）：表外串一律 ''（opus/mp3-in-mp4、mkv、hev1 版本化）": all(
+                (state.get("canPlayIos") or {}).get(k) == ""
+                for k in ("opusMp4", "mp3Mp4", "mkv", "mkvCodec", "hev1Full", "avi")),
+            "canPlayType（F-143）：白名单容器族裸查询 == 'maybe'（F-125 整族）": all(
+                (state.get("canPlayIos") or {}).get(k) == "maybe"
+                for k in ("gpp2", "aiff", "basic", "xm4a", "mp2t", "caf", "aacp")),
+            "canPlayType（F-143）：白名单容器 + codecs 走扩展判定": (
+                (state.get("canPlayIos") or {}).get("wavePcm") == "probably"
+                # audio/ogg 不在 30 项白名单内（F-125 排除表同族），裸查询为 ''
+                and (state.get("canPlayIos") or {}).get("oggContainer") == ""
+                and (state.get("canPlayIos") or {}).get("webmCodec") == ""),
+            "canPlayType（F-143）：无参抛 Not enough arguments（WebKit 文案）": (
+                (state.get("canPlayIos") or {}).get("noArg")
+                == "TypeError:Not enough arguments"),
+            # ---- F-20：Permissions.query 分州口径 ----
+            "Permissions：加速度计/陀螺仪/midi/display-capture 抛 NotSupportedError": all(
+                (state.get("perms") or {}).get(k) == "throw:NotSupportedError"
+                for k in ("accelerometer", "gyroscope", "midi", "display-capture")),
+            "Permissions：background-sync/clipboard/persistent-storage 抛 TypeError": all(
+                (state.get("perms") or {}).get(k) == "throw:TypeError"
+                for k in ("background-sync", "clipboard-read", "clipboard-write",
+                          "persistent-storage", "local-fonts")),
+            "Permissions：screen-wake-lock/storage-access/push == prompt（反向项）": all(
+                (state.get("perms") or {}).get(k) == "prompt"
+                for k in ("screen-wake-lock", "storage-access", "push")),
+            # ---- F-26 / F-27：Chromium 专属原型成员缺席 ----
+            "原型成员：RTCPeerConnection addStream 家族缺席": (
+                (state.get("protoDrop") or {}).get("rtc", {}).get("addStream") is False
+                and (state.get("protoDrop") or {}).get("rtc", {}).get("getLocalStreams") is False
+                and (state.get("protoDrop") or {}).get("rtc", {}).get("createDTMFSender") is False
+                and (state.get("protoDrop") or {}).get("rtc", {}).get("onaddstream") is False),
+            "原型成员：FontFace 度量覆写 / HTMLInputElement.incremental 缺席": (
+                (state.get("protoDrop") or {}).get("fontFace", {}).get("ascentOverride") is False
+                and (state.get("protoDrop") or {}).get("fontFace", {}).get("variant") is False
+                and (state.get("protoDrop") or {}).get("inputIncremental", {}).get("incremental") is False),
+            "原型成员：Element.moveBefore/setHTML、Document.wasDiscarded 缺席": (
+                (state.get("protoDrop") or {}).get("element", {}).get("moveBefore") is False
+                and (state.get("protoDrop") or {}).get("element", {}).get("setHTML") is False
+                and (state.get("protoDrop") or {}).get("document", {}).get("wasDiscarded") is False),
+            "原型成员：EventTarget.when、File.lastModifiedDate、ImageData.pixelFormat 缺席": (
+                (state.get("protoDrop") or {}).get("eventTarget", {}).get("when") is False
+                and (state.get("protoDrop") or {}).get("file", {}).get("lastModifiedDate") is False
+                and (state.get("protoDrop") or {}).get("imageData", {}).get("pixelFormat") is False),
+            "原型成员：WebGL makeXRCompatible / Screen.isExtended 缺席": (
+                (state.get("protoDrop") or {}).get("webgl", {}).get("makeXRCompatible") is False
+                and (state.get("protoDrop") or {}).get("screen", {}).get("isExtended") is False),
+            # ---- F-106：删除表挂在 WebGL2（真实宿主），WebGL1 保持缺席 ----
+            "原型成员：WebGL2RenderingContext 四项缺席（F-106 落点）": (
+                all((state.get("protoDrop") or {}).get("webgl2", {}).get(m) is False
+                    for m in ("makeXRCompatible", "drawingBufferStorage",
+                              "drawingBufferFormat", "unpackColorSpace"))),
+            # ---- F-103：Capture Handle 双端缺席（Android 也是 false） ----
+            "原型成员：Capture Handle（setCaptureHandleConfig / getCaptureHandle）缺席": (
+                (state.get("protoDrop") or {}).get("mediaDevices", {})
+                    .get("setCaptureHandleConfig") is False
+                and (state.get("protoDrop") or {}).get("mediaTrack", {})
+                    .get("getCaptureHandle") is False
+                and (state.get("protoDrop") or {}).get("mediaTrack", {})
+                    .get("oncapturehandlechange") is False),
+            # ---- F-104：Canvas 2D 六项缺席，filter 保留（iOS 18+） ----
+            "原型成员：CanvasRenderingContext2D 六项 Blink 专有属性缺席": (
+                all((state.get("protoDrop") or {}).get("canvas2d", {}).get(m) is False
+                    for m in ("fontKerning", "fontStretch", "fontVariantCaps",
+                              "isContextLost", "lang", "textRendering"))
+                and (state.get("protoDrop") or {}).get("canvas2dKeep", {})
+                    .get("filter") is True),
+            # ---- F-105 / F-108 / F-111 / F-112 / F-113 ----
+            "原型成员：零散 Blink 成员（MediaMetadata/Recorder/Keys/Request）缺席": (
+                (state.get("protoDrop") or {}).get("mediaMetadata", {}).get("chapterInfo") is False
+                and (state.get("protoDrop") or {}).get("mediaRecorder", {})
+                    .get("audioBitrateMode") is False
+                and (state.get("protoDrop") or {}).get("mediaKeys", {})
+                    .get("getStatusForPolicy") is False
+                and (state.get("protoDrop") or {}).get("request", {})
+                    .get("isHistoryNavigation") is False
+                and (state.get("protoDrop") or {}).get("request", {})
+                    .get("targetAddressSpace") is False),
+            "原型成员：HTMLElement 六项事件处理器与 editContext 缺席": (
+                all((state.get("protoDrop") or {}).get("htmlElement", {}).get(m) is False
+                    for m in ("onbeforexrselect", "oncontextlost", "oncontextrestored",
+                              "onpointerrawupdate", "onscrollsnapchange",
+                              "onscrollsnapchanging", "editContext",
+                              "virtualKeyboardPolicy"))),
+            "原型成员：HTMLMediaElement captureStream/controlsList/loading 缺席": (
+                all((state.get("protoDrop") or {}).get("mediaElement", {}).get(m) is False
+                    for m in ("captureStream", "controlsList", "loading"))),
+            # ---- F-122：setSinkId/sinkId 按 safari_ios=18.4 门控 ----
+            "原型成员：HTMLMediaElement setSinkId/sinkId 按 18.4 门控": (
+                (lambda v, m: (v >= (18, 4)
+                               and m.get("setSinkId") is True
+                               and m.get("sinkId") is True
+                               and m.get("onsinkchange") is False)
+                 or (v < (18, 4)
+                     and m.get("setSinkId") is False
+                     and m.get("sinkId") is False))(
+                    _ios_ver, (state.get("protoDrop") or {}).get("mediaElement") or {})),
+            "原型成员：HTMLIFrameElement 八项 Blink/Privacy Sandbox 属性缺席": (
+                all((state.get("protoDrop") or {}).get("iframe", {}).get(m) is False
+                    for m in ("adAuctionHeaders", "allowPaymentRequest", "browsingTopics",
+                              "credentialless", "csp", "featurePolicy", "privateToken",
+                              "sharedStorageWritable"))),
+            "原型成员：HTMLAreaElement / HTMLImageElement 归因族缺席": (
+                (state.get("protoDrop") or {}).get("area", {})
+                    .get("interestForElement") is False
+                and (state.get("protoDrop") or {}).get("area", {})
+                    .get("attributionSrc") is False
+                and (state.get("protoDrop") or {}).get("image", {})
+                    .get("sharedStorageWritable") is False),
+            "原型成员：Element.startViewTransition / onbefore* / onsearch 缺席（Document 级保留）": (
+                all((state.get("protoDrop") or {}).get("elementExtra", {}).get(m) is False
+                    for m in ("startViewTransition", "onbeforecopy", "onbeforecut",
+                              "onbeforepaste", "onsearch"))
+                and ((state.get("protoDrop") or {}).get("handlerKeep") or {})
+                    .get("docSVT") is True
+                and ((state.get("protoDrop") or {}).get("handlerKeep") or {})
+                    .get("ariaNotify") is True),
+            "事件处理器：onfocusin/onbeforecopy 落点在 Element/HTMLElement": (
+                # WebKit 26.5/27.2（has_touch+is_mobile 上下文）实测：五名都在
+                # Element/HTMLElement 上，document.documentElement（HTMLHtmlElement
+                # → HTMLElement）与 body 一样命中，Document 侧 onbefore* 也保留。
+                ((state.get("protoDrop") or {}).get("handlerKeep") or {})
+                    .get("focusin") is True
+                and ((state.get("protoDrop") or {}).get("handlerKeep") or {})
+                    .get("beforecopyBody") is True
+                and ((state.get("protoDrop") or {}).get("handlerKeep") or {})
+                    .get("beforecopyRoot") is True
+                and ((state.get("protoDrop") or {}).get("handlerKeep") or {})
+                    .get("beforecopyDoc") is True),
+            # ---- F-118 / F-119：WebKit 独有事件处理器 ----
+            "事件处理器：Element 上的 5 名 WebKit 专有处理器（不可枚举，root/body 继承命中）": (
+                (lambda h: bool(h)
+                    and all(h.get("root", {}).get(n) is True
+                            and h.get("body", {}).get(n) is True
+                            and h.get("own", {}).get(n) is True
+                            and h.get("enum", {}).get(n) is False
+                            for n in ("onbeforeload", "onwebkitneedkey",
+                                      "onwebkitpresentationmodechanged",
+                                      "onwebkitcurrentplaybacktargetiswirelesschanged",
+                                      "onwebkitplaybacktargetavailabilitychanged")))(
+                    (state.get("protoDrop") or {}).get("webkitHandlers"))),
+            "事件处理器：onpageswap/onpagereveal 只落 body/frameset（root 仍 false，可枚举）": (
+                (lambda h: bool(h)
+                    and h.get("pageswapBody") is True
+                    and h.get("pagerevealBody") is True
+                    and h.get("pageswapRoot") is False
+                    and h.get("pagerevealRoot") is False
+                    and h.get("pageswapWindow") is True
+                    and h.get("bodyOwn") is True
+                    and h.get("frameOwn") is True
+                    and h.get("bodyEnum") is True
+                    and h.get("bodyNull") is None)(
+                    (state.get("protoDrop") or {}).get("webkitHandlers"))),
+            # ---- F-31：storage.estimate 为 1 GiB 且无 usageDetails ----
+            "storage.estimate：quota == 1048576000 且仅 {quota, usage}": (
+                isinstance(state.get("storageEstimate"), dict)
+                and state["storageEstimate"].get("quota") == 1048576000
+                and state["storageEstimate"].get("keys") == ["quota", "usage"]
+                and state["storageEstimate"].get("usageDetails") is False),
+            # ---- F-32：enumerateDevices 无 audiooutput ----
+            "enumerateDevices：无 audiooutput 项（iOS 不暴露输出设备）": (
+                isinstance(state.get("deviceKinds"), list)
+                and "audiooutput" not in state["deviceKinds"]),
+            # ---- F-90：iOS 普通浏览上下文 Notification 整族缺席 ----
+            # NotificationsEnabled 的 defaultValue 在 PLATFORM(IOS_FAMILY)
+            # 为 false，Notification.idl / PushManager.idl / SWR+PushAPI.idl
+            # 全部 EnabledBySetting 门控——普通页连名字都不存在，F-33 的
+            # permission 读值断言随之作废（仅在 standalone PWA 里才有意义）。
+            "Notification 整族缺席（真机普通页 typeof === 'undefined'）": (
+                (state.get("notifAbsent") or {}).get("type") == "undefined"
+                and (state.get("notifAbsent") or {}).get("inWin") is False
+                and (state.get("notifAbsent") or {}).get("eventType") == "undefined"),
+            "Push 族缺席（PushManager/PushSubscription/PushSubscriptionOptions/PushEvent/PushMessageData）": (
+                all((state.get("notifAbsent") or {}).get(k) == "undefined"
+                    for k in ("pushManager", "pushSub", "pushOpts",
+                              "pushEvent", "pushMsg"))),
+            "window.pushManager 缺席（BCD 18.4，同 PushAPIEnabled 门控）": (
+                (state.get("notifAbsent") or {}).get("winPushManager") == "undefined"),
+            "ServiceWorkerRegistration.prototype.pushManager 缺席": (
+                (state.get("notifAbsent") or {}).get("swrPush") is False),
+            # F-102：Blink 专有 / pref 门控的五项成员同删；
+            # navigationPreload 默认开，真机存在，必须保留。
+            "ServiceWorkerRegistration：sync/periodicSync/backgroundFetch/paymentManager/cookies 缺席，navigationPreload 保留": (
+                (state.get("notifAbsent") or {}).get("swrDrops") not in (None, "absent", "ERR")
+                and not any((state.get("notifAbsent") or {}).get("swrDrops", {}).get(n)
+                            for n in ("sync", "periodicSync", "backgroundFetch",
+                                      "paymentManager", "cookies", "pushManager"))
+                and (state.get("notifAbsent") or {}).get("swrDrops", {})
+                .get("navigationPreload") is True),
+            # ---- F-28：无用户手势时未静音媒体 play() 必拒（iOS 口径）----
+            "自动播放：无手势未静音 play() reject NotAllowedError，静音放行": (
+                autoplay_state.get("active") is False
+                and (autoplay_state.get("plain") or "").startswith(
+                    "rejected:NotAllowedError:")
+                and autoplay_state.get("muted") == "resolved"
+                and autoplay_state.get("volumeZero") == "resolved"),
+            # ---- F-34：console 侧 Chromium 专有方法缺席 ----
+            "console：context/createTask/memory 缺席": (
+                state.get("consoleHasContext") is False
+                and state.get("consoleHasCreateTask") is False
+                and state.get("consoleHasMemory") is False),
+            # ---- F-25：真机有、Chromium 缺的 WebKit 面（补成员机制）----
+            "补成员：Canvas 遗留方法族在位且改画布状态": (
+                all((state.get("addMembers") or {}).get("c2d", {}).get(k, {}).get("inn") is True
+                    for k in ("setLineWidth", "setStrokeColor", "setFillColor",
+                              "setLineCap", "setLineJoin", "setMiterLimit",
+                              "setShadow", "clearShadow", "webkitLineDash",
+                              "webkitLineDashOffset"))
+                and (state.get("addMembers") or {}).get("c2dLive", {}).get("fillAfterSet")
+                    == "#123456"
+                and (state.get("addMembers") or {}).get("c2dLive", {}).get("dash") == []
+                and (state.get("addMembers") or {}).get("c2dLive", {}).get("dashOffset") == 0
+                and (state.get("addMembers") or {}).get("c2dLive", {}).get("clearShadow")
+                    == [0, 0]),
+            "补成员：Force Touch 常量与 webkitForce / Wheel 方向位在位": (
+                (state.get("addMembers") or {}).get("mouseConst") == {
+                    "own": 1, "force": 2, "proto": 1}
+                and (state.get("addMembers") or {}).get("mouseLive") == 0
+                and (state.get("addMembers") or {}).get("wheel", {}).get("inn") is True
+                and (state.get("addMembers") or {}).get("wheel", {}).get("val") is False),
+            # F-77 D4：12 个事件属性 × 4 个宿主；可枚举性只有 copy/cut/paste
+            # 为 true（真机 /tmp/f77p/hosts.py）。
+            "补成员：12 个事件属性在 Window/Document/HTMLElement/SVGElement 全在位": (
+                all(
+                    isinstance((state.get("addMembers") or {}).get("handlers", {})
+                               .get("hosts", {}).get(h), dict)
+                    and all(v in ("e", "ne")
+                            for v in (state.get("addMembers") or {}).get("handlers", {})
+                                    .get("hosts", {}).get(h, {}).values())
+                    and len((state.get("addMembers") or {}).get("handlers", {})
+                            .get("hosts", {}).get(h, {})) == 12
+                    for h in ("win", "doc", "el", "svg"))
+                and (state.get("addMembers") or {}).get("handlers", {}).get("before") == "null"
+                and (state.get("addMembers") or {}).get("handlers", {}).get("assign") is True
+                and (state.get("addMembers") or {}).get("handlers", {}).get("reset") is True),
+            "补成员：事件属性可枚举性（copy/cut/paste 真，其余九个假）": (
+                all(
+                    (state.get("addMembers") or {}).get("handlers", {})
+                        .get("hosts", {}).get(h, {}).get(n)
+                    == ("e" if n in ("oncopy", "oncut", "onpaste") else "ne")
+                    for h in ("win", "doc", "el", "svg")
+                    for n in ("oncopy", "oncut", "onpaste",
+                              "onwebkitmouseforcechanged", "onwebkitmouseforcedown",
+                              "onwebkitmouseforceup", "onwebkitmouseforcewillbegin",
+                              "ontouchforcechange", "ontouchstart", "ontouchmove",
+                              "ontouchend", "ontouchcancel"))),
+            "补成员：媒体面 fastSeek / audioTracks / getStartDate / 播放质量": (
+                (state.get("addMembers") or {}).get("media", {}).get("fastSeek") is True
+                and (state.get("addMembers") or {}).get("media", {}).get("audioTracks")
+                    == "[object AudioTrackList]"
+                and (state.get("addMembers") or {}).get("media", {}).get("videoTracks")
+                    == "[object VideoTrackList]"
+                and (state.get("addMembers") or {}).get("media", {}).get("getStartDate")
+                    == "Invalid Date"
+                and (state.get("addMembers") or {}).get("media", {}).get("vpqKeys") == []
+                and (state.get("addMembers") or {}).get("media", {}).get("mediaGroup") == ""
+                and (state.get("addMembers") or {}).get("media", {}).get("controller")
+                    == "null"
+                and (state.get("addMembers") or {}).get("media", {}).get("wirelessDisabled")
+                    is True
+                and (state.get("addMembers") or {}).get("media", {}).get("presMode") is True),
+            "补成员：SourceBuffer 轨道面 / Range.compareNode 与常量": (
+                all((state.get("addMembers") or {}).get("srcBuf", {}).get(k, {}).get("inn")
+                    is True for k in ("audioTracks", "textTracks", "videoTracks"))
+                and (state.get("addMembers") or {}).get("range", {}).get("inn") is True
+                and (state.get("addMembers") or {}).get("range", {}).get("consts")
+                    == [0, 1, 2, 3]
+                and (state.get("addMembers") or {}).get("range", {}).get("protoConst") == 0),
+            "补成员：TextMetrics em* / FontFace.width / CSSStyleDeclaration legacy": (
+                (state.get("addMembers") or {}).get("metrics", {}).get("asc") is not None
+                and (state.get("addMembers") or {}).get("fontFace") == {
+                    "inn": True, "val": "normal"}
+                and all((state.get("addMembers") or {}).get("cssDecl", {}).get(k, {}).get("inn")
+                        is True for k in ("cssRules", "getPropertyCSSValue"))),
+            # F-77 D3：三个全局项按真机形态补——webkitIndexedDB 是只读 getter
+            # （同一对象）；openDatabase 是 get/set 访问器、未赋值读作
+            # "undefined"（真机是 JSC 内部函数对象，typeof 相同，V8 造不出，
+            # 退化为真 undefined）；safari 是数据属性。
+            "补成员：webkitIndexedDB / openDatabase / safari / onmessageerror 等在位": (
+                (state.get("addMembers") or {}).get("globals", {}).get("webkitIndexedDB")
+                    == "object"
+                and (state.get("addMembers") or {}).get("globals", {}).get("sameIDB") is True
+                and (state.get("addMembers") or {}).get("globals", {}).get("gDesc", {})
+                    .get("webkitIndexedDB") == [True, True, "function", "undefined", "undefined"]
+                and (state.get("addMembers") or {}).get("globals", {}).get("openDatabase")
+                    == "undefined"
+                and (state.get("addMembers") or {}).get("globals", {}).get("gDesc", {})
+                    .get("openDatabase") == [False, True, "function", "function", "undefined"]
+                and (state.get("addMembers") or {}).get("globals", {}).get("odbNull") is True
+                and (state.get("addMembers") or {}).get("globals", {}).get("odbUndef") is True
+                and (state.get("addMembers") or {}).get("globals", {}).get("gDesc", {})
+                    .get("safari") == [True, True, "undefined", "undefined", "object"]
+                and (state.get("addMembers") or {}).get("globals", {}).get("safariTag")
+                    == "[object SafariRemoteNotification]"
+                and (state.get("addMembers") or {}).get("workerErr", {}).get("inn") is True),
+            # F-77 / F-14：页面侧 GPC 由补丁装在 Navigator 原型上（真机是只读
+            # getter、可枚举），Worker 侧不装（见 Worker 断言）。
+            "补成员：navigator.globalPrivacyControl 为原生外观的只读 false": (
+                (state.get("addMembers") or {}).get("globals", {}).get("gpcVal") is False
+                and (state.get("addMembers") or {}).get("globals", {}).get("gpcDesc")
+                    == [True, True, "function", "undefined"]
+                and (state.get("addMembers") or {}).get("globals", {}).get("gpcNative")
+                    is True),
+            # F-84：navigator.audioSession 与 window.AudioSession 同实例。
+            "补成员：navigator.audioSession 为 AudioSession 单例（与接口同源）": (
+                (state.get("addMembers") or {}).get("globals", {}).get("audio", {})
+                    .get("desc") == [True, True, "function", "undefined", 0]
+                and (state.get("addMembers") or {}).get("globals", {}).get("audio", {})
+                    .get("tag") == "[object AudioSession]"
+                and (state.get("addMembers") or {}).get("globals", {}).get("audio", {})
+                    .get("same") is True
+                and (state.get("addMembers") or {}).get("globals", {}).get("audio", {})
+                    .get("own") == []
+                and (state.get("addMembers") or {}).get("globals", {}).get("audio", {})
+                    .get("type") == "auto"
+                and (state.get("addMembers") or {}).get("globals", {}).get("audio", {})
+                    .get("inst") is True),
+            # ---- F-29 / F-30：表单控件默认字体与高度（真机 WebKit 口径）----
+            "补成员：表单控件默认 system-ui 字体 + 真机控件高度": (
+                all(
+                    (state.get("addMembers") or {}).get("globals", {})
+                        .get("form", {}).get(k, {}).get("ff") == "system-ui"
+                    for k in ("button", "input", "select", "textarea"))
+                and (state.get("addMembers") or {}).get("globals", {})
+                    .get("form", {}).get("button", {}).get("h") == 18
+                and (state.get("addMembers") or {}).get("globals", {})
+                    .get("form", {}).get("input", {}).get("h") == 21
+                and (state.get("addMembers") or {}).get("globals", {})
+                    .get("form", {}).get("textarea", {}).get("h") == 32),
+            "补成员：接口对象族齐全（Media/FileSystem/CSS Typed OM/Text 轨道）": (
+                all(isinstance((state.get("addMembers") or {}).get("iface", {}).get(k), dict)
+                    for k in ("AudioSession", "MediaController", "CSSValue",
+                              "CSSPrimitiveValue", "RGBColor", "Rect", "Counter",
+                              "SVGPathSeg", "SVGViewSpec", "VTTRegion",
+                              "ManagedMediaSource", "ManagedSourceBuffer",
+                              "BufferedChangeEvent", "VideoTrack", "AudioTrack",
+                              "VideoTrackList", "AudioTrackList",
+                              "AudioTrackConfiguration", "FileSystemEntry",
+                              "FileSystemDirectoryEntry", "FileSystemFileEntry",
+                              "FileSystemDirectoryReader", "Report", "FontFaceSet",
+                              "StylePropertyMapReadOnly", "CSSMathValue",
+                              "CSSNumericValue", "CSSUnitValue", "CSSKeywordValue",
+                              "CSSImageValue", "CSSTransformComponent",
+                              "CSSStyleValue", "SpeechRecognitionResultList",
+                              "SpeechRecognitionResult", "SpeechRecognitionAlternative",
+                              "ApplePayError", "FileSystem",
+                              "TextTrack", "TextTrackCue",
+                              "XMLHttpRequestProgressEvent", "MathMLMathElement",
+                              "DataCue", "MediaRecorderErrorEvent",
+                              "OverconstrainedErrorEvent"))),
+            "补成员：接口对象形态（不可枚举 / 可写 / toStringTag / 构造语义）": (
+                (state.get("addMembers") or {}).get("iface", {}).get("AudioSession")
+                    == {"len": 0, "ctor": "throw:TypeError:Illegal constructor",
+                        "noNew": "throw:TypeError:Illegal constructor",
+                        "en": False, "wr": True,
+                        "tag": "[object AudioSession]",
+                        "proto": ["constructor", "type"]}
+                and (state.get("addMembers") or {}).get("iface", {}).get("MediaController", {})
+                    .get("ctor") == "ok"
+                and (state.get("addMembers") or {}).get("iface", {}).get("MediaController", {})
+                    .get("noNew") == "throw:TypeError:Constructor requires 'ne"
+                and (state.get("addMembers") or {}).get("iface", {}).get("FontFaceSet", {})
+                    .get("len") == 1
+                # 混合体：不带 new 走 args 文案，带 new 是裸 Illegal constructor
+                and (state.get("addMembers") or {}).get("iface", {}).get("FontFaceSet", {})
+                    .get("noNew") == "throw:TypeError:Constructor requires 'ne"
+                and (state.get("addMembers") or {}).get("iface", {}).get("FontFaceSet", {})
+                    .get("ctor") == "throw:TypeError:Illegal constructor"
+                and (state.get("addMembers") or {}).get("iface", {}).get("CSSUnitValue", {})
+                    .get("ctor") == "throw:TypeError:Not enough arguments"
+                and (state.get("addMembers") or {}).get("iface", {}).get("CSSUnitValue", {})
+                    .get("noNew") == "throw:TypeError:Constructor requires 'ne"
+                and (state.get("addMembers") or {}).get("iface", {}).get("DataCue", {})
+                    .get("ctor") == "throw:TypeError:Not enough arguments"),
+            # ---- F-36：静态量（DataView.BYTES_PER_ELEMENT / RegExp legacy）----
+            "静态量：DataView.BYTES_PER_ELEMENT 与 RegExp legacy 属性在位": (
+                (state.get("addMembers") or {}).get("staticAdd", {}).get("dvbpe") is True
+                and (state.get("addMembers") or {}).get("staticAdd", {}).get("regMultiline")
+                    is True
+                and (state.get("addMembers") or {}).get("staticAdd", {}).get("regDollar1")
+                    is True),
+            "pdfViewerEnabled == true（Safari 16.4+ 真实能力位，与插件为空不矛盾）": (
+                state["hasPdfViewer"] is True and state["pdfViewerValue"] is True),
             "plugins/mimeTypes 为空（WKWebView 行为）": state["pluginsLen"] == 0 and state["mimeTypesLen"] == 0,
             # ---- 桌面 Chromium 独有 API 的抹除（一条 `'serial' in navigator` 即可判假）----
             "Web Serial/USB/WebHID 均不存在（Safari 未实现）": (
@@ -2756,6 +5299,234 @@ async def main() -> int:
             "navigator.vibrate 不存在（Safari 未实现）": state["hasVibrate"] is False,
             "showOpenFilePicker 不存在（Safari 未实现）": state["hasOpenFilePicker"] is False,
             "performance.memory 不存在（WebKit 未实现 MemoryInfo）": state["hasPerfMemory"] is False,
+            # ---- F-04：navigator 残留的 Chromium 专有成员 ----
+            "navigator：doNotTrack/scheduling/storageBuckets/windowControlsOverlay 均不存在": (
+                state["hasDoNotTrack"] is False and state["hasScheduling"] is False
+                and state["hasStorageBuckets"] is False and state["hasWco"] is False),
+            # F-90：徽标 API 与 Notification/Push 同属 iOS 普通上下文缺席面
+            # （AppBadgeEnabled 默认 false，BCD 的 16.4 是主屏 web app 口径）。
+            # F-139：devicePosture 同属「偏好默认关」面（WebKit
+            # DevicePostureAPIEnabled status: testable / defaultValue: false），
+            # 出货版 Safari 全版本缺席——不是 27 门控。
+            "navigator：setAppBadge / clearAppBadge / devicePosture 缺席": (
+                state["hasSetAppBadge"] is False
+                and state["hasClearAppBadge"] is False
+                and state["hasDevicePosture"] is False),
+            # F-87：真机 WebKit 无手柄返回空数组；Blink 固定 4 槽位 null。
+            "navigator.getGamepads() 无手柄返回空数组（真机 WebKit 口径）": (
+                state["gamepads"] == [True, 0, None, 0]),
+            # ---- F-05 / F-09 / F-21：窗口侧入口接口对象与 Blink 遗留别名 ----
+            "窗口：External/external/crashReport/viewport/credentialless 不存在": (
+                state["gExternal"] == "undefined" and state["gCrashReport"] == "undefined"
+                and state["gViewport"] == "undefined"
+                and state["gCredentialless"] == "undefined"),
+            "窗口：InputDeviceCapabilities / screen.isExtended 不存在": (
+                state["gInputDeviceCaps"] == "undefined"
+                and state["screenIsExtended"] is False),
+            "窗口：自相矛盾接口对象（NavigatorUAData/NetworkInformation）不存在": (
+                state["gUAData"] == "undefined" and state["gNetworkInfo"] == "undefined"),
+            "窗口：BackgroundFetch/SyncManager/BeforeInstallPrompt/WCO 不存在": (
+                state["gBackgroundFetch"] == "undefined"
+                and state["gSyncManager"] == "undefined"
+                and state["gBeforeInstall"] == "undefined"
+                and state["gWco"] == "undefined"),
+            "窗口：requestIdleCallback / EditContext / Sanitizer / LaunchQueue 不存在": (
+                state["gIdleCb"] == "undefined" and state["gEditContext"] == "undefined"
+                and state["gSanitizer"] == "undefined"
+                and state["gLaunchQueue"] == "undefined"),
+            "窗口：SuppressedError / DisposableStack / WebSocketError 不存在": (
+                state["gSuppressedError"] == "undefined"
+                and state["gDisposableStack"] == "undefined"
+                and state["gWebSocketError"] == "undefined"),
+            "窗口：webkit* 遗留别名族不存在（比裸名更刺眼）": (
+                state["gWebkitMediaStream"] == "undefined"
+                and state["gWebkitRTCPeer"] == "undefined"
+                and state["gWebkitSpeechGrammar"] == "undefined"),
+            "窗口：BarcodeDetector/PaymentRequest/SpeechRecognition 等按 iOS 版本门控": (
+                state["gBarcodeDetector"]
+                == ("function" if _ios_at_least(17) else "undefined")
+                and state["gPaymentRequest"]
+                == ("function" if _ios_at_least(11, 1) else "undefined")
+                and state["gSpeechRecognition"]
+                == ("function" if _ios_at_least(14, 1) else "undefined")
+                and state["gTrackProcessor"]
+                == ("function" if _ios_at_least(18) else "undefined")
+                and state["gDigitalCredential"]
+                == ("function" if _ios_at_least(26) else "undefined")
+                # F-139：DevicePosture 由 DevicePostureAPIEnabled 偏好门控
+                # （testable / 默认 false）→ 全版本缺席
+                and state["gDevicePostureCtor"] == "undefined"),
+            # F-82：WebGPU 整族（40 名窗口接口 + navigator.gpu）BCD safari_ios=26。
+            # 低版本必须整族缺席，26+ 必须整族在册（含 navigator.gpu）。
+            "窗口：WebGPU 整族按 iOS 版本门控（41 名，26+ 才有）": (
+                (state["gpuFamilyCount"] == (40 if _ios_at_least(26) else 0))
+                and state["hasNavigatorGpu"] is _ios_at_least(26)
+                and state["gGPU"]
+                == ("function" if _ios_at_least(26) else "undefined")
+                and state["gGPUAdapter"]
+                == ("function" if _ios_at_least(26) else "undefined")
+                and state["gGPUCanvasContext"]
+                == ("function" if _ios_at_least(26) else "undefined")
+                and state["gGPUBufferUsage"]
+                == ("object" if _ios_at_least(26) else "undefined")),
+            # F-85：余量 37 名（WebTransport / Trusted Types / Navigation /
+            # WebCodecs 音频侧 / CSS Position-Try / Streams BYOB / 单丁）。
+            # 逐个按 BCD 精确版本判定，不按 26 一刀切——Origin 是 26.5、
+            # Navigation 族是 26.2、WebTransport/BYOB 是 26.4。
+            "窗口：F-85 余量族按 iOS 精确版本门控（37 名）": (
+                all(
+                    state["gated26"].get(n) == (want if _ios_at_least(*ver) else "undefined")
+                    for n, ver, want in (
+                        ("WebTransport", (26, 4), "function"),
+                        ("WebTransportBidirectionalStream", (26, 4), "function"),
+                        ("WebTransportDatagramDuplexStream", (26, 4), "function"),
+                        ("WebTransportError", (26, 4), "function"),
+                        ("ReadableByteStreamController", (26, 4), "function"),
+                        ("ReadableStreamBYOBReader", (26, 4), "function"),
+                        ("ReadableStreamBYOBRequest", (26, 4), "function"),
+                        ("Navigation", (26, 2), "function"),
+                        ("NavigateEvent", (26, 2), "function"),
+                        ("NavigationActivation", (26, 2), "function"),
+                        ("NavigationCurrentEntryChangeEvent", (26, 2), "function"),
+                        ("NavigationDestination", (26, 2), "function"),
+                        ("NavigationHistoryEntry", (26, 2), "function"),
+                        ("NavigationTransition", (26, 2), "function"),
+                        ("navigation", (26, 2), "object"),
+                        ("CaretPosition", (26, 2), "function"),
+                        ("CommandEvent", (26, 2), "function"),
+                        ("EventCounts", (26, 2), "function"),
+                        ("LargestContentfulPaint", (26, 2), "function"),
+                        ("PerformanceEventTiming", (26, 2), "function"),
+                        ("Origin", (26, 5), "function"),
+                        ("TrustedHTML", (26, 0), "function"),
+                        ("TrustedScript", (26, 0), "function"),
+                        ("TrustedScriptURL", (26, 0), "function"),
+                        ("TrustedTypePolicy", (26, 0), "function"),
+                        ("TrustedTypePolicyFactory", (26, 0), "function"),
+                        ("trustedTypes", (26, 0), "object"),
+                        ("AudioData", (26, 0), "function"),
+                        ("AudioDecoder", (26, 0), "function"),
+                        ("AudioEncoder", (26, 0), "function"),
+                        ("EncodedAudioChunk", (26, 0), "function"),
+                        ("CSSPositionTryDescriptors", (26, 0), "function"),
+                        ("CSSPositionTryRule", (26, 0), "function"),
+                        ("FileSystemWritableFileStream", (26, 0), "function"),
+                        ("ScrollTimeline", (26, 0), "function"),
+                        ("ViewTimeline", (26, 0), "function"),
+                        ("URLPattern", (26, 0), "function"),
+                    ))
+                and len(state["gated26"]) == 37),
+            # ---- F-40 / F-49 / F-51：对象子属性与原型方法缺口 ----
+            "navigator.mediaDevices.getDisplayMedia 按 iOS 版本门控（27+ 才有）": (
+                state["mdGdm"] == ("function" if _ios_at_least(27) else "undefined")),
+            "CSS.paintWorklet 不存在（Safari 从未实现 Paint API）": (
+                state["paintWorklet"] == "undefined"),
+            "select.showPicker 不存在 / input.showPicker 保留": (
+                state["selectShowPicker"] == "undefined"
+                and state["inputShowPicker"] == "function"),
+            # ---- F-52 / F-55 / F-56：编码与上下文属性面 ----
+            "canvas webp 编码回退 PNG（真机 iOS 无 webp 编码器）": (
+                str(state.get("canvasWebp") or "").startswith("data:image/png")),
+            # 清单 §46：webm 容器 true、vp8 / vp9,opus true、
+            # x-matroska;codecs=avc1 false（容器不在白名单）。h264-in-webm
+            # 同样 false（WebM 分支只认 vp8/vp9/opus/vorbis）。
+            "MediaRecorder 矩阵为 WebKit 口径（webm true / h264-in-webm false）": (
+                state["mrWebm"] is True and state["mrWebmH264"] is False
+                and state["mrVp8"] is True and state["mrVp9Opus"] is True
+                and state["mrMp4"] is True),
+            "2D getContextAttributes 为真机 3 键": (
+                state.get("ctx2dAttrs") == ["colorSpace", "desynchronized",
+                                            "willReadFrequently"]),
+            # ---- F-58 / F-59：事件原型 legacy 面 ----
+            "UIEvent.prototype 含 pageX/pageY/layerX/layerY、无 sourceCapabilities": (
+                all(k in (state.get("uiEventProto") or [])
+                    for k in ("pageX", "pageY", "layerX", "layerY"))
+                and "sourceCapabilities" not in (state.get("uiEventProto") or [])
+                and state.get("uiPageX") is True),
+            "AnimationEvent/TransitionEvent 带 legacy animation 属性": (
+                state.get("animHasAnimation") is True
+                and state.get("transHasAnimation") is True),
+            # ---- F-43：zh/ja 排版口径（WebKit libicucore）----
+            "Intl zh-CN full 日期段为「日 星期X」、24 小时制时区名后无空格": (
+                isinstance(state.get("intlZh"), dict)
+                and state["intlZh"]["dateFull"] == "2026年10月19日 星期一"
+                and state["intlZh"]["full"] ==
+                    "2026年10月19日 星期一 北美太平洋夏令时间23:05:09"
+                and state["intlZh"]["timeFull"] == "北美太平洋夏令时间23:05:09"),
+            "Intl 各 locale 星期空格口径与真机一致": (
+                isinstance(state.get("intlZh"), dict)
+                and _intl_locale_ok(state["intlZh"].get("locales") or {})),
+            "Intl 各 locale 时区名位置与真机一致（显式/dateStyle 两路）": (
+                isinstance(state.get("intlZh"), dict)
+                and _intl_tz_ok(state["intlZh"].get("locales") or {})),
+            "Intl ja 带分钟时星期前置、12 时制 12 时写作 0 时": (
+                isinstance(state.get("intlZh"), dict)
+                and (state["intlZh"].get("ja") or {}).get("reorder")
+                    == "月曜日 23:05"
+                and (state["intlZh"].get("ja") or {}).get("zero")
+                    == "午後0時"),
+            "Intl zh-SG 默认 12 小时制、时区名后无空格": (
+                isinstance(state.get("intlZh"), dict)
+                and (state["intlZh"].get("sg") or {}).get("full")
+                    == "2026年10月19日 星期一 "
+                       "北美太平洋夏令时间晚上11:05:09"
+                and (state["intlZh"].get("sg") or {}).get("week")
+                    == "星期一 晚上11:05"),
+            "Intl 12 小时制 dayPeriod 按本地小时分区（逐时表）": (
+                isinstance(state.get("intlZh"), dict)
+                and _intl_dp_ok(state["intlZh"].get("dpHours") or {})),
+            "Intl formatRange 两端各自取 dayPeriod 且与 parts 自洽": (
+                isinstance(state.get("intlZh"), dict)
+                and state["intlZh"]["range"] ==
+                    "2026/10/19 晚上11:05 – 2026/10/20 上午11:05"
+                and state["intlZh"]["rangeJoin"] is True),
+            "Date#toLocaleString 与 format 同口径": (
+                isinstance(state.get("intlZh"), dict)
+                and state["intlZh"]["tls"] == state["intlZh"]["full"]),
+            "Intl 非 zh/ja 不受影响、非法组合仍抛 TypeError": (
+                isinstance(state.get("intlZh"), dict)
+                and state["intlZh"]["en"] ==
+                    "Monday, October 19, 2026 at 11:05:09 PM Pacific "
+                    "Daylight Time"
+                and state["intlZh"]["tldErr"] is True),
+            "Intl formatToParts 与 format 自洽": (
+                isinstance(state.get("intlZh"), dict)
+                and state["intlZh"]["join"] is True),
+            "Intl format 仍是原型取值器返回的函数（形态不变）": (
+                isinstance(state.get("intlZh"), dict)
+                and state["intlZh"]["fmtGetter"] == "function"
+                and state["intlZh"]["fmtIsFn"] == "function"
+                and state["intlZh"]["fmtLen"] == 1),
+            # ---- F-60 / F-61：命令面手势与平台口径 ----
+            "无手势无选区 execCommand('copy') 返回 false": (
+                state.get("execCopyNoSel") is False),
+            "queryCommandSupported('paste') 为 true（WebKit 口径）": (
+                state.get("qcsPaste") is True),
+            # ---- F-48：真机 iOS visualViewport 与 innerHeight 不等 ----
+            "visualViewport.height < innerHeight（真机 iOS 工具栏 inset）": (
+                isinstance(state.get("vvH"), (int, float))
+                and isinstance(state.get("innerH"), (int, float))
+                and state["innerH"] - state["vvH"] >= 40),
+            # ---- F-46 / F-47：控件 UA 样式表计算值 ----
+            "控件 UA 样式表：textarea/select 为 system-ui、input overflow=visible": (
+                "monospace" not in (state.get("uaFormStyles") or {})
+                    .get("textarea", {}).get("fontFamily", "")
+                and (state.get("uaFormStyles") or {}).get("input", {}).get("overflow")
+                == "visible"
+                and "Arial" not in (state.get("uaFormStyles") or {})
+                    .get("select", {}).get("fontFamily", "")),
+            "正文 -webkit-user-select 为 none（真机 iOS 正文不可选）": (
+                (state.get("uaFormStyles") or {}).get("bodyUserSelect") == "none"),
+            # ---- F-08：Blink 专有事件处理器属性 ----
+            "窗口：onsearch/oncontextlost/oncontextrestored/onbeforeinstallprompt/onappinstalled 不存在": (
+                state["evSearch"] is False and state["evContextLost"] is False
+                and state["evContextRestored"] is False
+                and state["evBeforeInstall"] is False
+                and state["evAppInstalled"] is False),
+            # ---- F-10：Blink 前缀可见性别名 ----
+            "document：webkitHidden / webkitVisibilityState 不存在": (
+                state["docWebkitHidden"] is False
+                and state["docWebkitVisibility"] is False),
             # ---- iOS WebKit 专有手势事件家族（Chromium 装 iOS 的最快反证）----
             "GestureEvent 构造器存在（iOS WebKit 专有）": state["hasGestureEvent"] is True,
             "ongesturestart 处理属性存在": state["hasGestureHandler"] is True,
@@ -2795,40 +5566,66 @@ async def main() -> int:
                     for n in ("sharedStorage", "SharedStorage", "fence", "Fence",
                               "HTMLFencedFrameElement", "showSaveFilePicker",
                               "showDirectoryPicker"))),
+            "平台API：F-92 存储分桶 / 呈现可用性类名缺席（入口已删，类名同删）": (
+                all((plat.get("win") or {}).get(n) == ["undefined", False]
+                    for n in ("PresentationAvailability", "StorageBucket"))),
+            "平台API：F-92 Gamepad 震动面缺席（iOS 开关默认 false，类名 + 原型成员同删）": (
+                (plat.get("win") or {}).get("GamepadHapticActuator") == ["undefined", False]
+                and state.get("gamepadVibActuator") is False),
             "平台API：document.browsingTopics 与 navigator 广告/XR/VirtualKeyboard 面缺席": (
                 (plat.get("doc") or {}).get("browsingTopics") == ["undefined", False]
                 and all((plat.get("nav") or {}).get(n) == ["undefined", False]
                         for n in ("xr", "virtualKeyboard", "ink", "runAdAuction",
                                   "joinAdInterestGroup", "leaveAdInterestGroup",
                                   "deprecatedReplaceInURN", "updateAdInterestGroups",
+                                  "deprecatedRunAdAuctionEnforcesKAnonymity",
                                   "protectedAudience"))),
             "平台API：真机存在面保持（WebCodecs/URLPattern/BarcodeDetector/全屏外引擎面）": (
                 all((plat.get("kept") or {}).get(n) == ["function", True]
-                    for n in ("VideoDecoder", "VideoFrame", "AudioDecoder",
-                              "EncodedAudioChunk", "URLPattern", "Highlight",
+                    for n in ("VideoDecoder", "VideoFrame", "Highlight",
                               "BarcodeDetector", "ImageCapture",
-                              "MediaStreamTrackProcessor", "GPU",
                               "FileSystemHandle", "FileSystemFileHandle",
-                              "FileSystemDirectoryHandle", "FileSystemWritableFileStream"))
-                and (plat.get("kept") or {}).get("navigation") == ["object", True]
+                              "FileSystemDirectoryHandle"))
+                # F-85：这批按 BCD 接口自身版本门控，低版本 profile 必须缺席
+                and all((plat.get("kept") or {}).get(n)
+                        == (["function", True] if _ios_at_least(26) else ["undefined", False])
+                        for n in ("AudioDecoder", "EncodedAudioChunk", "URLPattern",
+                                  "GPU", "FileSystemWritableFileStream"))
+                # MediaStreamTrackProcessor 是 iOS 18+，低版本 profile 必须缺席
+                and (plat.get("kept") or {}).get("MediaStreamTrackProcessor")
+                == (["function", True] if _ios_at_least(18) else ["undefined", False])
+                # F-85：Navigation API 是 26.2，低版本 profile 必须缺席
+                and (plat.get("kept") or {}).get("navigation")
+                == (["object", True] if _ios_at_least(26, 2) else ["undefined", False])
                 and all((plat.get("keptDoc") or {}).get(n) == ["function", True]
                         for n in ("startViewTransition", "hasStorageAccess",
                                   "requestStorageAccess"))
                 and all((plat.get("keptNav") or {}).get(n) == ["function", True]
                         for n in ("share", "canShare"))
-                and all((plat.get("keptNav") or {}).get(n) == ["object", True]
-                        for n in ("wakeLock", "gpu"))),
+                and (plat.get("keptNav") or {}).get("wakeLock") == ["object", True]
+                and (plat.get("keptNav") or {}).get("gpu")
+                == (["object", True] if _ios_at_least(26) else ["undefined", False])),
             "平台API：Worker 侧差集（IdleDetector/WebSocketStream/ImageDecoder/Scheduler 缺席）": (
                 all((wk_main.get("platW") or {}).get(n) == "undefined"
                     for n in ("IdleDetector", "WebSocketStream", "ImageDecoder",
                               "FileSystemObserver", "Scheduler", "scheduler"))
                 and all((wk_main.get("platW") or {}).get(n) == "function"
-                        for n in ("VideoDecoder", "BarcodeDetector", "URLPattern",
-                                  "WebGL2RenderingContext"))),
+                        for n in ("VideoDecoder", "BarcodeDetector",
+                                  "WebGL2RenderingContext"))
+                # F-85：URLPattern 在 Worker 全局同样按版本门控
+                and (wk_main.get("platW") or {}).get("URLPattern")
+                == ("function" if _ios_at_least(26) else "undefined")),
+            # F-90：Notification / Push 族在 iOS Worker 全局同样缺席
+            # （页面侧由 notifAbsent 断言，Worker 是独立全局，须单独收口）。
+            "平台API：Worker 侧 Notification / Push 族缺席": (
+                all((wk_main.get("platW") or {}).get(n) == "undefined"
+                    for n in ("Notification", "PushManager", "PushSubscription",
+                              "PushSubscriptionOptions"))),
             "平台API：跨域 iframe Worker 同口径": (
                 (fr_worker.get("platW") or {}).get("IdleDetector") == "undefined"
                 and (fr_worker.get("platW") or {}).get("Scheduler") == "undefined"
-                and (fr_worker.get("platW") or {}).get("VideoDecoder") == "function"),
+                and (fr_worker.get("platW") or {}).get("VideoDecoder") == "function"
+                and (fr_worker.get("platW") or {}).get("Notification") == "undefined"),
             # ---- JavaScriptCore 引擎面（iOS 目标）----
             # 声明 iOS 而引擎是 V8 有四条独立判据，逐条对齐 WebKit；取证见
             # app/mobile_cdp_injector.py 的「JavaScriptCore 引擎面」注释块。
@@ -2957,49 +5754,13 @@ async def main() -> int:
                 and all(v == "undefined"
                         for v in (fr_worker.get("mediaW") or {}).values())
                 and bool(wk_main.get("mediaW")) and bool(fr_worker.get("mediaW"))),
-            # ---- Notification 面（WebKit Notification.idl 口径）----
-            "Notification：静态 permission 为数据属性（readonly attribute 形态）": (
-                ntf.get("permissionDesc") == ["data", False, True, True]
-                and ntf.get("permission") in ("default", "denied")),
-            "Notification：静态 maxActions 不存在（WebKit 未实现该项）": (
-                ntf.get("maxActionsIn") is False),
-            "Notification：原型成员集与 WebKit 逐项一致（含 ondisplay/navigate/show）": (
-                ntf.get("protoOwn") == ["constructor", "onclick", "onerror",
-                                        "navigate", "title", "dir", "lang",
-                                        "body", "tag", "icon", "silent", "data",
-                                        "onclose", "ondisplay", "onshow",
-                                        "close", "show"]),
-            "Notification：原型链继承 EventTarget.prototype（事件系统可用）": (
-                (ntf.get("chain") or [])[:2] == ["Notification", "EventTarget.prototype"]
-                and (ntf.get("inst") or {}).get("isET") is True
-                and (ntf.get("inst") or {}).get("isN") is True
-                # 真 EventTarget 才能通过 addEventListener/dispatchEvent 的内部槽校验
-                and (ntf.get("inst") or {}).get("hits") == 1),
-            "Notification：构造语义与选项缺省值（silent 缺省 null、navigate 空串）": (
-                (ntf.get("defaults") or {}).get("silent") is None
-                and (ntf.get("defaults") or {}).get("dir") == "auto"
-                and (ntf.get("defaults") or {}).get("icon") == ""
-                and (ntf.get("defaults") or {}).get("navigate") == ""
-                and ntf.get("silentFalse") is False
-                and (ntf.get("inst") or {}).get("silent") is True
-                and (ntf.get("inst") or {}).get("dir") == "rtl"
-                and (ntf.get("inst") or {}).get("data") == {"a": 1}),
-            "Notification：实例无自有属性、show/close 返回 undefined、无 new 抛 TypeError": (
-                (ntf.get("inst") or {}).get("own") == []
-                and (ntf.get("inst") or {}).get("show") == "undefined"
-                and (ntf.get("inst") or {}).get("close") == "undefined"
-                and ntf.get("noNew") == "throw:TypeError"),
-            "Notification：坏 receiver 抛 TypeError（含 navigate/ondisplay/show）": (
-                ntf.get("badRecv") == "throw:TypeError"
-                and ntf.get("badRecvNav") == "throw:TypeError"
-                and ntf.get("showBadRecv") == "throw:TypeError"
-                and ntf.get("handlerLoop") == [True, None]),
-            "Notification：构造器保持原生外观（length 1 / prototype 不可写）": (
-                ntf.get("len") == 1
-                and ntf.get("native") is True
-                and ntf.get("protoDesc") == [False, False, False]
-                and ntf.get("tag") == "[object Notification]"
-                and ntf.get("reqPermDesc") == ["function", True, True, True, 0]),
+            # ---- Notification 面 ----
+            # F-90：iOS 普通浏览上下文里 NotificationsEnabled 默认为 false，
+            # Notification 连同 Push 族整体缺席——这里只断言「没有」，
+            # 原来的静态成员 / 原型成员 / 缺省值九项断言随假面一起作废
+            # （WebKit Notification.idl 口径的仿真只在 Android 侧有意义）。
+            "Notification：iOS 页面全局缺席（typeof undefined 且不在 window 上）": (
+                ntf.get("type") == "undefined"),
             # ---- WebKit 原生触控工厂（document.createTouch / createTouchList）----
             # 取证：Playwright WebKit 27.2 实测 + WebKit main Source/WebCore/
             # dom/Document.idl（createTouch / createTouchList）与 Touch.idl。
@@ -3146,8 +5907,110 @@ async def main() -> int:
             "CSS：值合法性（非法值 false、否定式语义正确）": (
                 eng.get("cssTouchCalloutBadValue") is False
                 and eng.get("cssTouchCalloutNegInvalid") is True),
+            # F-88：allow 表里 5 个「任意值」项改为真值域校验
+            "CSS：allow 面非法值一律 false（F-88）": (
+                eng.get("cssBadMarginTrim") is False
+                and eng.get("cssBadTextAutospace") is False
+                and eng.get("cssBadBackdrop") is False
+                and eng.get("cssBadHyphens") is False
+                and eng.get("cssBadApplePay") is False
+                and eng.get("cssBadMarginTrimCond") is False
+                and eng.get("cssBadBackdropCond") is False),
+            "CSS：值域边界（margin-trim: inline / blur 无单位 → false；多函数与 || 组合 → true）": (
+                eng.get("cssMarginTrimInline") is False
+                and eng.get("cssBackdropUnitless") is False
+                and eng.get("cssBackdropMulti") is True
+                and eng.get("cssMarginTrimCombo") is True
+                and eng.get("cssTextAutospaceCombo") is True),
             "CSS：原生判定不受影响（display: grid 真 / 非法值假）": (
                 eng.get("cssNativeTrue") is True and eng.get("cssNativeFalse") is False),
+            # F-101：复合条件（and/or/not）里的 allow 项同样走改写
+            "CSS：复合条件里的非前缀 allow 项（margin-trim/text-autospace）": (
+                eng.get("cssComboMarginTrim") is True
+                and eng.get("cssComboMarginTrimBad") is False
+                and eng.get("cssComboTextAutospace") is True
+                and eng.get("cssComboHyphens") is True),
+            # F-98：inline 存储 + 枚举 + computed 回读
+            "CSS：WebKit 专有属性的 inline 读写 / 索引枚举 / computed 回读": (
+                f98.get("len") == 5
+                and f98.get("items") == ["color", "-webkit-backdrop-filter",
+                                         "margin-trim", "hyphens",
+                                         "-apple-pay-button-style"]
+                and f98.get("itemAt") == "-webkit-backdrop-filter"
+                and f98.get("inlineMT") == "block"
+                and f98.get("inlinePay") == "black"
+                and f98.get("inlineHyphens") == "auto"
+                and f98.get("compMT") == "block"
+                and f98.get("compPay") == "black"
+                and f98.get("compHyphens") == "auto"
+                and f98.get("stickyInline") == "-webkit-sticky"
+                and f98.get("stickyComp") == "sticky"
+                and f98.get("removed") == "blur(4px)"
+                and f98.get("lenAfter") == 4
+                and f98.get("emptyIn") is False),
+            # F-99：computed 数值序列化（LayoutUnit 1/64 / float32 / 整数档）
+            "CSS：computed 长度按 WebKit 三档口径序列化": (
+                f99.get("width") == "21.4375px"
+                and f99.get("height") == "33.296875px"
+                and f99.get("margin") == "21.4375px 21.440001px 21.4375px 21.4375px"
+                and f99.get("marginRight") == "21.440001px"
+                and f99.get("padding") == "21.440001px"
+                and f99.get("lineHeight") == "27.200001px"
+                and f99.get("fontSize") == "16px"
+                and f99.get("borderWidth") == "1px"
+                and f99.get("outlineWidth") == "2px"
+                and f99.get("outlineOffset") == "1px"),
+            "CSS：物理右侧外边距是量化例外（rtl / vertical-rl 同样）": (
+                f99.get("rtlInlineStart") == "21.440001px"
+                and f99.get("rtlInlineEnd") == "21.4375px"
+                and f99.get("rtlBlockStart") == "21.4375px"
+                and f99.get("vertBlockStart") == "21.440001px"
+                and f99.get("vertBlockEnd") == "21.4375px"),
+            "CSS：未参与布局的元素不做量化（display:none）": (
+                f99.get("hiddenWidth") == "33.299999px"
+                and f99.get("hiddenMargin") == "21.440001px"),
+            "CSS：简写折叠与 -webkit-locale 去引号": (
+                f99.get("radiusSlash") == "10px / 20px"
+                and f99.get("locale") == "en"
+                and f99.get("localeCamel") == "en"),
+            "CSS：inline 声明保留作者原文，仅 computed 归一": (
+                f99.get("inlineWidth") == "33.3px"
+                and f99.get("inlineLineHeight") == "1.7"
+                and f99.get("compWidth") == "33.296875px"
+                and f99.get("compLineHeight") == "27.200001px"),
+            "CSS：camel / getPropertyValue 两条旁路口径一致": (
+                f99.get("marginVP") == "21.4375px"
+                and f99.get("marginCamel") == "21.4375px"),
+            # F-100：表单控件 UA 默认值
+            "CSS：表单控件 computed line-height 为 normal": (
+                f99.get("btnLH") == "normal"
+                and f99.get("taLH") == "normal"
+                and f99.get("selLH") == "normal"
+                and all(f99.get("lh_" + t) == "normal" for t in (
+                    "checkbox", "radio", "range", "color", "file", "date"))),
+            "CSS：表单控件 computed cursor（文本类 auto / 按钮类 default）": (
+                f99.get("btnCursor") == "default"
+                and f99.get("selCursor") == "default"
+                and f99.get("taCursor") == "auto"
+                and all(f99.get("cur_" + t) == "auto" for t in (
+                    "checkbox", "radio", "range", "color", "file", "date"))),
+            # F-07 / F-24：deny（桌面独有）与 allow（WebKit 独有）双向差集
+            "CSS：deny 面 5 项为 false（interpolate-size/overflow-clip-margin/corner-shape/reading-flow/:host-context）": (
+                eng.get("cssDenyInterpolate") is False
+                and eng.get("cssDenyOverflowClip") is False
+                and eng.get("cssDenyCornerShape") is False
+                and eng.get("cssDenyReadingFlow") is False
+                and eng.get("cssDenyHostContext") is False),
+            "CSS：allow 面 6 项为 true（margin-trim/text-autospace/-webkit-backdrop-filter/-webkit-sticky/-webkit-hyphens/-apple-pay-button-style）": (
+                eng.get("cssAllowMarginTrim") is True
+                and eng.get("cssAllowTextAutospace") is True
+                and eng.get("cssAllowBackdrop") is True
+                and eng.get("cssAllowSticky") is True
+                and eng.get("cssAllowHyphens") is True
+                and eng.get("cssAllowApplePay") is True),
+            "CSS：单参条件文本同样走双向差集": (
+                eng.get("cssAllowMarginTrimCond") is True
+                and eng.get("cssDenyInterpolateCond") is False),
             "CSS：webkitTouchCallout/webkitOverflowScrolling 属性面 + 读写回环": (
                 eng.get("tcInStyle") is True and eng.get("oscInStyle") is True
                 and eng.get("tcDefault") == ""
@@ -3302,6 +6165,38 @@ async def main() -> int:
                     fr_live.get("gcr") is True and fr_live.get("wk") is True
                     and fr_live.get("hist") is True
                     and fr_live.get("chromeType") == "undefined"),
+                # ---- POST 重放面（B1-7）：只在 POST 文档出现 ----
+                # 真机源码：post_request.js 把 __crPostRequestWorkaround 定义为
+                # 命名空间对象（不是函数），两个回执通道由路由在重放期间临时注册。
+                "CriOS POST：__crPostRequestWorkaround 为命名空间对象": (
+                    post.get("present") is True
+                    and post.get("type") == "object"
+                    and post.get("keys") == ["runPostRequest"]),
+                "CriOS POST：runPostRequest 四参且非 native": (
+                    post.get("runLen") == 4 and post.get("runNative") is False),
+                "CriOS POST：函数源文本为 Chrome 61 原文（同步 XHR + document.write）": (
+                    isinstance(post.get("runSrc"), str)
+                    and "function(\n    url, headers, body, contentType) {"
+                    in post["runSrc"]
+                    and "new XMLHttpRequest()" in post["runSrc"]
+                    and "document.open();" in post["runSrc"]
+                    and "window.webkit.messageHandlers['POSTSuccessHandler']"
+                    in post["runSrc"]),
+                "CriOS POST：两个回执通道存在且不可枚举": (
+                    post.get("chanSuccess") is True
+                    and post.get("chanError") is True
+                    and post.get("chanInvoke") is True
+                    and post.get("chanOwn") == []
+                    and post.get("mhProtoOwn") == ["constructor"]),
+                "CriOS POST：标记 cookie / 交接标记均已清": (
+                    post.get("cookie") == ""
+                    and post.get("flagLeak") is False
+                    and post_state.get("cookie_leak") is False),
+                "反证：GET 文档无重放面（导航前/后）": (
+                    (post_state.get("get_before") or {}).get("present") is False
+                    and (post_state.get("get_after") or {}).get("present") is False
+                    and (post_state.get("get_after") or {}).get("chanSuccess")
+                    is False),
             })
         else:
             checks.update({
@@ -3314,6 +6209,10 @@ async def main() -> int:
                     state["historyPatched"] is False
                     and state["printPatched"] is False
                     and state["scrollPatched"] is False),
+                # POST 重放面是 CriOS 宿主行为，Safari 的 POST 文档上不存在
+                "Safari POST：无重放面": (
+                    post.get("present") is False
+                    and not post.get("chanSuccess")),
                 "Safari：standalone 存在且为 false（iOS 专有属性）": (
                     state["hasStandalone"] is True and state["standalone"] is False),
                 "跨域 iframe：无 CriOS 检测面（Safari 口径）": (
@@ -3341,6 +6240,12 @@ async def main() -> int:
             mq.get("hoverNone") is True and mq.get("hoverHover") is False),
         "媒体查询：any-pointer:coarse / any-hover:none 一致": (
             mq.get("anyPointerCoarse") is True and mq.get("anyHoverNone") is True),
+        # F-12：HDR 屏机型 (dynamic-range: high) 为 true（CDP 无法仿真，
+        # 由 matchMedia 补丁按机型给值）；SE 系列为 false。Android 侧不补
+        # 该特性（真机 Chrome Android 的取值随设备屏而变，未做机型表），
+        # 只断言查询串原样透出、不被补丁改写。
+        "媒体查询：dynamic-range 查询串原样（Android 未启用该补丁）": (
+            mq.get("dynamicRangeMedia") == "(dynamic-range: high)"),
         # 真机口径：内核 --disable-spoofing=audio 已关闭「按种子微扰采样率」的
         # 伪装（实测宿主 44100 → 伪装 44100.01171875），采样率必须精确整数。
         "音频：OfflineAudioContext 采样率为精确整数（44100/48000）": (
@@ -3351,6 +6256,10 @@ async def main() -> int:
         # ---- 断线自愈（看门狗）：事故形态复现 + 自动恢复 ----
         "自愈：通道断开即标记重连中（面板状态可见）": (
             hs.get("state_down") == "reconnecting"),
+        # F-01：连接成功 ≠ 仿真生效——注入后主动读一次真实读数
+        "注入后读数校验：maxTouchPoints/pointer 已生效（state=ok）": (
+            hs.get("verified_before") is True
+            and hs.get("state_before") == "ok"),
         "自愈：看门狗自动重连（计数递增，状态回 ok）": (
             hs.get("healthy") is True
             and hs.get("state_after") == "ok"
@@ -3363,10 +6272,46 @@ async def main() -> int:
             int(h_main.get("touch") or 0) >= 5 and h_main.get("coarse") is True),
     })
 
+    # F-12：iOS 的 HDR 屏口径（CDP 无法仿真，由 matchMedia 补丁按机型给值）。
+    if target_os == "ios":
+        checks["媒体查询：dynamic-range 与机型口径一致（HDR 屏 true / SE false）"] = (
+            mq.get("dynamicRangeHigh") is (
+                "SE" not in (extra.get("marketName") or ""))
+            and mq.get("dynamicRangeStandard") is True)
+
+    # ---- F-15：孤儿实例回收 ----
+    # 探针自己拉起的浏览器在 finally 里已被关掉；此刻 profile 目录下不应
+    # 再有「父进程已消失」的浏览器进程。回收器先跑一遍，再把结果与
+    # 「跑完后仍剩多少」对上——只断言不残留，不断言回收了谁（并发跑别的
+    # 用例时可能有别的实例在场，断言数量会误报）。
+    try:
+        from app.config import PROFILE_ROOT as _profile_root
+        from app.kernels import fp_chromium_kernel as _fpk
+        _fpk.reclaim_orphans(_profile_root)
+        _root_text = str(_profile_root)
+        _left = [p for p in _fpk._iter_browser_processes()
+                 if p[2].startswith(_root_text + os.sep)]
+        _live_left = []
+        for _pid, _ppid, _ in _left:
+            if _ppid != 1 and _fpk._alive(_ppid):
+                continue
+            _live_left.append(_pid)
+        checks["F-15：profile 目录下无孤儿浏览器残留（父进程已消失）"] = (
+            not _live_left)
+    except Exception as e:  # noqa: BLE001
+        checks["F-15：profile 目录下无孤儿浏览器残留（父进程已消失）"] = False
+        print("      F-15 检查异常:", e)
+
     print("\n== 检查项 ==")
     ok_all = True
     for name, passed in checks.items():
         print(("  ✅ " if passed else "  ❌ ") + name)
+        if not passed and os.environ.get("VERIFY_DEBUG"):
+            keys = (("wcCodecs",) if "codec 矩阵" in name
+                    else ("wkIcs",) if "F-133" in name
+                    else ("wkSw",) if "serviceWorker" in name else ("intlZh",))
+            print("      state:", json.dumps(
+                {k: v for k, v in state.items() if k in keys}, ensure_ascii=False))
         ok_all = ok_all and passed
     print("\n" + (f"✅ 全部通过（{len(checks)} 项）" if ok_all
                   else f"❌ 存在失败项（{len(checks)} 项）"))

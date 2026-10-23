@@ -107,6 +107,16 @@ async def _check_kernel_health():
 async def lifespan(app: FastAPI):
     db.init_db()
     db.ensure_default_member()
+    # F-15：回收上次异常退出遗留的浏览器实例（父进程已消失的那些）。
+    # 必须在 scheduler.start() 之前——否则调度器可能先撞上被占住的
+    # profile 目录，把「无法启动」记成一次环境故障。
+    try:
+        killed = await asyncio.to_thread(
+            fp_chromium_kernel.reclaim_orphans, PROFILE_ROOT)
+        if killed:
+            log.warning("已回收 %d 个孤儿浏览器实例：%s", len(killed), killed)
+    except Exception:
+        log.debug("孤儿实例回收失败（不影响启动）", exc_info=True)
     scheduler.start()
     asyncio.create_task(_check_kernel_health())
     log.info("%s v%s (Phase %s) 已启动", APP_NAME, VERSION, PHASE)

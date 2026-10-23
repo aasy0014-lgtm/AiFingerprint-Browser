@@ -440,6 +440,28 @@ function readEngine() {
       })(),
       crwebInvoke: !!(window.webkit && window.webkit.messageHandlers
         && window.webkit.messageHandlers.crwebinvoke),
+      // POST 两通道：真机只在 POST 重放期间临时注册（路由 add/remove），
+      // 普通 GET 页面上应为 false。真机对拍用它在现场校准。
+      wkPostChannels: (window.webkit && window.webkit.messageHandlers) ? {
+        success: 'POSTSuccessHandler' in window.webkit.messageHandlers,
+        error: 'POSTErrorHandler' in window.webkit.messageHandlers,
+      } : null,
+      // POST 导航重放面：真机只在由 POST 产生的文档上存在；GET 页面应为 null。
+      postRequest: (typeof window.__crPostRequestWorkaround === 'undefined'
+        ? null : (() => {
+          const ns = window.__crPostRequestWorkaround;
+          const fn = ns && ns.runPostRequest;
+          const d = Object.getOwnPropertyDescriptor(
+            window, '__crPostRequestWorkaround');
+          return {
+            type: typeof ns,
+            keys: Object.keys(ns || {}),
+            runType: typeof fn,
+            runLen: typeof fn === 'function' ? fn.length : null,
+            runSrc: typeof fn === 'function' ? String(fn).slice(0, 300) : null,
+            desc: d ? [d.writable, d.enumerable, d.configurable] : null,
+          };
+        })()),
       crwebPmRet: (() => {
         try {
           const h = window.webkit && window.webkit.messageHandlers

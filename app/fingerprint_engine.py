@@ -243,7 +243,7 @@ def check_health(fingerprint_data: dict[str, Any], target_os: str) -> dict[str, 
         "macos": {"MacIntel"},
         "linux": {"Linux x86_64"},
         # 移动端 JS 层 navigator.platform 的真机典型值
-        "android": {"Linux armv81", "Linux aarch64", "Linux armv7l"},
+        "android": {"Linux aarch64", "Linux armv8l", "Linux armv7l"},
         "ios": {"iPhone", "iPad", "iPod"},
     }
     if platform and platform not in expected_platform.get(target_os, {platform}):
