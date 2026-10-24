@@ -37,7 +37,7 @@ DETECT_LINKS = {
     "WebRTC 检测": "https://browserleaks.com/webrtc",
     "Pixelscan": "https://pixelscan.net/",
     "IPHey": "https://iphey.com/",
-    "AmIUnique": "https://amiunique.org/fp",
+    "AmIUnique": "https://amiunique.org/fingerprint",
     "JA3/TLS 检测": "https://scrapfly.io/web-scraping-tools/ja3-fingerprint",
 }
 
