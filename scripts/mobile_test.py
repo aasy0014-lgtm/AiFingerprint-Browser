@@ -204,6 +204,14 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
         check(f"[{tag}] WebGL 上限为移动档",
               extra["webglProfile"]["limits"]["MAX_TEXTURE_SIZE"] == 16384
               and extra["webglProfile"]["limits"]["MAX_SAMPLES"] == 4)
+        # F-165：Adreno 走 ANGLE GLES 后端，经 min(1024, native) 与
+        # ANGLE_LIMIT_CAP 后落在宿主之下，可如实声明（Mali/Xclipse 不动）。
+        check(f"[{tag}] WebGL 上限按 GPU 家族覆盖（Adreno 256 vectors / 14 blocks）",
+              (extra["webglProfile"]["limits"]["MAX_VERTEX_UNIFORM_VECTORS"] == 256
+               and extra["webglProfile"]["limits"]["MAX_VERTEX_UNIFORM_BLOCKS"] == 14
+               and extra["webglProfile"]["limits"]["MAX_COMBINED_UNIFORM_BLOCKS"] == 28)
+              if "Adreno" in data["videoCard"]["renderer"]
+              else "MAX_VERTEX_UNIFORM_COMPONENTS" not in extra["webglProfile"]["limits"])
         check(f"[{tag}] 编解码表只校准 HEVC（ogg/webm 内核原生已可播）",
               set(extra.get("codecCapability") or {})
               == {'video/mp4; codecs="hvc1"', 'video/mp4; codecs="hvc1.1.6.l93.b0"'})

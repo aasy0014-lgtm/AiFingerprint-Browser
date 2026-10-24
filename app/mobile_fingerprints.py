@@ -464,6 +464,16 @@ _ANDROID_DOWNLINK_MAX_MBPS = 1300.0
 # 支持 S3TC，检测站对 iOS 目标直接按 15 分计）。故本表的核心是扩展集
 # 白名单，MAX_* 只覆盖确有家族差异的项。
 #
+# F-165 更正（2026-10-24）：此前把「真机 Android」的对照值取成了 ANGLE 的
+# **Vulkan** 后端读数（gpuinfo r8256 等，渲染器串形如 `... on Vulkan 1.3.x`），
+# 与本仓声明的渲染器串不是同一后端。本仓 Adreno/Mali 串收尾是
+# `OpenGL ES 3.2`——ANGLE 的 DisplayGL::getVersionString 只在原生上下文为
+# GLES 时加这个前缀（DisplayGL.cpp:206-212 + SanitizeVersionString:57-85），
+# 即 **GL/GLES 后端**。Vulkan 后端的读数（4096 uniform vectors、96 纹理
+# 单元、8192 三维纹理、63 texel offset）不适用。
+# GLES 后端经 ANGLE 两层钳位后，Adreno 的多个上限**低于**宿主，可如实声明
+# 而不出现「报得上、用不了」；见 _GL_LIMITS_ADRENO。
+#
 # 扩展集来源：内核在移动 GPU 上会导出的 WebGL1 扩展（Chrome 148 实测集
 # 合中剔除桌面专属项）。缺失项由注入层从 getSupportedExtensions() 过滤，
 # getExtension() 对过滤项返回 null（与「驱动不导出」同语义）。
@@ -520,16 +530,69 @@ _GL_LIMITS_MOBILE: Dict[str, Any] = {
 }
 
 
-def _webgl_profile(target_os: str) -> Dict[str, Any]:
+# Adreno 家族在 ANGLE **GLES 后端**下的真实上限（覆盖 _GL_LIMITS_MOBILE）。
+#
+# 推导链：原生 Adreno GLES 驱动读数（gpuinfo opengles r8242/8244/8245/
+# 8247/8250/8254，Adreno 610/619/830/840/850）→ ANGLE 钳位 → WebGL 报值。
+# 钳位两处：
+#   renderergl_utils.cpp:1472-1479
+#       maxVertexUniformVectors = min(1024, native)          # Adreno 原生 256
+#       maxShaderUniformComponents[V] = min(vectors * 4, native)
+#   Context.cpp:4415-4500 ANGLE_LIMIT_CAP
+#       maxVertexAttributes        ≤ MAX_VERTEX_ATTRIBS (16)
+#       maxShaderUniformBlocks[*]  ≤ 16
+#       maxCombinedUniformBlocks   ≤ 60
+#       maxUniformBufferBindings   ≤ 72
+#       maxCombinedTextureImageUnits ≤ 64 (ES3.2 以下)
+# Chrome 的 WebGL 层不再加钳位（gles2_cmd_decoder.cc:3597-3598、3736-3739
+# 直接透传 ANGLE 的 caps），所以 ANGLE 的 GLES 数值就是真机 WebGL 报值。
+#
+# 只列**与宿主不同且可如实声明**的项：Adreno 经钳位后落在宿主之下
+# （1024→256、4096→1024、16→14、32→28、4294967294→2147483647），
+# 声明后仍可真实使用，不产生「报得上、用不了」的二次矛盾。
+#
+# 仍未声明的项（GLES 后端下仍高于宿主，声明即「报得上、用不了」）：
+#   MAX_UNIFORM_BUFFER_BINDINGS 72（宿主 32）、MAX_UNIFORM_BLOCK_SIZE 65536
+#   （宿主 16384）、MAX_VERTEX_OUTPUT_COMPONENTS / MAX_FRAGMENT_INPUT_
+#   COMPONENTS 128（宿主 120）、MAX_VARYING_VECTORS 31（宿主 30）、
+#   MAX_COMBINED_VERTEX/FRAGMENT_UNIFORM_COMPONENTS 230400（宿主 69632）、
+#   MAX_TEXTURE_LOD_BIAS 16（宿主 15）。这些保留宿主真值。
+_GL_LIMITS_ADRENO: Dict[str, Any] = {
+    # Adreno 原生 256 → ANGLE min(1024, 256) = 256
+    "MAX_VERTEX_UNIFORM_VECTORS": 256,
+    "MAX_FRAGMENT_UNIFORM_VECTORS": 256,
+    # Adreno 原生 1024 → ANGLE min(256 * 4, 1024) = 1024
+    "MAX_VERTEX_UNIFORM_COMPONENTS": 1024,
+    "MAX_FRAGMENT_UNIFORM_COMPONENTS": 1024,
+    # Adreno 原生 14 → ANGLE min(14, 16) = 14
+    "MAX_VERTEX_UNIFORM_BLOCKS": 14,
+    "MAX_FRAGMENT_UNIFORM_BLOCKS": 14,
+    # Adreno 原生 84 → CapCombinedLimitToESShaders 取 V+F = 28，再 min(28, 60)
+    "MAX_COMBINED_UNIFORM_BLOCKS": 28,
+    # Adreno 原生 2147483647（ANGLE 只钳上界 UINT_MAX-1，不抬高）
+    "MAX_ELEMENT_INDEX": 2147483647,
+}
+
+
+def _webgl_limits_for(target_os: str, renderer: str = "") -> Dict[str, Any]:
+    """按 GPU 家族返回上限覆盖表；渲染器串缺省时退回平台基线。"""
+    limits = dict(_GL_LIMITS_MOBILE)
+    if target_os == "android" and "Adreno" in renderer:
+        limits.update(_GL_LIMITS_ADRENO)
+    return limits
+
+
+def _webgl_profile(target_os: str, renderer: str = "") -> Dict[str, Any]:
     """目标平台 WebGL 面校准规格：上限覆盖 + 扩展集剔除/补充（按 GPU 家族）。"""
+    limits = _webgl_limits_for(target_os, renderer)
     if target_os == "ios":
         return {
-            "limits": dict(_GL_LIMITS_MOBILE),
+            "limits": limits,
             "dropExtensions": list(_GL_EXT_DESKTOP_ONLY_IOS),
             "addExtensions": list(_GL_EXT_IOS_ADD),
         }
     return {
-        "limits": dict(_GL_LIMITS_MOBILE),
+        "limits": limits,
         "dropExtensions": list(_GL_EXT_DESKTOP_ONLY),
     }
 
@@ -2174,7 +2237,7 @@ def generate_mobile_fingerprint(
             "codecCapability": _codec_capability(
                 target_os,
                 av1=_ios_av1_capable(str(device["model"]), device["market_name"])),
-            "webglProfile": _webgl_profile(target_os),
+            "webglProfile": _webgl_profile(target_os, video_card["renderer"]),
             "removeNavigatorProps": remove_props,
             "uaCh": ua_ch,
             "maxTouchPoints": max_touch_points,

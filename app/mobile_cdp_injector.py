@@ -676,7 +676,7 @@ def derive_spec(fingerprint: dict, target_os: str,
     # 时按平台兜底，存量档案无需重建。
     webgl_profile = extra.get("webglProfile")
     if not isinstance(webgl_profile, dict) or not webgl_profile:
-        webgl_profile = _webgl_profile(target_os)
+        webgl_profile = _webgl_profile(target_os, renderer)
 
     color_depth = screen.get("colorDepth")
     try:
