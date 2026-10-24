@@ -12129,6 +12129,8 @@ class MobileEmulationSession:
         self._emu_ok = False
         # 注入后读数校验结果：None = 尚未校验，False = 通道在线但仿真未生效
         self._emu_verified: Optional[bool] = None
+        # 设备度量覆盖三级降参全部失败（视口已退回宿主窗口）
+        self._metrics_unapplied = False
         self._reconnects = 0
         self._last_error = ""
         self.profile_id = ""
@@ -12169,6 +12171,7 @@ class MobileEmulationSession:
         self._sensor_supported = None
         self._sensor_session = None
         self._emu_verified = None
+        self._metrics_unapplied = False
         self._ua_guard.clear()
         self._ua_guard_busy.clear()
         self._first_page_task = None
@@ -12253,6 +12256,11 @@ class MobileEmulationSession:
     def emulation_verified(self) -> Optional[bool]:
         """首屏读数校验：True = 仿真确实生效，False = 在线但未生效。"""
         return self._emu_verified
+
+    @property
+    def metrics_unapplied(self) -> bool:
+        """设备度量覆盖三级降参全部失败：视口仍是宿主窗口尺寸。"""
+        return self._metrics_unapplied
 
     @property
     def reconnect_count(self) -> int:
@@ -12541,9 +12549,29 @@ class MobileEmulationSession:
         走代理导致 CDP 握手失败时浏览器照常启动、/browser/start 照常返回
         成功，但一条 CDP 仿真都没挂上（宿主触屏/媒体查询）。这里读一次
         真实读数，面板据此区分「在线」与「在线但未生效」。
+
+        触控两项**不足以**判定仿真生效（F-166）：JS 补丁自己就改写
+        maxTouchPoints，matchMedia('(pointer: coarse)') 也只反映
+        setTouchEmulationEnabled，两者都可在 setDeviceMetricsOverride 完全
+        缺席时成立（实测：仅开触控时 mtp=5 / coarse=true，而 innerWidth 仍
+        是宿主窗口 500）。此时页面照常渲染、面板照常显示健康，视口穿帮要
+        等到检测脚本量 innerWidth 才暴露。故必须同时校验几何。
+
+        几何用 visualViewport.width * visualViewport.scale == css_w，而**不能**
+        用 innerWidth == css_w：本函数在挂载时于 about:blank 上执行，该页无
+        <meta viewport>，度量覆盖生效时 innerWidth 恒为默认 980 布局视口
+        （此时 scale = css_w/980）。乘上 scale 的乘积与页面是否声明 viewport
+        无关，在 about:blank / 真实页面、Android / iOS 下都等于 css_w。
+        iOS 侧补丁只改 visualViewport.height（F-48 工具栏 inset），width 与
+        scale 未动，乘积同样成立。
         """
-        expr = ("({mtp: navigator.maxTouchPoints,"
-                " coarse: matchMedia('(pointer: coarse)').matches})")
+        want_w = float(self.css_w)
+        expr = ("(function(){var v=window.visualViewport;return {"
+                "mtp: navigator.maxTouchPoints,"
+                " coarse: matchMedia('(pointer: coarse)').matches,"
+                " vvW: v?v.width:null, vvScale: v?v.scale:null,"
+                " iw: innerWidth, ih: innerHeight,"
+                " sw: screen.width, sh: screen.height};})()")
         try:
             res = await self._send("Runtime.evaluate", {
                 "expression": expr, "returnByValue": True,
@@ -12551,6 +12579,15 @@ class MobileEmulationSession:
             val = ((res.get("result") or {}).get("value"))
             ok = (isinstance(val, dict) and int(val.get("mtp") or 0) > 0
                   and val.get("coarse") is True)
+            if ok:
+                # 未生效时 visualViewport 缺失（极老宿主）也按失败处理：
+                # 这正是本该被看见的退化，不该因为「读不到」而静默放行。
+                try:
+                    prod = float(val["vvW"]) * float(val["vvScale"])
+                except (TypeError, ValueError, KeyError):
+                    prod = None
+                if prod is None or abs(prod - want_w) > 1.5:
+                    ok = False
         except Exception as e:  # noqa: BLE001
             # 读不到（文档处于暂停态 / 命令超时）不等于仿真失效：保持未校验，
             # 留给下一个页面挂载时重试，避免瞬态误报 degraded。
@@ -12558,9 +12595,12 @@ class MobileEmulationSession:
             return
         self._emu_verified = ok
         if not ok:
-            self._last_error = f"仿真读数校验失败: {val}"
-            log.error("移动端仿真读数校验失败（补丁/设备仿真未生效）：%s [%s]",
-                      val, self.profile_name or self.profile_id or "?")
+            self._last_error = (f"仿真读数校验失败: {val}"
+                                f"（期望视口宽 {self.css_w}）")
+            log.error("移动端仿真读数校验失败（补丁/设备仿真未生效）：%s "
+                      "期望 css_w=%s viewport_h=%s dpr=%s [%s]",
+                      val, self.css_w, self.viewport_h, self.dpr,
+                      self.profile_name or self.profile_id or "?")
 
     async def _attach_frame(self, target_id: str, session_id: Optional[str] = None,
                             *, paused: bool = False) -> None:
@@ -12961,6 +13001,12 @@ class MobileEmulationSession:
             "screenHeight": self.css_h,
             "screenOrientation": {"type": "portraitPrimary", "angle": 0},
         }
+        # 逐级降参：部分内核版本拒收 screenOrientation 或 screen* 字段。
+        # 三级全败时**不能静默**——此前 `continue` 吞掉全部 CDPError，结果
+        # 是视口退回宿主窗口而没有任何日志（F-166）。这里记一次 error 并
+        # 置 _metrics_unapplied，随后的 _verify_emulation 会再以读数复核。
+        metrics_applied = False
+        last_metrics_err: Optional[Exception] = None
         for drop in (None, "screenOrientation", ("screenWidth", "screenHeight")):
             params = dict(full)
             if drop:
@@ -12969,9 +13015,16 @@ class MobileEmulationSession:
             try:
                 await self._send("Emulation.setDeviceMetricsOverride", params,
                                  session_id=sid)
+                metrics_applied = True
                 break
-            except CDPError:
+            except CDPError as e:
+                last_metrics_err = e
                 continue
+        if not metrics_applied:
+            self._metrics_unapplied = True
+            log.error("设备度量覆盖全部降参尝试失败，视口将退回宿主窗口：%s "
+                      "[%s] 目标=%s", last_metrics_err,
+                      self.profile_name or self.profile_id or "?", self.css_w)
 
         # 2. 触控仿真（原生影响 navigator.maxTouchPoints 与 pointer 事件）
         with contextlib.suppress(CDPError):
