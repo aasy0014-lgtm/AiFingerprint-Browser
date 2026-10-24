@@ -77,7 +77,8 @@ class _CdpPage:
             r = await c.put(f"http://127.0.0.1:{self.port}/json/new?about:blank", timeout=10)
             info = r.json()
         self.target_id = info["id"]
-        self.ws = await websockets.connect(info["webSocketDebuggerUrl"], max_size=8 << 20)
+        self.ws = await websockets.connect(
+            info["webSocketDebuggerUrl"], max_size=8 << 20, proxy=None)
 
     async def _send(self, method: str, params: dict | None = None) -> dict:
         self._id += 1
@@ -133,6 +134,9 @@ _IP_PROVIDERS = [
      if d.get("ip") else None),
 ]
 
+# 非安全上下文采样时的改道端点（https，仅为拿到安全上下文，数据不参与判定）
+_SECURE_SAMPLE_URLS = ("https://example.com/", "https://ipwho.is/?fields=ip,success")
+
 # 各检测项与风控体系的关联（用于报告展示）
 VENDOR_MAP = {
     "ip_reachable": ["cloudflare", "google", "geetest", "yidun"],
@@ -160,6 +164,10 @@ _EXPECT_LANG_PREFIX = {"CN": "zh", "TW": "zh", "HK": "zh", "US": "en", "GB": "en
 _CHECK_JS = """(async () => {
   const out = {};
   out.tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+  // getBattery / navigator.gpu / mediaDevices 只在安全上下文暴露：IP 端点
+  // 首选 http 源，落在那里采样会把它们全读成缺失，必须能区分。
+  out.secure = window.isSecureContext;
+  out.href = location.href;
   out.lang = navigator.language || '';
   out.langs = (navigator.languages || []).join(',');
   out.webdriver = navigator.webdriver;
@@ -291,6 +299,13 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
 
     checks: list[dict] = []
     page = None
+    # 移动端 profile：屏幕、插件、Battery/Client Hints/deviceMemory 的存在性
+    # 都按真机口径变化，桌面假设会整片误报（详见各检查项注释）。
+    target_os = profile.get("target_os") or ""
+    mobile = target_os in ("android", "ios")
+    spec = (profile.get("fingerprint") or {}).get("fingerprint") or {}
+    spec_extra = spec.get("mobileExtra") or {}
+    spec_screen = spec.get("screen") or {}
     try:
         if inst is None:
             raise RuntimeError("浏览器实例不可用（启动失败）")
@@ -334,6 +349,20 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
 
         # ---- 页面内全量采样
         data = await asyncio.wait_for(page.evaluate(_CHECK_JS), timeout=45)
+        # 采样页停在非安全上下文时，getBattery / navigator.gpu / mediaDevices
+        # 按规范根本不暴露，后续三项会整片误报——先改道 https 端点再采一次。
+        if not data.get("secure"):
+            for url in _SECURE_SAMPLE_URLS:
+                try:
+                    await page.goto(url)
+                    retry = await asyncio.wait_for(page.evaluate(_CHECK_JS), timeout=45)
+                except Exception:
+                    continue
+                if retry.get("secure"):
+                    data = retry
+                    break
+        # 改道也没成功：这三项在非安全上下文里本就不可观测，不能当作缺失上报。
+        secure = bool(data.get("secure"))
 
         # 时区一致性
         ip_tz = _normalize_tz(ipinfo.get("timezone"))
@@ -418,20 +447,48 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
 
         # Client Hints（仅 Chromium 系需要检查；Firefox 无此 API 属正常）
         if is_chromium:
-            expect_ch = {"windows": "Windows", "macos": "macOS", "linux": "Linux"}.get(
-                profile.get("target_os"), "")
             got = data.get("chPlatform")
-            if got and expect_ch and got != expect_ch:
-                checks.append(_result("ua_chips", "fail",
-                                      f"Client Hints 平台 {got} ≠ 目标 OS {expect_ch}",
-                                      "userAgentData 与伪装 OS 矛盾（穿帮级）；"
-                                      "fp-chromium 内核自带一致性，出现此问题请换内核或重生成指纹"))
-            elif got:
-                checks.append(_result("ua_chips", "pass", f"Client Hints 平台一致（{got}）"))
+            if mobile:
+                # iOS 走 WebKit 口径：真 Safari 没有 userAgentData，移动端
+                # 指纹也按 removeNavigatorProps 把它摘掉——缺失才是对的。
+                if target_os == "ios":
+                    if got:
+                        checks.append(_result("ua_chips", "warn",
+                                              f"iOS 环境出现 Client Hints（{got}）",
+                                              "真 Safari 无 userAgentData；出现即为穿帮"))
+                    else:
+                        checks.append(_result("ua_chips", "pass",
+                                              "iOS 无 Client Hints（与真 Safari 一致）"))
+                else:
+                    expect_ch = "Android"
+                    if got and got != expect_ch:
+                        checks.append(_result("ua_chips", "fail",
+                                              f"Client Hints 平台 {got} ≠ 目标 OS {expect_ch}",
+                                              "userAgentData 与伪装 OS 矛盾（穿帮级）"))
+                    elif got:
+                        checks.append(_result("ua_chips", "pass", f"Client Hints 平台一致（{got}）"))
+                    elif spec_extra.get("hasUaCh"):
+                        checks.append(_result("ua_chips", "warn",
+                                              "userAgentData 缺失（该机型规格应有）",
+                                              "指纹声明了 hasUaCh，实际却没有；"
+                                              "真 Android Chrome 均带 Client Hints"))
+                    else:
+                        checks.append(_result("ua_chips", "pass",
+                                              "无 Client Hints（该机型规格即如此）"))
             else:
-                checks.append(_result("ua_chips", "warn",
-                                      "userAgentData 缺失（Chromium 应有）",
-                                      "真 Chrome 均带 Client Hints；缺失是自动化/精简版信号"))
+                expect_ch = {"windows": "Windows", "macos": "macOS", "linux": "Linux"}.get(
+                    target_os, "")
+                if got and expect_ch and got != expect_ch:
+                    checks.append(_result("ua_chips", "fail",
+                                          f"Client Hints 平台 {got} ≠ 目标 OS {expect_ch}",
+                                          "userAgentData 与伪装 OS 矛盾（穿帮级）；"
+                                          "fp-chromium 内核自带一致性，出现此问题请换内核或重生成指纹"))
+                elif got:
+                    checks.append(_result("ua_chips", "pass", f"Client Hints 平台一致（{got}）"))
+                else:
+                    checks.append(_result("ua_chips", "warn",
+                                          "userAgentData 缺失（Chromium 应有）",
+                                          "真 Chrome 均带 Client Hints；缺失是自动化/精简版信号"))
         else:
             checks.append(_result("ua_chips", "pass", "Firefox 内核无 Client Hints（正常）"))
 
@@ -442,10 +499,30 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
             w = h = 0
         depth = data.get("colorDepth")
         dpr = data.get("dpr")
-        screen_ok = w >= 1024 and h >= 720
         depth_ok = depth in (24, 30)
-        dpr_ok = dpr in (1, 1.25, 1.5, 1.75, 2, 2.5, 3)
-        if screen_ok and depth_ok and dpr_ok:
+        mismatch = ""
+        if mobile:
+            # 移动端 screen.width 报的是 CSS 逻辑像素（iPhone 13 为 390x844），
+            # 物理分辨率在指纹里是 width/height；1024x720 的桌面下限会把
+            # 所有手机判成异常，故只做「像手机」的宽松下限。
+            screen_ok = w >= 320 and h >= 480
+            dpr_ok = isinstance(dpr, (int, float)) and 1 <= dpr <= 4
+            # 与存储指纹逐值对照：对不上说明 CDP 设备度量没有落到这一页，
+            # 此时 innerWidth/screen.width 会退回宿主窗口值（穿帮级）。
+            want_w = spec_screen.get("cssWidth")
+            want_h = spec_screen.get("cssHeight")
+            if want_w and want_h and (w, h) != (int(want_w), int(want_h)):
+                mismatch = f"实测 {w}x{h} ≠ 指纹 {want_w}x{want_h}"
+        else:
+            screen_ok = w >= 1024 and h >= 720
+            dpr_ok = dpr in (1, 1.25, 1.5, 1.75, 2, 2.5, 3)
+        if mismatch:
+            checks.append(_result(
+                "screen_sane", "warn", mismatch,
+                "设备度量没有落到该页（screen 仍是宿主值），同一环境下 "
+                "innerWidth/innerHeight 也会退回宿主窗口，属穿帮级差异；"
+                "请重启环境，若稳定复现请检查 CDP 注入日志"))
+        elif screen_ok and depth_ok and dpr_ok:
             checks.append(_result("screen_sane", "pass",
                                   f"{w}x{h} @{depth}bit DPR={dpr}"))
         else:
@@ -461,7 +538,12 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
 
         # 媒体设备
         md = data.get("mediaDevices")
-        if md is None or md == -1:
+        if not secure:
+            checks.append(_result("media_devices", "warn",
+                                  "非安全上下文，enumerateDevices 不可观测",
+                                  "该项只在 https 页面上有意义；本次改道 https 未成功"
+                                  "（检查代理是否放行 https），结果不代表真实设备数"))
+        elif md is None or md == -1:
             checks.append(_result("media_devices", "warn",
                                   "enumerateDevices 不可用",
                                   "真机均有摄像头/麦克风/扬声器条目；0 设备是虚拟机信号"))
@@ -474,7 +556,12 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
 
         # WebGPU
         wg = data.get("webgpu")
-        if str(wg).startswith("ok"):
+        if not secure:
+            checks.append(_result("webgpu", "warn",
+                                  "非安全上下文，navigator.gpu 不可观测",
+                                  "该项只在 https 页面上有意义；本次改道 https 未成功，"
+                                  "结果不代表真实 WebGPU 支持"))
+        elif str(wg).startswith("ok"):
             checks.append(_result("webgpu", "pass",
                                   f"WebGPU 适配器可用（{str(wg)[2:][:40] or '无架构信息'}）"))
         elif wg in ("unsupported", "no-adapter"):
@@ -496,7 +583,12 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
 
         # 插件数量（真 Chrome 有 5 个内置 PDF 插件；0 是精简/自动化信号）
         plugins = int(data.get("plugins") or 0)
-        if is_chromium and plugins == 0:
+        if mobile and spec_extra.get("emptyPlugins"):
+            # 移动端指纹按规格清空 plugins（Android Chrome 与 iOS Safari 的
+            # 真机插件列表本就随机型/版本不同），空列表是该规格的正确取值。
+            checks.append(_result("plugins_sane", "pass",
+                                  f"插件数 {plugins}（该机型规格为空列表）"))
+        elif is_chromium and plugins == 0:
             checks.append(_result("plugins_sane", "warn",
                                   "navigator.plugins 为空（真 Chrome 应有 5 个 PDF 插件）",
                                   "插件列表为空是 headless/精简版特征"))
@@ -509,7 +601,13 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
         hw_ok = hw is None or 1 <= int(hw) <= 64
         mem_ok = mem is None or (float(mem) >= 0.25 and float(mem) <= 128)
         battery_note = ""
-        if is_chromium and not data.get("hasBattery"):
+        if mobile:
+            # iOS Safari 没有 Battery API / deviceMemory，移动端指纹也按
+            # removeNavigatorProps 摘除；缺失是规格，不是缺陷。
+            if (secure and target_os == "android" and spec_extra.get("hasBattery")
+                    and not data.get("hasBattery")):
+                battery_note = "；Battery API 缺失（该机型规格应有）"
+        elif secure and is_chromium and not data.get("hasBattery"):
             battery_note = "；Battery API 缺失（真 Chrome 应有）"
         if hw_ok and mem_ok and not battery_note:
             detail = f"核心数 {hw or '未知'}"

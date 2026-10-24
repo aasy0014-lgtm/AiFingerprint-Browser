@@ -16,3 +16,7 @@ __pycache__/
 
 # 浏览器内核二进制（体积大，按文档/脚本自行安装；install_fpchromium.sh 会自动下载）
 tools/fp-chromium/
+
+# 真机采集：自签证书与手机回传的读数（含真实设备信息，不入库）
+.probe-certs/
+phone_probe.json

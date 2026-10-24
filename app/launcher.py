@@ -92,11 +92,13 @@ class LaunchManager:
         return False
 
     def emulation_state(self, profile_id: str) -> Optional[str]:
-        """移动端仿真通道状态：ok / reconnecting；None = 非移动端或未运行。
+        """移动端仿真通道状态：ok / reconnecting / degraded；None = 非移动端或未运行。
 
         通道断开期间内核会还原全部 CDP 覆盖，已打开页面退化为仅 JS 补丁
         （媒体查询回落宿主值）、新标签页完全裸奔；看门狗会自动重连自愈，
-        面板据此提示用户。
+        面板据此提示用户。degraded = 通道在线但首屏读数校验失败
+        （maxTouchPoints/pointer 不符），即 F-01 那种「浏览器起来了但一条
+        仿真都没挂上」的静默失效形态。
         """
         inst = self._running.get(profile_id)
         if inst is None:
@@ -104,7 +106,9 @@ class LaunchManager:
         sess = inst.extra.get("mobile_session")
         if sess is None:
             return None
-        return "ok" if sess.healthy else "reconnecting"
+        if not sess.healthy:
+            return "reconnecting"
+        return "degraded" if sess.emulation_verified is False else "ok"
 
     async def start(
         self,
@@ -256,9 +260,11 @@ class LaunchManager:
                     # 桌面环境不建立移动仿真会话：内核 info 的 mobile_ua 字段对
                     # 桌面环境同样有值（通用 UA 回填），不能作为「需要移动仿真」的
                     # 判据——否则桌面 fp-chromium 启动会因缺少屏幕尺寸而失败。
-                    elif is_mobile and (viewport or ua):
+                    elif is_mobile:
                         mobile_session = MobileEmulationSession(
                             info["ws_endpoint"],
+                            fingerprint=None,
+                            target_os=target_os,
                             viewport=viewport, dpr=dpr, ua=ua, platform=platform,
                             max_touch_points=max_touch,
                             locale=launch.locale or "",
@@ -309,9 +315,26 @@ class LaunchManager:
                                  mobile_session.css_w, mobile_session.css_h,
                                  mobile_session.dpr, mobile_session.viewport_h)
                     
+                    # 输入翻译代理（P2-3）：下游自动化（Selenium/Puppeteer/
+                    # Playwright）经 ws_endpoint 发来的鼠标命令转成触摸序列。
+                    # 桌面环境不挂：鼠标就是桌面输入，翻译反而失真。
+                    input_proxy = None
+                    if is_mobile and info.get("ws_endpoint"):
+                        from .cdp_input_proxy import CdpInputProxy
+                        input_proxy = CdpInputProxy(info["ws_endpoint"])
+                        try:
+                            real_endpoint = info["ws_endpoint"]
+                            info["ws_endpoint"] = await input_proxy.start()
+                            info["ws_endpoint_direct"] = real_endpoint
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("CDP 输入代理启动失败，下游直连内核: %s", e)
+                            with contextlib.suppress(Exception):
+                                await input_proxy.close()
+                            input_proxy = None
+
                     # 异步建立仿真（不阻塞启动流程），句柄随实例生命周期管理
                     mobile_task = asyncio.create_task(_setup_mobile_context())
-                    
+
                     async def _stop_fpchromium() -> None:
                         if not mobile_task.done():
                             mobile_task.cancel()
@@ -321,6 +344,9 @@ class LaunchManager:
                         if sess is not None:
                             with contextlib.suppress(Exception):
                                 await sess.close()
+                        if input_proxy is not None:
+                            with contextlib.suppress(Exception):
+                                await input_proxy.close()
                         await fp_chromium_kernel.stop(result)
                         if _fwd:
                             await _fwd.stop()

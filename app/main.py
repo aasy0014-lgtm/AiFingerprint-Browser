@@ -107,6 +107,16 @@ async def _check_kernel_health():
 async def lifespan(app: FastAPI):
     db.init_db()
     db.ensure_default_member()
+    # F-15：回收上次异常退出遗留的浏览器实例（父进程已消失的那些）。
+    # 必须在 scheduler.start() 之前——否则调度器可能先撞上被占住的
+    # profile 目录，把「无法启动」记成一次环境故障。
+    try:
+        killed = await asyncio.to_thread(
+            fp_chromium_kernel.reclaim_orphans, PROFILE_ROOT)
+        if killed:
+            log.warning("已回收 %d 个孤儿浏览器实例：%s", len(killed), killed)
+    except Exception:
+        log.debug("孤儿实例回收失败（不影响启动）", exc_info=True)
     scheduler.start()
     asyncio.create_task(_check_kernel_health())
     log.info("%s v%s (Phase %s) 已启动", APP_NAME, VERSION, PHASE)
@@ -915,7 +925,9 @@ async def browser_start(request: Request, body: BrowserStartRequest) -> dict:
             raise ApiError(404, result["error"])
         if result.get("code") == 403:
             raise ApiError(403, result["error"])
-        if "已在运行" in result["error"]:
+        # 「已在运行」「正在启动中」都是并发/重复点击的必然结果，不是故障：
+        # 落到 500 会让前端把用户自己的第二次点击报成启动失败。
+        if "已在运行" in result["error"] or "正在启动中" in result["error"]:
             raise ApiError(409, result["error"])
         raise ApiError(500, result["error"])
     audit("browser.start", result.get("name", body.profile_id), member=member)

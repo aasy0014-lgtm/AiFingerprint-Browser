@@ -145,7 +145,7 @@ function renderRows() {
         <span class="tag ${(p.fingerprint_summary?.mode || "").includes("预设") ? "preset" : "generate"}" style="margin-top:2px">${esc(mode)}</span>
       </td>
       <td>${healthCell(p.fingerprint_summary)}</td>
-      <td><span class="status ${p.running ? "running" : ""}"><span class="dot"></span>${p.running ? "运行中" : "已停止"}</span>${p.running && p.emulation === "reconnecting" ? '<span class="emu-warn" title="移动端仿真通道正在自动重连：期间新建标签页会裸奔（宿主 GPU/触屏/桌面媒体查询）">⚠ 仿真重连中</span>' : ""}</td>
+      <td><span class="status ${p.running ? "running" : ""}"><span class="dot"></span>${p.running ? "运行中" : "已停止"}</span>${p.running && p.emulation === "reconnecting" ? '<span class="emu-warn" title="移动端仿真通道正在自动重连：期间新建标签页会裸奔（宿主 GPU/触屏/桌面媒体查询）">⚠ 仿真重连中</span>' : ""}${p.running && p.emulation === "degraded" ? '<span class="emu-warn" title="移动端仿真读数校验失败：通道在线但补丁/设备仿真未生效（maxTouchPoints/pointer 为宿主值），请检查代理与内核版本">⚠ 仿真未生效</span>' : ""}</td>
       <td>
         <button class="btn small primary" data-act="start" ${p.running ? "disabled" : ""}>启动</button>
         <button class="btn small" data-act="stop" ${p.running ? "" : "disabled"}>停止</button>
@@ -455,7 +455,11 @@ async function startProfile(id) {
     if (info.kernel === "chromium" && info.ws_endpoint) {
       toast(`已启动，CDP 端点：${info.ws_endpoint}`);
     } else toast("环境已启动");
-  } catch (e) { toast(`启动失败：${e.message}`, "err"); }
+  } catch (e) {
+    // 「已在运行 / 正在启动中」是重复点击的必然结果，不是启动失败。
+    if (/已在运行|正在启动中/.test(e.message)) toast(e.message, "ok");
+    else toast(`启动失败：${e.message}`, "err");
+  }
   await Promise.all([loadProfiles(), loadStatus()]);
 }
 

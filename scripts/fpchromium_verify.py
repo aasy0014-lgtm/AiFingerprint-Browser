@@ -31,7 +31,8 @@ async def cdp_evaluate(debug_port: int) -> dict:
     async with httpx.AsyncClient() as c:
         targets = (await c.get(f"http://127.0.0.1:{debug_port}/json")).json()
     page = next(t for t in targets if t["type"] == "page")
-    async with websockets.connect(page["webSocketDebuggerUrl"], max_size=8 * 1024 * 1024) as ws:
+    async with websockets.connect(page["webSocketDebuggerUrl"], max_size=8 * 1024 * 1024,
+                                  proxy=None) as ws:
         msg_id = 1
         await ws.send(json.dumps({"id": msg_id, "method": "Runtime.evaluate",
                                   "params": {"expression": NAV_JS, "returnByValue": True}}))

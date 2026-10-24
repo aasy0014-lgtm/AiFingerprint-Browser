@@ -1,6 +1,6 @@
 """API 数据模型（Pydantic v2）。"""
 from typing import Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ProxyScheme = Literal["http", "https", "socks4", "socks5"]
 TargetOS = Literal["windows", "macos", "linux", "android", "ios"]
@@ -87,6 +87,19 @@ class ProfileCreate(BaseModel):
     browser: Optional[MobileBrowser] = None
     proxy: Optional[ProxyConfig] = None
     launch: LaunchConfig = Field(default_factory=LaunchConfig)
+
+    @model_validator(mode="after")
+    def _mobile_kernel_pairing(self):
+        """移动端只在 fp-chromium 上成立（CDP 设备仿真）。
+
+        入口层（main._check_mobile_target）已有同名校验；放在模型里是为了让
+        MCP / 脚本等绕过 HTTP 的调用方也在构造对象时失败，而不是等到启动。
+        """
+        if self.target_os in ("android", "ios") and self.kernel != "fp-chromium":
+            raise ValueError("移动端目标 OS（android/ios）仅支持 fp-chromium 内核")
+        if self.target_os == "android" and self.browser not in (None, "chrome"):
+            raise ValueError(f"Android 端浏览器口径仅支持 chrome（收到 {self.browser}）")
+        return self
 
 
 class ProfileBatchCreate(BaseModel):

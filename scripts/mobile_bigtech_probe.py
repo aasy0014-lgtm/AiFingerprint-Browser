@@ -6,8 +6,17 @@
 参数 / 自动化事件层，输出 JSON 供与真机行为逐项比对。
 详细方法、读数矩阵与缺口清单见 docs/移动端大厂检测对抗优化方案.md。
 
-用法: .venv/bin/python scripts/mobile_bigtech_probe.py [android|ios] [market_name]
+读数 JS 本身在 scripts/mobile_probe_js.py（真机采集页共用同一份），
+本脚本只负责「起仿真 → 依次取数 → 打 JSON」。
+
+用法:
+    .venv/bin/python scripts/mobile_bigtech_probe.py [android|ios] [market_name]
+    .venv/bin/python scripts/mobile_bigtech_probe.py ios "iPhone 16" --json /tmp/sim.json --quiet
+
+真机侧：.venv/bin/python scripts/mobile_real_collect.py，然后用
+scripts/mobile_probe_compare.py 与 --json 产物逐项对拍。
 """
+import argparse
 import asyncio
 import copy
 import json
@@ -20,11 +29,22 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "scripts"))
 os.environ.setdefault("FPWB_HOME", tempfile.mkdtemp(prefix="fpwb_probe_"))
 
-target_os = sys.argv[1] if len(sys.argv) > 1 else "android"
-device_name = sys.argv[2] if len(sys.argv) > 2 else (
-    "Xiaomi 15" if target_os == "android" else "iPhone 17")
+import mobile_probe_js  # noqa: E402
+
+_ap = argparse.ArgumentParser(add_help=True)
+_ap.add_argument("target_os", nargs="?", default="android", choices=["android", "ios"])
+_ap.add_argument("market_name", nargs="?")
+_ap.add_argument("--browser", choices=["safari", "chrome_ios"],
+                help="iOS 浏览器口径（CriOS 才有 __gCrWeb 面）")
+_ap.add_argument("--json", dest="json_out", help="把读数写进文件（stdout 仍是 JSON）")
+_ap.add_argument("--quiet", action="store_true", help="不打印读数，只写 --json / 提示")
+_args = _ap.parse_args()
+
+target_os = _args.target_os
+device_name = _args.market_name or ("Xiaomi 15" if target_os == "android" else "iPhone 17")
 
 lib = json.loads((REPO / "app/data/mobile_devices.json").read_text(encoding="utf-8"))
 DEV = next(d for d in lib["devices"] if d["market_name"] == device_name)
@@ -36,172 +56,6 @@ mf._pick_device = lambda target_os, manufacturer: copy.deepcopy(DEV)
 from app.config import ensure_dirs  # noqa: E402
 from app.fingerprint_engine import create_fingerprint  # noqa: E402
 from app.launcher import LaunchManager  # noqa: E402
-
-BATTERY_JS = r"""(async () => {
-  const out = {};
-  const safeA = async (fn) => { try { return await fn(); } catch (e) { return 'ERR:' + ((e && e.name) || e); } };
-  const safe = (fn) => { try { return fn(); } catch (e) { return 'ERR:' + ((e && e.name) || e); } };
-  const mm = (q) => safe(() => matchMedia(q).matches);
-
-  out.href = location.href;
-  out.isSecureContext = isSecureContext;
-  out.userAgent = navigator.userAgent;
-  out.platform = navigator.platform;
-  out.vendor = navigator.vendor;
-  out.languages = navigator.languages;
-  out.hardwareConcurrency = navigator.hardwareConcurrency;
-  out.deviceMemory = navigator.deviceMemory === undefined ? '<undef>' : navigator.deviceMemory;
-  out.maxTouchPoints = navigator.maxTouchPoints;
-  out.uaChType = typeof navigator.userAgentData;
-  out.uaChMobile = safe(() => navigator.userAgentData ? navigator.userAgentData.mobile : '<missing>');
-  out.uaChFull = await safeA(async () => {
-    if (!navigator.userAgentData) return '<missing>';
-    return await navigator.userAgentData.getHighEntropyValues(
-      ['platform','platformVersion','architecture','bitness','model','uaFullVersion','fullVersionList','wow64']);
-  });
-
-  out.screen = {
-    w: screen.width, h: screen.height, dpr: devicePixelRatio,
-    availW: screen.availWidth, availH: screen.availHeight,
-    availLeft: screen.availLeft, availTop: screen.availTop,
-    colorDepth: screen.colorDepth, pixelDepth: screen.pixelDepth,
-    isExtended: screen.isExtended,
-  };
-  out.screenOrientation = safe(() => ({ type: screen.orientation.type, angle: screen.orientation.angle }));
-  out.win = {
-    innerW: innerWidth, innerH: innerHeight, outerW: outerWidth, outerH: outerHeight,
-    screenX: screenX, screenY: screenY, screenLeft: screenLeft, screenTop: screenTop,
-    legacyOrientation: typeof window.orientation === 'undefined' ? '<undef>' : window.orientation,
-  };
-  out.visualViewport = safe(() => ({
-    w: visualViewport.width, h: visualViewport.height, scale: visualViewport.scale,
-    top: visualViewport.offsetTop, left: visualViewport.offsetLeft,
-  }));
-
-  out.mq = {
-    pointerCoarse: mm('(pointer: coarse)'), pointerFine: mm('(pointer: fine)'),
-    anyPointerCoarse: mm('(any-pointer: coarse)'), anyPointerFine: mm('(any-pointer: fine)'),
-    hoverNone: mm('(hover: none)'), hoverHover: mm('(hover: hover)'),
-    anyHoverNone: mm('(any-hover: none)'), anyHoverHover: mm('(any-hover: hover)'),
-  };
-  out.touch = {
-    ontouchstart: 'ontouchstart' in window,
-    touchEvent: typeof TouchEvent,
-    ontouchmove: 'ontouchmove' in window,
-    gesturestart: 'ongesturestart' in window,
-    gestureEvent: typeof GestureEvent,
-  };
-  out.sensors = {
-    doe: typeof DeviceOrientationEvent,
-    dme: typeof DeviceMotionEvent,
-    ondeviceorientation: 'ondeviceorientation' in window,
-    ondevicemotion: 'ondevicemotion' in window,
-    reqPerm: safe(() => typeof DeviceOrientationEvent.requestPermission),
-  };
-  out.sensors.accelPerm = await safeA(async () => (await navigator.permissions.query({ name: 'accelerometer' })).state);
-  out.sensors.gyroPerm = await safeA(async () => (await navigator.permissions.query({ name: 'gyroscope' })).state);
-
-  out.connection = safe(() => {
-    const c = navigator.connection;
-    if (!c) return '<missing>';
-    return { type: c.type === undefined ? '<undef>' : c.type,
-             typeIn: 'type' in c,
-             effectiveType: c.effectiveType, rtt: c.rtt, downlink: c.downlink, saveData: c.saveData };
-  });
-  out.pdfViewerEnabled = safe(() => navigator.pdfViewerEnabled === undefined ? '<undef>' : navigator.pdfViewerEnabled);
-  out.plugins = safe(() => Array.from(navigator.plugins).map((p) => p.name));
-  out.mimeTypesLen = safe(() => navigator.mimeTypes.length);
-  out.perfMemory = safe(() => performance.memory
-      ? { limitGB: Math.round(performance.memory.jsHeapSizeLimit / 1e9 * 10) / 10 }
-      : '<missing>');
-
-  out.nav = {
-    serial: 'serial' in navigator, usb: 'usb' in navigator, hid: 'hid' in navigator,
-    bluetooth: 'bluetooth' in navigator, keyboard: 'keyboard' in navigator,
-    wakeLock: 'wakeLock' in navigator, presentation: 'presentation' in navigator,
-    getInstalledRelatedApps: typeof navigator.getInstalledRelatedApps,
-    setAppBadge: typeof navigator.setAppBadge, vibrate: typeof navigator.vibrate,
-    share: typeof navigator.share, mediaSession: 'mediaSession' in navigator,
-    getGamepads: typeof navigator.getGamepads, requestMIDIAccess: typeof navigator.requestMIDIAccess,
-    webdriver: navigator.webdriver,
-  };
-  out.showOpenFilePicker = typeof showOpenFilePicker;
-  out.webkit = safe(() => typeof window.webkit);
-  out.webkitMessageHandlers = safe(() => !!(window.webkit && window.webkit.messageHandlers));
-  out.chrome = safe(() => window.chrome ? Object.keys(window.chrome) : '<missing>');
-  out.cdcKeys = safe(() => Object.keys(window).filter((k) => /cdc_|selenium|webdriver|puppeteer|playwright/i.test(k)));
-  out.notification = safe(() => ({ permission: Notification.permission, maxActions: Notification.maxActions }));
-  out.battery = await safeA(async () => {
-    const b = await navigator.getBattery();
-    return { level: b.level, charging: b.charging };
-  });
-
-  out.media = safe(() => {
-    const a = document.createElement('audio');
-    const v = document.createElement('video');
-    return {
-      ogg: a.canPlayType('audio/ogg; codecs="vorbis"'),
-      opusWebm: a.canPlayType('audio/webm; codecs="opus"'),
-      webmVp9: v.canPlayType('video/webm; codecs="vp9"'),
-      h264: v.canPlayType('video/mp4; codecs="avc1.42E01E"'),
-      hevc: v.canPlayType('video/mp4; codecs="hvc1"'),
-    };
-  });
-  out.storage = await safeA(async () => {
-    const e = await navigator.storage.estimate();
-    return { quotaGB: Math.round(e.quota / 1e9 * 10) / 10, usageMB: Math.round(e.usage / 1e6) };
-  });
-
-  out.css = {
-    touchCallout: CSS.supports('-webkit-touch-callout', 'none'),
-    overflowScrolling: CSS.supports('-webkit-overflow-scrolling', 'touch'),
-    envSupports: CSS.supports('padding-top: env(safe-area-inset-top)'),
-    pointerCoarse: CSS.supports('(pointer: coarse)'),
-  };
-  out.envSafeArea = safe(() => {
-    const d = document.createElement('div');
-    d.style.cssText = 'position:fixed;top:0;left:0;padding-top:env(safe-area-inset-top);'
-      + 'padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left)';
-    document.body.appendChild(d);
-    const cs = getComputedStyle(d);
-    const r = { top: cs.paddingTop, bottom: cs.paddingBottom, left: cs.paddingLeft };
-    d.remove();
-    return r;
-  });
-
-  out.webgl = safe(() => {
-    const c = document.createElement('canvas');
-    const gl = c.getContext('webgl');
-    if (!gl) return '<no webgl>';
-    const g = (p) => { try { return gl.getParameter(p); } catch (e) { return 'ERR'; } };
-    const ext = gl.getExtension('WEBGL_debug_renderer_info');
-    const vd = g(gl.MAX_VIEWPORT_DIMS);
-    return {
-      vendor: g(gl.VENDOR), renderer: g(gl.RENDERER),
-      unmaskedVendor: ext ? g(ext.UNMASKED_VENDOR_WEBGL) : null,
-      unmaskedRenderer: ext ? g(ext.UNMASKED_RENDERER_WEBGL) : null,
-      version: g(gl.VERSION), glsl: g(gl.SHADING_LANGUAGE_VERSION),
-      MAX_TEXTURE_SIZE: g(gl.MAX_TEXTURE_SIZE),
-      MAX_CUBE_SIZE: g(gl.MAX_CUBE_MAP_TEXTURE_SIZE),
-      MAX_RENDERBUFFER_SIZE: g(gl.MAX_RENDERBUFFER_SIZE),
-      MAX_VIEWPORT_DIMS: vd && vd.length !== undefined ? Array.from(vd) : vd,
-      MAX_VERTEX_UNIFORM_VECTORS: g(gl.MAX_VERTEX_UNIFORM_VECTORS),
-      MAX_FRAGMENT_UNIFORM_VECTORS: g(gl.MAX_FRAGMENT_UNIFORM_VECTORS),
-      MAX_VERTEX_TEXTURE_IMAGE_UNITS: g(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS),
-      MAX_TEXTURE_IMAGE_UNITS: g(gl.MAX_TEXTURE_IMAGE_UNITS),
-      MAX_COMBINED_TEXTURE_IMAGE_UNITS: g(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS),
-      extCount: (gl.getSupportedExtensions() || []).length,
-      webgl2: !!document.createElement('canvas').getContext('webgl2'),
-    };
-  });
-  out.webglExts = safe(() => {
-    const gl = document.createElement('canvas').getContext('webgl');
-    if (!gl) return '<no webgl>';
-    return (gl.getSupportedExtensions() || []).sort().join(',');
-  });
-
-  return out;
-})()"""
 
 PAGE = ("<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -222,149 +76,6 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-ENGINE_JS = r"""() => {
-  // 引擎面「一行判假」读数：全屏面 / <video> webkit 全屏家族 / WebKit 专属
-  // CSS 面 / 传感器构造器与 legacy 链。真机 iOS 与 Chrome Android 在这些
-  // 读数上互斥（见 docs/移动端大厂检测对抗优化方案.md）。
-  const fsNames = (obj) => Object.getOwnPropertyNames(obj).filter((n) => /fullscreen/i.test(n));
-  const chain = (kind) => {
-    try {
-      const e = document.createEvent(kind);
-      const init = (kind === 'DeviceOrientationEvent')
-        ? e.initDeviceOrientationEvent : e.initDeviceMotionEvent;
-      if (typeof init !== 'function') return 'no-init';
-      if (kind === 'DeviceOrientationEvent') {
-        init.call(e, 'deviceorientation', false, false, 10, 20, 30, 45, 5);
-        return [e.type, e.alpha, e.beta, e.gamma, e.webkitCompassHeading, e.webkitCompassAccuracy];
-      }
-      init.call(e, 'devicemotion', false, false, {x: 1, y: 2, z: 3},
-                {x: 4, y: 5, z: 6}, {alpha: 7, beta: 8, gamma: 9}, 16);
-      return [e.type, e.acceleration.x, e.accelerationIncludingGravity.y,
-              e.rotationRate.gamma, e.interval];
-    } catch (err) { return 'throw:' + err.name; }
-  };
-  const ctor = (name) => {
-    try { new window[name]('x'); return 'ok'; } catch (e) { return e.name; }
-  };
-  const v = document.createElement('video');
-  const s = document.body.style;
-  // 先取「属性存在性」再跑写入回环：写未知驼峰属性会在 Chromium 上留下 JS
-  // expando，污染 `in` 读数（读真机时同一顺序同样关键）。
-  const tcInStyle = 'webkitTouchCallout' in s;
-  const oscInStyle = 'webkitOverflowScrolling' in s;
-  const styleRoundtrip = (() => {
-    const before = s.webkitTouchCallout;
-    s.webkitTouchCallout = 'none';
-    const mid = s.webkitTouchCallout;
-    s.removeProperty('-webkit-touch-callout');
-    return [before, mid, s.webkitTouchCallout];
-  })();
-  return {
-    fullscreen: {
-      elementOwn: fsNames(Element.prototype),
-      documentOwn: fsNames(Document.prototype),
-      requestType: typeof document.documentElement.requestFullscreen,
-      enabledType: typeof document.fullscreenEnabled,
-      exitType: typeof document.exitFullscreen,
-      elementInDoc: 'fullscreenElement' in document,
-    },
-    video: {
-      enterType: typeof v.webkitEnterFullscreen,
-      supportsType: ('webkitSupportsFullscreen' in v)
-        ? typeof v.webkitSupportsFullscreen : 'ABSENT',
-    },
-    css: {
-      touchCallout: CSS.supports('-webkit-touch-callout', 'none'),
-      touchCalloutOneArg: CSS.supports('-webkit-touch-callout: none'),
-      overflowScrolling: CSS.supports('-webkit-overflow-scrolling', 'touch'),
-      touchCalloutInStyle: tcInStyle,
-      overflowScrollingInStyle: oscInStyle,
-      styleRoundtrip: styleRoundtrip,
-    },
-    sensors: {
-      dmeCtor: ctor('DeviceMotionEvent'),
-      doeCtor: ctor('DeviceOrientationEvent'),
-      compassHeadingIn: 'webkitCompassHeading' in DeviceOrientationEvent.prototype,
-      absoluteInProto: 'absolute' in DeviceOrientationEvent.prototype,
-      initDOE: typeof DeviceOrientationEvent.prototype.initDeviceOrientationEvent,
-      initDME: typeof DeviceMotionEvent.prototype.initDeviceMotionEvent,
-      doeChain: chain('DeviceOrientationEvent'),
-      dmeChain: chain('DeviceMotionEvent'),
-    },
-    // Safari 全局面（item 13：WebKitPoint 家族 / WebKitNamespace 家族 /
-    // webkitCancelRequestAnimationFrame）。真机 iOS 有、桌面内核无。
-    safari: {
-      webKitPoint: typeof window.WebKitPoint,
-      wkpProto: window.WebKitPoint
-        ? Object.getOwnPropertyNames(window.WebKitPoint.prototype) : null,
-      wkpVals: (() => {
-        try {
-          if (typeof window.WebKitPoint !== 'function') return null;
-          const p = new WebKitPoint(1.5, 2.5); return [p.x, p.y];
-        }
-        catch (e) { return 'throw:' + e.name; }
-      })(),
-      convertNodeToPage: typeof window.webkitConvertPointFromNodeToPage,
-      convertPageToNode: typeof window.webkitConvertPointFromPageToNode,
-      convertLen: window.webkitConvertPointFromNodeToPage
-        ? window.webkitConvertPointFromNodeToPage.length : null,
-      convertRoundtrip: (() => {
-        try {
-          const f1 = window.webkitConvertPointFromNodeToPage;
-          const f2 = window.webkitConvertPointFromPageToNode;
-          if (typeof f1 !== 'function' || typeof f2 !== 'function') return null;
-          const p = f1(document.body, new WebKitPoint(5, 40));
-          const b = f2(document.body, p);
-          return [Math.round(b.x), Math.round(b.y)];
-        } catch (e) { return 'throw:' + e.name; }
-      })(),
-      craf: typeof window.webkitCancelRequestAnimationFrame,
-      webKitNamespace: typeof window.WebKitNamespace,
-      nsProto: window.WebKitNamespace
-        ? Object.getOwnPropertyNames(window.WebKitNamespace.prototype) : null,
-      userMsgHandlersNs: typeof window.UserMessageHandlersNamespace,
-      userMsgHandler: typeof window.UserMessageHandler,
-      webKitJSHandle: typeof window.WebKitJSHandle,
-      webKitNodeSnapshot: typeof window.WebKitNodeSnapshot,
-      windowWebkit: typeof window.webkit,
-      wkHandlers: (window.webkit && window.webkit.messageHandlers)
-        ? Object.keys(window.webkit.messageHandlers) : null,
-      wkHandlersOwn: (window.webkit && window.webkit.messageHandlers)
-        ? Object.getOwnPropertyNames(window.webkit.messageHandlers) : null,
-      wkHandlerIn: (window.webkit && window.webkit.messageHandlers)
-        ? ('crwebinvoke' in window.webkit.messageHandlers) : null,
-      wkHandlerUnknown: (window.webkit && window.webkit.messageHandlers)
-        ? typeof window.webkit.messageHandlers.__no_such_handler__ : null,
-      wkHandlerDesc: (() => {
-        const mh = window.webkit && window.webkit.messageHandlers;
-        if (!mh) return null;
-        const d = Object.getOwnPropertyDescriptor(mh, 'crwebinvoke');
-        return d ? [d.writable, d.enumerable, d.configurable] : null;
-      })(),
-      buffersTag: (window.webkit && window.webkit.buffers)
-        ? Object.prototype.toString.call(window.webkit.buffers) : null,
-      buffersCtor: (() => {
-        const b = window.webkit && window.webkit.buffers;
-        if (!b) return null;
-        const p = Object.getPrototypeOf(b);
-        return (p && p.constructor) ? p.constructor.name : null;
-      })(),
-      crwebInvoke: !!(window.webkit && window.webkit.messageHandlers
-        && window.webkit.messageHandlers.crwebinvoke),
-      crwebPmRet: (() => {
-        try {
-          const h = window.webkit && window.webkit.messageHandlers
-            && window.webkit.messageHandlers.crwebinvoke;
-          if (!h) return null;
-          const p = h.postMessage(1);
-          return (p && typeof p.then === 'function') ? 'promise' : typeof p;
-        } catch (e) { return 'throw:' + e.name; }
-      })(),
-    },
-  };
-}"""
-
-
 EVENT_CAPTURE_JS = r"""() => {
   window.__ev = [];
   const rec = (e) => window.__ev.push(e.type + (e.pointerType !== undefined ? ':' + e.pointerType : ''));
@@ -380,135 +91,13 @@ EVENT_CAPTURE_JS = r"""() => {
 }"""
 
 
-SENSOR_JS = r"""async () => {
-  // 传感器事件流读数：真机 Chrome Android 有持续数值流（devicemotion 60Hz
-  // 级、orientation 随读数更新派发）；iOS 未授权时零事件（内核只在注册
-  // 监听时派发一次全 null 哨兵，numeric 计数器为 0 可辨别）。
-  const num = (v) => typeof v === 'number' && isFinite(v);
-  const out = {
-    counts: { motion: 0, motionNumeric: 0, orientation: 0, orientationNumeric: 0,
-              orientationAbsolute: 0, orientationAbsoluteNumeric: 0 },
-    requestPermission: {
-      motion: typeof (window.DeviceMotionEvent || {}).requestPermission,
-      orientation: typeof (window.DeviceOrientationEvent || {}).requestPermission },
-    orientationAbsoluteInProto: (typeof DeviceOrientationEvent === 'function')
-      && ('absolute' in DeviceOrientationEvent.prototype),
-    onDeviceOrientationAbsolute: 'ondeviceorientationabsolute' in window,
-    intervals: { motion: null },
-    samples: { motion: [], orientation: [] },
-    sensorApi: null,
-  };
-  window.addEventListener('devicemotion', (e) => {
-    out.counts.motion++;
-    const g = e.accelerationIncludingGravity, a = e.acceleration, r = e.rotationRate;
-    out.intervals.motion = e.interval;
-    if (g && (num(g.x) || num(g.y) || num(g.z))) {
-      out.counts.motionNumeric++;
-      if (out.samples.motion.length < 4) {
-        out.samples.motion.push({
-          trusted: e.isTrusted, interval: e.interval,
-          aig: [g.x, g.y, g.z],
-          acc: a ? [a.x, a.y, a.z] : null,
-          rr: r ? [r.alpha, r.beta, r.gamma] : null,
-        });
-      }
-    }
-  }, true);
-  window.addEventListener('deviceorientation', (e) => {
-    out.counts.orientation++;
-    if (num(e.alpha) || num(e.beta) || num(e.gamma)) {
-      out.counts.orientationNumeric++;
-      if (out.samples.orientation.length < 3) {
-        out.samples.orientation.push({ a: e.alpha, b: e.beta, g: e.gamma, abs: e.absolute });
-      }
-    }
-  }, true);
-  window.addEventListener('deviceorientationabsolute', (e) => {
-    out.counts.orientationAbsolute++;
-    if (num(e.alpha) || num(e.beta) || num(e.gamma)) out.counts.orientationAbsoluteNumeric++;
-  }, true);
-  // Sensor API（Chrome Android）＝同一虚拟传感器的另一读取面
-  if (typeof Accelerometer === 'function') {
-    try {
-      const acc = new Accelerometer({ frequency: 60 });
-      const got = [];
-      acc.addEventListener('reading', () => {
-        if (got.length < 4) got.push([acc.x, acc.y, acc.z]);
-      });
-      acc.start();
-      await new Promise((r) => setTimeout(r, 600));
-      try { acc.stop(); } catch (e2) {}
-      out.sensorApi = { supported: true, samples: got };
-    } catch (e) {
-      out.sensorApi = { supported: false, error: String(e).slice(0, 120) };
-    }
-  }
-  await new Promise((r) => setTimeout(r, 900));
-  return out;
-}"""
-
-
-PLATFORM_JS = r"""async () => {
-  // 平台 API 差集读数（真机口径对比用）：窗口级 / document / navigator 三处
-  // 的 [typeof, 名字是否仍 in 对象] + Worker 全局同名读数。
-  const t = (obj, n) => { try { return typeof obj[n]; } catch (e) { return 'ERR'; } };
-  const has = (obj, n) => { try { return n in obj; } catch (e) { return 'ERR'; } };
-  const read = (obj, names) => {
-    const o = {};
-    for (const n of names) { o[n] = [t(obj, n), has(obj, n)]; }
-    return o;
-  };
-  const out = {
-    win: read(window, ['Sensor', 'SensorErrorEvent', 'Accelerometer', 'Gyroscope',
-      'LinearAccelerationSensor', 'GravitySensor', 'AbsoluteOrientationSensor',
-      'RelativeOrientationSensor', 'EyeDropper', 'IdleDetector', 'WebSocketStream',
-      'ImageDecoder', 'FileSystemObserver', 'queryLocalFonts',
-      'documentPictureInPicture', 'launchQueue', 'Scheduler', 'scheduler',
-      'OTPCredential', 'Ink', 'MediaStreamTrackGenerator', 'sharedStorage',
-      'SharedStorage', 'fence', 'Fence', 'HTMLFencedFrameElement',
-      'showSaveFilePicker', 'showDirectoryPicker']),
-    doc: read(document, ['browsingTopics']),
-    nav: read(navigator, ['xr', 'virtualKeyboard', 'ink', 'runAdAuction',
-      'joinAdInterestGroup', 'leaveAdInterestGroup', 'deprecatedReplaceInURN',
-      'updateAdInterestGroups', 'protectedAudience']),
-    kept: read(window, ['VideoDecoder', 'VideoFrame', 'AudioDecoder',
-      'EncodedAudioChunk', 'URLPattern', 'Highlight', 'BarcodeDetector',
-      'ImageCapture', 'MediaStreamTrackProcessor', 'navigation', 'GPU',
-      'FileSystemHandle', 'FileSystemFileHandle', 'FileSystemDirectoryHandle',
-      'FileSystemWritableFileStream']),
-    keptDoc: read(document, ['startViewTransition', 'hasStorageAccess',
-      'requestStorageAccess', 'fragmentDirective']),
-    keptNav: read(navigator, ['share', 'canShare', 'wakeLock', 'gpu']),
-    worker: null,
-  };
-  try {
-    const names = ['IdleDetector', 'WebSocketStream', 'ImageDecoder',
-      'FileSystemObserver', 'Scheduler', 'scheduler', 'VideoDecoder',
-      'BarcodeDetector', 'URLPattern', 'WebGL2RenderingContext'];
-    const src = 'self.onmessage = () => { const t = (n) => {'
-      + ' try { return typeof self[n]; } catch (e) { return "ERR"; } };'
-      + ' const names = ' + JSON.stringify(names) + '; const o = {};'
-      + ' for (const n of names) { o[n] = t(n); } postMessage(o); };';
-    const w = new Worker(URL.createObjectURL(new Blob([src])));
-    out.worker = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('timeout')), 5000);
-      w.onmessage = (e) => { clearTimeout(timer); resolve(e.data); };
-      w.onerror = () => { clearTimeout(timer); reject(new Error('worker-error')); };
-      w.postMessage(1);
-    });
-    w.terminate();
-  } catch (e) { out.worker = 'ERR:' + e.name + ':' + e.message; }
-  return out;
-}"""
-
-
 async def main() -> int:
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{port}/"
 
-    fp = create_fingerprint(target_os, "generate")
+    fp = create_fingerprint(target_os, "generate", browser=_args.browser)
     scr = fp["fingerprint"]["screen"]
     print(f"== 机型: {fp['manufacturer']} {fp['device_model']} | css {scr['cssWidth']}x{scr['cssHeight']} "
           f"vp {scr['cssViewportHeight']} @{scr['devicePixelRatio']} ==", file=sys.stderr)
@@ -541,7 +130,8 @@ async def main() -> int:
                 await page.goto(url, wait_until="domcontentloaded", timeout=15000)
             except Exception as exc:
                 print("goto warn:", exc, file=sys.stderr)
-            signals = await page.evaluate(BATTERY_JS)
+            main_part = await page.evaluate(mobile_probe_js.eval_expr('main'))
+            signals = main_part['parts']['main']
 
             await page.evaluate(EVENT_CAPTURE_JS)
             try:
@@ -603,26 +193,33 @@ async def main() -> int:
 
             # 传感器事件流（页面在 127.0.0.1 = 信任来源；真机非安全上下文
             # 同样不派发，故必须以本地服务页为准）
-            sensor = await page.evaluate(SENSOR_JS)
+            sensor = (await page.evaluate(mobile_probe_js.eval_expr('sensor')))['parts']['sensor']
             # 引擎面读数（全屏 / 视频 webkit 全屏 / WebKit CSS / 传感器构造器）
-            engine = await page.evaluate(ENGINE_JS)
+            engine = (await page.evaluate(mobile_probe_js.eval_expr('engine')))['parts']['engine']
             # 平台 API 差集读数（窗口/文档/navigator + Worker 全局）
-            platform = await page.evaluate(PLATFORM_JS)
+            platform = (await page.evaluate(mobile_probe_js.eval_expr('platform')))['parts']['platform']
+            # CriOS 宿主壳面（__gCrWeb 成员集 / windowId 形态 / 改写源码文本）
+            crios = (await page.evaluate(mobile_probe_js.eval_expr('crios')))['parts']['crios']
 
             out = {
                 "target_os": target_os,
                 "device": device_name,
-                "signals": signals,
-                "sensor": sensor,
-                "engine": engine,
-                "platform": platform,
+                "probe_version": mobile_probe_js.PROBE_VERSION,
+                "collected_at": main_part["collected_at"],
+                "parts": {"main": signals, "sensor": sensor, "engine": engine,
+                          "platform": platform, "crios": crios},
                 "input_mouse_click_events": events_mouse,
                 "input_playwright_touchscreen_tap": tap_api,
                 "input_touch_tap_events": events_touch,
                 "input_touch_scroll": {"before": scroll_before, "after": scroll_after,
                                        "events": events_scroll},
             }
-            print(json.dumps(out, ensure_ascii=False, indent=1))
+            text = json.dumps(out, ensure_ascii=False, indent=1)
+            if _args.json_out:
+                Path(_args.json_out).write_text(text + "\n", encoding="utf-8")
+                print(f"读数已写入 {_args.json_out}", file=sys.stderr)
+            if not _args.quiet:
+                print(text)
             try:
                 await browser.close()
             except Exception:
