@@ -20,3 +20,11 @@ tools/fp-chromium/
 # 真机采集：自签证书与手机回传的读数（含真实设备信息，不入库）
 .probe-certs/
 phone_probe.json
+
+# 运行日志：每次启动都变，且可能含代理域名与解析出的出口 IP
+server.log
+server.err.log
+*.log
+
+# 系统/编辑器生成物
+.DS_Store
