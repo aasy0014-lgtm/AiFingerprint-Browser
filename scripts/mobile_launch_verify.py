@@ -214,6 +214,22 @@ STATE_JS = """async () => {
         hasScheduling: 'scheduling' in nav,
         hasStorageBuckets: 'storageBuckets' in nav,
         hasWco: 'windowControlsOverlay' in nav,
+        // ---- F-95：Android 的 Contact Picker 面（真机有、桌面内核缺）----
+        contactsType: typeof nav.contacts,
+        contactsInNav: 'contacts' in nav,
+        contactsCtor: typeof window.ContactsManager,
+        contactsAddrCtor: typeof window.ContactAddress,
+        contactsDesc: (() => {
+            let p = Object.getPrototypeOf(nav), i = 0;
+            for (; p && i < 6; i++, p = Object.getPrototypeOf(p)) {
+                const d = Object.getOwnPropertyDescriptor(p, 'contacts');
+                if (d) {
+                    return { get: typeof d.get, set: typeof d.set,
+                             en: d.enumerable, cf: d.configurable };
+                }
+            }
+            return 'ABSENT';
+        })(),
         // 反向保留：iOS 真机存在的成员不得误删
         // F-90：setAppBadge/clearAppBadge 由 AppBadgeEnabled 门控，iOS 默认关，
         // 普通浏览上下文缺席（Android 侧 setAppBadge 亦缺席，见 F-78）。
@@ -756,7 +772,8 @@ STATE_JS = """async () => {
             cssBadApplePay: CSS.supports('-apple-pay-button-style', 'notavalue'),
             cssBadMarginTrimCond: CSS.supports('(margin-trim: notavalue)'),
             cssBadBackdropCond: CSS.supports('(-webkit-backdrop-filter: notavalue)'),
-            // 合法值域的边界：inline 不在 margin-trim 值域、blur 必须带单位
+            // 合法值域的边界：inline 在 margin-trim 值域内（CSS 规范
+            // <margin-trim-kw> 含 inline）、blur 必须带单位
             cssMarginTrimInline: CSS.supports('margin-trim', 'inline'),
             cssBackdropUnitless: CSS.supports('-webkit-backdrop-filter', 'blur(4)'),
             cssBackdropMulti: CSS.supports('-webkit-backdrop-filter',
@@ -802,10 +819,10 @@ STATE_JS = """async () => {
                     items: items,
                     itemAt: st.item(1),
                     inlineMT: st.getPropertyValue('margin-trim'),
-                    inlinePay: st.applePayButtonStyle,
+                    inlinePay: st.ApplePayButtonStyle,
                     inlineHyphens: st.getPropertyValue('-webkit-hyphens'),
                     compMT: cs.getPropertyValue('margin-trim'),
-                    compPay: cs.applePayButtonStyle,
+                    compPay: cs.ApplePayButtonStyle,
                     compHyphens: cs.getPropertyValue('-webkit-hyphens'),
                     stickyInline: stick.style.getPropertyValue('position'),
                     stickyComp: getComputedStyle(stick)
@@ -917,28 +934,42 @@ STATE_JS = """async () => {
                 s.removeProperty('-webkit-touch-callout');
                 return v;
             })(),
-            // 传感器构造器（WebKit 不可构造）与 iOS 专有罗盘属性
+            // 传感器构造器（WebKit 不可构造）与 iOS 专有罗盘属性。
+            // 两个构造器都带 [SecureContext]：非安全上下文（start_url 外网不通时
+            // 页面停在 chrome-error://chromewebdata/）上真机 WebKit 同样缺席
+            // （/tmp/f608/wk_secure.py 实测），故先取到本地别名再判空——否则单个
+            // 全局缺失会以 ReferenceError 中断整个探针，连带吞掉其余全部检查。
             dmeCtorThrows: (() => {
+                if (typeof DeviceMotionEvent !== 'function') return 'ABSENT';
                 try { new DeviceMotionEvent('devicemotion'); return 'ok'; }
                 catch (e) { return e.name; }
             })(),
             doeCtorThrows: (() => {
+                if (typeof DeviceOrientationEvent !== 'function') return 'ABSENT';
                 try { new DeviceOrientationEvent('deviceorientation'); return 'ok'; }
                 catch (e) { return e.name; }
             })(),
-            dmeProtoCtorSelf: DeviceMotionEvent.prototype.constructor === DeviceMotionEvent,
-            dmeNativeStr: /\\[native code\\]/.test(String(DeviceMotionEvent)),
-            compassHeadingIn: 'webkitCompassHeading' in DeviceOrientationEvent.prototype,
-            compassAccuracyIn: 'webkitCompassAccuracy' in DeviceOrientationEvent.prototype,
+            dmeProtoCtorSelf: (typeof DeviceMotionEvent === 'function')
+                ? DeviceMotionEvent.prototype.constructor === DeviceMotionEvent : 'ABSENT',
+            dmeNativeStr: (typeof DeviceMotionEvent === 'function')
+                ? /\\[native code\\]/.test(String(DeviceMotionEvent)) : 'ABSENT',
+            compassHeadingIn: (typeof DeviceOrientationEvent === 'function')
+                ? 'webkitCompassHeading' in DeviceOrientationEvent.prototype : 'ABSENT',
+            compassAccuracyIn: (typeof DeviceOrientationEvent === 'function')
+                ? 'webkitCompassAccuracy' in DeviceOrientationEvent.prototype : 'ABSENT',
             compassHeadingValue: (() => {
+                if (typeof DeviceOrientationEvent !== 'function') return 'ABSENT';
                 const d = descOf(DeviceOrientationEvent.prototype, 'webkitCompassHeading');
                 if (!d || !d.get) return 'ABSENT';
                 try { return d.get.call(new Event('fp')); } catch (e) { return 'throw'; }
             })(),
-            absoluteInProto: 'absolute' in DeviceOrientationEvent.prototype,
-            initDOELen: (typeof DeviceOrientationEvent.prototype.initDeviceOrientationEvent === 'function')
+            absoluteInProto: (typeof DeviceOrientationEvent === 'function')
+                ? 'absolute' in DeviceOrientationEvent.prototype : 'ABSENT',
+            initDOELen: (typeof DeviceOrientationEvent === 'function'
+                         && typeof DeviceOrientationEvent.prototype.initDeviceOrientationEvent === 'function')
                 ? DeviceOrientationEvent.prototype.initDeviceOrientationEvent.length : null,
-            initDMELen: (typeof DeviceMotionEvent.prototype.initDeviceMotionEvent === 'function')
+            initDMELen: (typeof DeviceMotionEvent === 'function'
+                         && typeof DeviceMotionEvent.prototype.initDeviceMotionEvent === 'function')
                 ? DeviceMotionEvent.prototype.initDeviceMotionEvent.length : null,
             // 真机闭环：createEvent → init → 回读（WebKit 支持这两条链，Chromium 不支持）
             createEventDOE: (() => {
@@ -1597,6 +1628,34 @@ STATE_JS = """async () => {
                 return o;
             } catch (e) { return 'throw:' + e.name; }
         })(),
+        // F-96：baseLatency 是 WebKit 的 framesPerBuffer(128)/sampleRate，
+        // 关闭后归 0；Blink 除的是自己的缓冲深度（48k 256 / 44.1k 236），
+        // 倍差单行可读（/tmp/f585、/tmp/f586）。
+        audioLatency: await (async () => {
+            try {
+                const Ctor = window.AudioContext || window.webkitAudioContext;
+                const o = {};
+                const d = new Ctor();
+                o.dflt = d.baseLatency;
+                o.dfltSr = d.sampleRate;
+                o.out = d.outputLatency;
+                o.samples = d.baseLatency * d.sampleRate;
+                const c44 = new Ctor({ sampleRate: 44100 });
+                o.s44 = c44.baseLatency;
+                o.s44Samples = c44.baseLatency * c44.sampleRate;
+                const c96 = new Ctor({ sampleRate: 96000 });
+                o.s96 = c96.baseLatency;
+                try { c44.close(); } catch (e) {}
+                try { c96.close(); } catch (e) {}
+                const closed = new Ctor();
+                const p = closed.close();
+                o.closedIsPromise = !!(p && typeof p.then === 'function');
+                await p;
+                o.closedState = closed.state;
+                o.closedBase = closed.baseLatency;
+                return o;
+            } catch (e) { return 'throw:' + e.name; }
+        })(),
         audioMembers: (() => {
             const proto = window.AudioContext ? window.AudioContext.prototype : null;
             if (!proto) { return null; }
@@ -1937,6 +1996,23 @@ STATE_JS = """async () => {
                         protoConst: Range.prototype.NODE_BEFORE},
                 metrics: (() => { const mm = c2d.measureText('Hg');
                     return {asc: mm.emHeightAscent, desc: mm.emHeightDescent}; })(),
+                // F-93②：通用族的 canvas 度量。WebKit 的 sans-serif→Helvetica、
+                // serif→Times、monospace→Courier，与 Blink 在 macOS 上的
+                // Arial/Times New Roman/Menlo 映射可区分——「声明 Safari
+                // 但 sans-serif 是 Arial 宽度」是一行判据。
+                fontFam: (() => {
+                    const out = {};
+                    for (const f of ['monospace', 'serif', 'sans-serif',
+                                     'cursive', 'fantasy']) {
+                        c2d.font = '40px ' + f;
+                        out[f] = [Math.round(c2d.measureText('iiiiiiiiii').width * 100) / 100,
+                                  Math.round(c2d.measureText('mmmmmmmmmm').width * 100) / 100];
+                    }
+                    c2d.font = '40px monospace';
+                    out.monoEq = c2d.measureText('iiiiiiiiii').width
+                                 === c2d.measureText('mmmmmmmmmm').width;
+                    return out;
+                })(),
                 fontFace: {inn: 'width' in FontFace.prototype, val: ffn.width},
                 cssDecl: has(P('CSSStyleDeclaration'),
                     ['cssRules', 'getPropertyCSSValue']),
@@ -2110,6 +2186,26 @@ STATE_JS = """async () => {
             return nav.mediaDevices.enumerateDevices();
         } catch (e) { return 'throw:' + e.name; }
     })();
+    // ---- F-94：getSupportedConstraints 走 WebKit 逐项回填的白名单 ----
+    // Blink 返回引擎全能力 36 项，WebKit 只回填 MediaDevices.cpp 里显式
+    // 赋值的键（17.x 15 项 / 18.0+ 17 项）。键序是字母序。
+    out.supportedConstraints = (() => {
+        try {
+            const md = nav.mediaDevices;
+            if (!md || typeof md.getSupportedConstraints !== 'function') { return null; }
+            const c = md.getSupportedConstraints();
+            return {
+                keys: Object.keys(c),
+                count: Object.keys(c).length,
+                voiceIsolation: 'voiceIsolation' in c,
+                backgroundBlur: 'backgroundBlur' in c,
+                powerEfficient: 'powerEfficient' in c,
+                torch: 'torch' in c,
+                zoom: 'zoom' in c,
+                allTrue: Object.keys(c).every((k) => c[k] === true),
+            };
+        } catch (e) { return 'throw:' + e.name; }
+    })();
     out.deviceKinds = out.deviceKinds && typeof out.deviceKinds.then === 'function'
         ? await out.deviceKinds.then((ds) => ds.map((d) => d.kind),
                                    (e) => 'throw:' + e.name)
@@ -2259,13 +2355,25 @@ STATE_JS = """async () => {
             var C = window.VideoDecoder;
             if (typeof C !== 'function') { return { absent: true }; }
             var d = Object.getOwnPropertyDescriptor(C, 'isConfigSupported');
-            var msg = function (cfg) {
-                try { C.isConfigSupported(cfg); return 'no-throw'; }
+            // 真机 WebKit 把参数校验放在 Promise 内部（`isConfigSupported`
+            // 本身不抛，返回的 promise 以 TypeError 拒绝，/tmp/f600 实测）；
+            // 只看同步返回会误判成「没校验」。这里一律 await 取值。
+            // 必须用 apply 透传实参个数：`isConfigSupported(undefined)` 走的是
+            // 配置转换（报 codec 必填），只有零实参才报 `Not enough arguments`
+            // （真机 /tmp/f601/probe2.py 实测）。
+            var msg = async function () {
+                try { await C.isConfigSupported.apply(C, arguments); return 'no-throw'; }
                 catch (e) { return e.name + ':' + e.message; }
             };
             var A = window.AudioEncoder;
-            var amsg = function (cfg) {
-                try { A.isConfigSupported(cfg); return 'no-throw'; }
+            // AudioEncoder/AudioDecoder 是 Safari 26 才有的面（BCD
+            // safari_ios 26），低版本 profile 上两者都缺席——这里返回
+            // 'absent' 让断言按版本推导，而不是误判成「校验缺失」。
+            var amsg = async function (cfg) {
+                if (typeof A !== 'function' || !A.isConfigSupported) {
+                    return 'absent';
+                }
+                try { await A.isConfigSupported(cfg); return 'no-throw'; }
                 catch (e) { return e.name + ':' + e.message; }
             };
             var q = function (c) {
@@ -2280,7 +2388,11 @@ STATE_JS = """async () => {
                           function () { return 'ERR'; });
             };
             var qa = function (c) {
-                return window.AudioDecoder.isConfigSupported(
+                var D = window.AudioDecoder;
+                if (typeof D !== 'function' || !D.isConfigSupported) {
+                    return Promise.resolve('absent');
+                }
+                return D.isConfigSupported(
                     { codec: c, numberOfChannels: 2, sampleRate: 48000 })
                     .then(function (r) { return !!r.supported; },
                           function () { return 'ERR'; });
@@ -2298,9 +2410,9 @@ STATE_JS = """async () => {
                 desc: d ? [d.enumerable, d.configurable, d.writable] : null,
                 length: C.isConfigSupported.length,
                 native: nativeStr(C.isConfigSupported),
-                noArg: msg(),
-                emptyCfg: msg({}),
-                aeNoRate: amsg({ codec: 'opus', numberOfChannels: 2 }),
+                noArg: await msg(),
+                emptyCfg: await msg({}),
+                aeNoRate: await amsg({ codec: 'opus', numberOfChannels: 2 }),
                 vp8: m[0], avc1: m[1], hvc1: m[2], hev1: m[3], vp09: m[4],
                 vp09p2: m[5], av01: m[6], h264: m[7], vp9: m[8],
                 eAvc1: m[9], eHevc: m[10], eAv01: m[11],
@@ -2533,16 +2645,31 @@ try {
     + ' , wcIcs: (function () { try {'
     + ' var C = self.VideoDecoder; if (typeof C !== "function") { return {absent: true}; }'
     + ' var d = Object.getOwnPropertyDescriptor(C, "isConfigSupported");'
-    + ' var msg = function (cfg) { try { C.isConfigSupported(cfg); return "no-throw"; }'
-    + ' catch (e) { return e.name + ":" + e.message; } };'
+    // 真机 WebKit 的参数校验在 Promise 内部（同步返回不抛，返回的 promise
+    // 以 TypeError 拒绝，/tmp/f600 实测），所以三个取值必须 await 后回传。
+    // 实参个数用 apply 透传：`isConfigSupported(undefined)` 报 codec 必填，
+    // 只有零实参才报 `Not enough arguments`（/tmp/f601/probe2.py 实测）。
+    + ' var msg = function () { return C.isConfigSupported.apply(C, arguments)'
+    + ' .then(function () { return "no-throw"; },'
+    + ' function (e) { return e.name + ":" + e.message; }); };'
     + ' var A = self.AudioEncoder;'
-    + ' var amsg = function (cfg) { try { A.isConfigSupported(cfg); return "no-throw"; }'
-    + ' catch (e) { return e.name + ":" + e.message; } };'
+    // AudioEncoder 是 Safari 26 的面（BCD safari_ios 26），低版本 Worker 里
+    // 根本没有，取属性即 TypeError——这里返回 "absent" 交给断言按版本推导。
+    + ' var amsg = function (cfg) { if (typeof A !== "function"'
+    + ' || typeof A.isConfigSupported !== "function") {'
+    + ' return Promise.resolve("absent"); }'
+    + ' return A.isConfigSupported(cfg)'
+    + ' .then(function () { return "no-throw"; },'
+    + ' function (e) { return e.name + ":" + e.message; }); };'
+    + ' self.__wcIcsP = Promise.all([msg(), msg({}),'
+    + ' amsg({codec: "opus", numberOfChannels: 2})]).then(function (v) {'
     + ' return {type: typeof C.isConfigSupported, own: !!d,'
     + ' desc: d ? [d.enumerable, d.configurable, d.writable] : null,'
     + ' length: C.isConfigSupported.length,'
-    + ' noArg: msg(), emptyCfg: msg({}),'
-    + ' aeNoRate: amsg({codec: "opus", numberOfChannels: 2}),'
+    + ' noArg: v[0], emptyCfg: v[1], aeNoRate: v[2]}; });'
+    + ' return {type: typeof C.isConfigSupported, own: !!d,'
+    + ' desc: d ? [d.enumerable, d.configurable, d.writable] : null,'
+    + ' length: C.isConfigSupported.length,'
     + ' wcP: ((self.__wcP = (function () {'
     + ' var E = self.VideoEncoder, A = self.AudioDecoder;'
     + ' var q = function (c) { return C.isConfigSupported({codec: c})'
@@ -2550,7 +2677,8 @@ try {
     + ' var qe = function (c) { return E.isConfigSupported('
     + ' {codec: c, width: 640, height: 480})'
     + ' .then(function (r) { return !!r.supported; }, function () { return "ERR"; }); };'
-    + ' var qa = function (c) { return A.isConfigSupported('
+    + ' var qa = function (c) { if (!A || typeof A.isConfigSupported !== "function") {'
+    + ' return Promise.resolve("absent"); } return A.isConfigSupported('
     + ' {codec: c, numberOfChannels: 2, sampleRate: 48000})'
     + ' .then(function (r) { return !!r.supported; }, function () { return "ERR"; }); };'
     + ' return Promise.all([q("vp8"), q("avc1.42E01E"), q("hvc1.1.6.L93.B0"),'
@@ -2565,8 +2693,8 @@ try {
     + ' } catch (e) { return "ERR:" + e.name; } })()'
     + ' , mediaW: (function () { var ns = ["WebKitPlaybackTargetAvailabilityEvent","WebKitMediaKeys","WebKitMediaKeySession","WebKitMediaKeyMessageEvent","WebKitMediaKeyNeededEvent","WebKitMediaKeyError","HTMLMediaElement","HTMLVideoElement"];'
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
-    + '}); Promise.all([self.__wcP]).then(function (v) {'
-    + ' postMessage({wcCodecs: v[0]}); }, function () {'
+    + '}); Promise.all([self.__wcP, self.__wcIcsP]).then(function (v) {'
+    + ' postMessage({wcCodecs: v[0], wcIcs: v[1]}); }, function () {'
     + ' postMessage({wcCodecs: "ERR"}); }); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.workerData = {};
@@ -2683,16 +2811,31 @@ try {
     + ' , wcIcs: (function () { try {'
     + ' var C = self.VideoDecoder; if (typeof C !== "function") { return {absent: true}; }'
     + ' var d = Object.getOwnPropertyDescriptor(C, "isConfigSupported");'
-    + ' var msg = function (cfg) { try { C.isConfigSupported(cfg); return "no-throw"; }'
-    + ' catch (e) { return e.name + ":" + e.message; } };'
+    // 真机 WebKit 的参数校验在 Promise 内部（同步返回不抛，返回的 promise
+    // 以 TypeError 拒绝，/tmp/f600 实测），所以三个取值必须 await 后回传。
+    // 实参个数用 apply 透传：`isConfigSupported(undefined)` 报 codec 必填，
+    // 只有零实参才报 `Not enough arguments`（/tmp/f601/probe2.py 实测）。
+    + ' var msg = function () { return C.isConfigSupported.apply(C, arguments)'
+    + ' .then(function () { return "no-throw"; },'
+    + ' function (e) { return e.name + ":" + e.message; }); };'
     + ' var A = self.AudioEncoder;'
-    + ' var amsg = function (cfg) { try { A.isConfigSupported(cfg); return "no-throw"; }'
-    + ' catch (e) { return e.name + ":" + e.message; } };'
+    // AudioEncoder 是 Safari 26 的面（BCD safari_ios 26），低版本 Worker 里
+    // 根本没有，取属性即 TypeError——这里返回 "absent" 交给断言按版本推导。
+    + ' var amsg = function (cfg) { if (typeof A !== "function"'
+    + ' || typeof A.isConfigSupported !== "function") {'
+    + ' return Promise.resolve("absent"); }'
+    + ' return A.isConfigSupported(cfg)'
+    + ' .then(function () { return "no-throw"; },'
+    + ' function (e) { return e.name + ":" + e.message; }); };'
+    + ' self.__wcIcsP = Promise.all([msg(), msg({}),'
+    + ' amsg({codec: "opus", numberOfChannels: 2})]).then(function (v) {'
     + ' return {type: typeof C.isConfigSupported, own: !!d,'
     + ' desc: d ? [d.enumerable, d.configurable, d.writable] : null,'
     + ' length: C.isConfigSupported.length,'
-    + ' noArg: msg(), emptyCfg: msg({}),'
-    + ' aeNoRate: amsg({codec: "opus", numberOfChannels: 2}),'
+    + ' noArg: v[0], emptyCfg: v[1], aeNoRate: v[2]}; });'
+    + ' return {type: typeof C.isConfigSupported, own: !!d,'
+    + ' desc: d ? [d.enumerable, d.configurable, d.writable] : null,'
+    + ' length: C.isConfigSupported.length,'
     + ' wcP: ((self.__wcP = (function () {'
     + ' var E = self.VideoEncoder, A = self.AudioDecoder;'
     + ' var q = function (c) { return C.isConfigSupported({codec: c})'
@@ -2700,7 +2843,8 @@ try {
     + ' var qe = function (c) { return E.isConfigSupported('
     + ' {codec: c, width: 640, height: 480})'
     + ' .then(function (r) { return !!r.supported; }, function () { return "ERR"; }); };'
-    + ' var qa = function (c) { return A.isConfigSupported('
+    + ' var qa = function (c) { if (!A || typeof A.isConfigSupported !== "function") {'
+    + ' return Promise.resolve("absent"); } return A.isConfigSupported('
     + ' {codec: c, numberOfChannels: 2, sampleRate: 48000})'
     + ' .then(function (r) { return !!r.supported; }, function () { return "ERR"; }); };'
     + ' return Promise.all([q("vp8"), q("avc1.42E01E"), q("hvc1.1.6.L93.B0"),'
@@ -2715,8 +2859,8 @@ try {
     + ' } catch (e) { return "ERR:" + e.name; } })()'
     + ' , mediaW: (function () { var ns = ["WebKitPlaybackTargetAvailabilityEvent","WebKitMediaKeys","WebKitMediaKeySession","WebKitMediaKeyMessageEvent","WebKitMediaKeyNeededEvent","WebKitMediaKeyError","HTMLMediaElement","HTMLVideoElement"];'
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
-    + '}); Promise.all([self.__wcP]).then(function (v) {'
-    + ' postMessage({wcCodecs: v[0]}); }, function () {'
+    + '}); Promise.all([self.__wcP, self.__wcIcsP]).then(function (v) {'
+    + ' postMessage({wcCodecs: v[0], wcIcs: v[1]}); }, function () {'
     + ' postMessage({wcCodecs: "ERR"}); }); }, 300);';
   var w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
   window.__workerData = {};
@@ -2783,6 +2927,14 @@ POST_FORM_HTML = """<!doctype html><html><head><meta charset="utf-8"></head><bod
 <input name="a" value="1"><button type="submit">go</button></form>
 </body></html>"""
 POST_TARGET_HTML = """<!doctype html><html><body>posted</body></html>"""
+# 主状态页（STATE_JS 的落点）。必须带 viewport meta：无此 meta 时 Chromium 退回
+# 980px 的桌面布局视口，innerWidth/innerHeight 量出来是 980/1636 而不是 CSS
+# 尺寸——那量的是「页面没声明视口」，与仿真是否把视口做成移动端无关。
+# `lang="en"` 同理：-webkit-locale 继承文档语言，缺 lang 时真机 WebKit 也返回
+# `auto`（/tmp/f608/wk_locale.py 实测），带 lang 才量得到 `en` 这个口径。
+PROBE_HTML = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+              '<meta name="viewport" content="width=device-width,initial-scale=1">'
+              '</head><body>probe</body></html>')
 CRIOS_POST_JS = """() => {
   const mh = window.webkit && window.webkit.messageHandlers;
   const ns = window.__crPostRequestWorkaround;
@@ -3713,7 +3865,13 @@ async def main() -> int:
         browser = await pw.chromium.connect_over_cdp(res["ws_endpoint"])
         context = browser.contexts[0]
         page = context.pages[0] if context.pages else await context.new_page()
-        state = await page.evaluate(STATE_JS)
+        # start_url 是外网地址，本机网络不通时会停在 chrome-error://chromewebdata/
+        # ——那是非安全上下文，[SecureContext] 面（传感器构造器、WebGPU）在真机
+        # WebKit 上同样缺席（/tmp/f608/wk_secure.py 实测），在那里取状态会把
+        # 「网络问题」误读成「仿真缺陷」。这里先记下 start_url 的落点用于断言，
+        # 再把页面导到**路由拦截的 https 假域**（安全上下文，且不碰真实网络）
+        # 上取全部状态。
+        start_url_href = await page.evaluate("() => location.href")
 
         # 请求头核对：拦截一个假域名，读取浏览器实际发出的请求头
         seen_headers: dict = {}
@@ -3724,10 +3882,11 @@ async def main() -> int:
                 if lk.startswith("sec-ch") or lk == "user-agent":
                     seen_headers[lk] = v
             await route.fulfill(status=200, content_type="text/html",
-                                body="<html><body>probe</body></html>")
+                                body=PROBE_HTML)
 
-        await page.route("http://probe.test/**", on_route)
-        await page.goto("http://probe.test/", wait_until="domcontentloaded")
+        await page.route("https://probe.test/**", on_route)
+        await page.goto("https://probe.test/", wait_until="domcontentloaded")
+        state = await page.evaluate(STATE_JS)
 
         print("\n== 页面实际状态（导航后）==")
         print(json.dumps(state, ensure_ascii=False, indent=1))
@@ -3928,7 +4087,7 @@ async def main() -> int:
         return int(sess or 0)
 
     checks: dict[str, bool] = {
-        "已按 start_url 导航": "example.com" in (state["url"] or ""),
+        "已按 start_url 导航": "example.com" in (start_url_href or ""),
         "UA 为指纹中的移动端 UA": state["userAgent"] == nav["userAgent"],
         "platform 一致": state["platform"] == nav.get("platform"),
         "maxTouchPoints 一致": state["maxTouchPoints"] == nav.get("maxTouchPoints"),
@@ -3996,10 +4155,20 @@ async def main() -> int:
         # 上恒为 zh-CN，与欧美出口时区并存即「属地与语言不符」的跨域特征。
         "Intl locale 覆盖生效（launch.locale）": state.get("intlLocale") == "zh-CN",
         # ---- 伪造接收者防护：Object.create(实例) 上调用补丁 getter 必须抛 ----
-        "伪造接收者：Navigator getter 抛 Illegal invocation": (
+        # 文案按内核分流：Blink 的绑定层抛 `Illegal invocation`，WebKit 的
+        # JSDOMWindow 走 `The <Iface>.<member> getter can only be used on
+        # instances of <Iface>`（Playwright WebKit 27.2 实测，/tmp/f596）。
+        # iOS 身份模仿的是 Safari，用 Blink 文案反而是一条现成的判假面。
+        "伪造接收者：Navigator getter 抛原生 TypeError": (
             bool(state.get("brandGuard"))
-            and all(v == "TypeError:Illegal invocation"
-                    for v in state["brandGuard"].values())),
+            and all(
+                v == "TypeError:Illegal invocation"
+                or ("can only be used on instances of" in v)
+                # 方法形态真机首字母大写：`Can only call Document.createEvent
+                # on instances of Document`（/tmp/f600 实测），比对时降大小写。
+                or ("can only call " in v.lower()
+                    and " on instances of " in v.lower())
+                for v in state["brandGuard"].values())),
         "伪造接收者：覆盖面齐全（含 Screen/Window）": (
             len(state.get("brandGuard") or {}) >= 12),
         # 反向保真：原生 enumerateDevices 不校验接收者，补丁不得画蛇添足
@@ -4154,6 +4323,20 @@ async def main() -> int:
                 state["pluginsLen"] == 0 and state["mimeTypesLen"] == 0),
             "pdfViewerEnabled == false（Android 构建口径）": state["pdfViewerValue"] is False,
             "WebHID 不存在（Android Chrome 未实现）": state["hasHid"] is False,
+            # ---- F-95：Contact Picker（BCD chrome_android 80，真机有）----
+            # 桌面 Chromium 的 ContactsManager runtime flag 是 test（默认关），
+            # 真机 Android 是 stable。`'contacts' in navigator` 一行即判。
+            "navigator.contacts 存在且为对象（Contact Picker，Android 真机有）": (
+                state.get("contactsType") == "object"
+                and state.get("contactsInNav") is True
+                and state.get("contactsCtor") == "function"
+                and state.get("contactsAddrCtor") == "function"),
+            "navigator.contacts：Navigator 上的 getter 形态（SameObject 只读）": (
+                isinstance(state.get("contactsDesc"), dict)
+                and state["contactsDesc"].get("get") == "function"
+                and state["contactsDesc"].get("set") == "undefined"
+                and state["contactsDesc"].get("en") is True
+                and state["contactsDesc"].get("cf") is True),
             "WebUSB 存在（Chrome Android 148 支持）": state["hasUsb"] is True,
             "Web Serial 存在（Chrome Android 148 支持）": state["hasSerial"] is True,
             # ---- F-40 / F-49 / F-51：Android 侧同口径（BCD chrome_android）----
@@ -4533,7 +4716,11 @@ async def main() -> int:
             "Worker：WorkerNavigator 只留真机 16 个成员（serviceWorker 在、GPC 不在）": (
                 isinstance(wk_main.get("wkNav"), list)
                 and wk_main["wkNav"][:1] == ["constructor"]
-                and wk_main["wkNav"][1:] == _IOS_WORKER_NAV_PROTO
+                # `gpu` 是 Safari 26 才有的成员（_IOS_MIN_VERSIONS["gpu"]=(26,)），
+                # 低版本档真机同样没有——期望值按 profile 版本过滤，不能写死全表。
+                and wk_main["wkNav"][1:] == [
+                    n for n in _IOS_WORKER_NAV_PROTO
+                    if n != "gpu" or _ios_at_least(26)]
                 and wk_main.get("wkGpc") is False),
             # F-77 D3：真机 Worker 的 navigator.serviceWorker 是原型上的只读
             # getter（enumerable true、无 setter、get.length 0），每次读同一个
@@ -4646,8 +4833,9 @@ async def main() -> int:
             "Worker：AudioEncoder.isConfigSupported 校验顺序 codec→ch→rate（F-133）": (
                 isinstance(wk_main.get("wcIcs"), dict)
                 and wk_main["wcIcs"].get("aeNoRate")
-                    == "TypeError:Member WebCodecsAudioEncoderConfig.sampleRate is"
-                       " required and must be an instance of unsigned long"),
+                    == ("TypeError:Member WebCodecsAudioEncoderConfig.sampleRate is"
+                        " required and must be an instance of unsigned long"
+                        if _ios_at_least(26) else "absent")),
             # F-133 表：WebKit main 的 isSupported*Codec 谓词。av01 由
             # WebCodecsAV1Enabled（COCOA 默认 false）门控——与机型 AV1 硬解
             # 无关，所以这里不按 _ios_av1_capable 分叉。
@@ -4655,15 +4843,20 @@ async def main() -> int:
                 isinstance(wk_main.get("wcCodecs"), dict)
                 and wk_main["wcCodecs"] == {
                     "vp8": True, "avc1": True, "hvc1": True, "hev1": True,
-                    "vp09": True, "vp09p2": False, "av01": False,
+                    "vp09": True, "vp09p2": True, "av01": False,
                     "h264": False, "vp9": False,
                     "eAvc1": True, "eHevc": True, "eAv01": False,
-                    "adOpus": True, "adPcm": True, "adPcmBad": False}),
+                    "adOpus": True if _ios_at_least(26) else "absent",
+                    "adPcm": True if _ios_at_least(26) else "absent",
+                    "adPcmBad": False if _ios_at_least(26) else "absent"}),
             "Worker：AudioDecoder 认 opus / pcm-s16，不认 pcm-s20（F-133）": (
                 isinstance(wk_main.get("wcCodecs"), dict)
-                and wk_main["wcCodecs"].get("adOpus") is True
-                and wk_main["wcCodecs"].get("adPcm") is True
-                and wk_main["wcCodecs"].get("adPcmBad") is False),
+                and (wk_main["wcCodecs"].get("adOpus") is True
+                     and wk_main["wcCodecs"].get("adPcm") is True
+                     and wk_main["wcCodecs"].get("adPcmBad") is False)
+                if _ios_at_least(26) else
+                all(wk_main["wcCodecs"].get(k) == "absent"
+                    for k in ("adOpus", "adPcm", "adPcmBad"))),
             "UA-CH 不存在（Safari/CriOS 均无该 API）": state["uaData"] == "ABSENT",
             "getBattery 不存在（WKWebView 无该 API）": state["hasGetBattery"] is False,
             "deviceMemory 不暴露（WKWebView 无该 API）": state["deviceMemory"] is None,
@@ -4716,11 +4909,14 @@ async def main() -> int:
                 and state["wcIcs"].get("emptyCfg")
                     == "TypeError:Member WebCodecsVideoDecoderConfig.codec is"
                        " required and must be an instance of DOMString"),
+            # F-85：AudioEncoder/AudioDecoder 是 Safari 26 的面（BCD
+            # safari_ios 26），低版本 profile 上必须缺席——期望值按版本推导。
             "WebCodecs：AudioEncoder 校验顺序 codec→ch→rate（F-132）": (
                 isinstance(state.get("wcIcs"), dict)
                 and state["wcIcs"].get("aeNoRate")
-                    == "TypeError:Member WebCodecsAudioEncoderConfig.sampleRate is"
-                       " required and must be an instance of unsigned long"),
+                    == ("TypeError:Member WebCodecsAudioEncoderConfig.sampleRate is"
+                        " required and must be an instance of unsigned long"
+                        if _ios_at_least(26) else "absent")),
             "WebCodecs：codec 矩阵 == WebKit 谓词（F-132）": (
                 isinstance(state.get("wcIcs"), dict)
                 and {k: v for k, v in state["wcIcs"].items()
@@ -4728,10 +4924,13 @@ async def main() -> int:
                               "av01", "h264", "vp9", "eAvc1", "eHevc",
                               "eAv01", "adOpus", "adPcm", "adPcmBad")} == {
                     "vp8": True, "avc1": True, "hvc1": True, "hev1": True,
-                    "vp09": True, "vp09p2": False, "av01": False,
+                    "vp09": True, "vp09p2": True, "av01": False,
                     "h264": False, "vp9": False,
                     "eAvc1": True, "eHevc": True, "eAv01": False,
-                    "adOpus": True, "adPcm": True, "adPcmBad": False}),
+                    # 26 以下 AudioDecoder 缺席，qa() 返回 'absent'
+                    "adOpus": True if _ios_at_least(26) else "absent",
+                    "adPcm": True if _ios_at_least(26) else "absent",
+                    "adPcmBad": False if _ios_at_least(26) else "absent"}),
             "WebCodecs：VideoFrame 构造器保持原生（品牌校验未破坏）": (
                 isinstance(state.get("wcIcs"), dict)
                 and state["wcIcs"].get("vfNative") is True),
@@ -4871,6 +5070,17 @@ async def main() -> int:
                 and (state.get("audioMembers") or {}).get("onsinkchange") is False
                 and (state.get("audioMembers") or {}).get("playbackStats") is False
                 and (state.get("audioMembers") or {}).get("basePlaybackStats") is False),
+            # ---- F-96：baseLatency 按平台常量（WebKit 128 样本） ----
+            # 真机 = framesPerBuffer(128) / sampleRate，与采样率无关的
+            # **样本数**恒定；Blink 除的是自己的缓冲深度（48k 256 /
+            # 44.1k 236 / 96k 512）。断言样本数而非浮点值，避免 1/44100
+            # 这类除法的末位抖动。
+            "AudioContext.baseLatency = 128 样本 / sampleRate（WebKit 口径）": (
+                abs(((state.get("audioLatency") or {}).get("samples") or 0) - 128) < 1e-6
+                and abs(((state.get("audioLatency") or {}).get("s44Samples") or 0) - 128) < 1e-6),
+            "AudioContext.baseLatency：关闭后归 0、state 读 closed": (
+                (state.get("audioLatency") or {}).get("closedBase") == 0
+                and (state.get("audioLatency") or {}).get("closedState") == "closed"),
             # ---- F-44（修正 F-18）：iPhone 自然方向是竖屏 ----
             # WebKit naturalScreenOrientationType()：iPad → landscape-primary，
             # 其余 iOS → portrait-primary；angle 按该表查，所以 iPhone 竖屏
@@ -5018,8 +5228,12 @@ async def main() -> int:
                               "onbeforepaste", "onsearch"))
                 and ((state.get("protoDrop") or {}).get("handlerKeep") or {})
                     .get("docSVT") is True
+                # F-141：ariaNotify 是 `EnabledBySetting=IsARIANotifyEnabled`
+                # 的 Element 方法，出货版 Safari 的该 pref 恒 false——真机
+                # 26.5 上 Element/Document 两端都缺席（/tmp/f603/probe2.py），
+                # 与版本无关，故这里必须为 False。
                 and ((state.get("protoDrop") or {}).get("handlerKeep") or {})
-                    .get("ariaNotify") is True),
+                    .get("ariaNotify") is False),
             "事件处理器：onfocusin/onbeforecopy 落点在 Element/HTMLElement": (
                 # WebKit 26.5/27.2（has_touch+is_mobile 上下文）实测：五名都在
                 # Element/HTMLElement 上，document.documentElement（HTMLHtmlElement
@@ -5066,6 +5280,27 @@ async def main() -> int:
             "enumerateDevices：无 audiooutput 项（iOS 不暴露输出设备）": (
                 isinstance(state.get("deviceKinds"), list)
                 and "audiooutput" not in state["deviceKinds"]),
+            # ---- F-94：getSupportedConstraints 走 WebKit 白名单 ----
+            # 真机是 MediaDevices.cpp 逐项回填的 15/17 项（字母序），
+            # 桌面 Blink 是 36 项引擎全集。voiceIsolation 一行即判。
+            # 键集随 iOS 版本变（WebKit 619/Safari 18.0 起多 backgroundBlur
+            # /powerEfficient），期望值按 profile 版本推导，不写死。
+            "getSupportedConstraints：无 Blink 专有键（voiceIsolation 等）": (
+                isinstance(state.get("supportedConstraints"), dict)
+                and state["supportedConstraints"].get("voiceIsolation") is False
+                and state["supportedConstraints"].get("torch") is True
+                and state["supportedConstraints"].get("zoom") is True
+                and state["supportedConstraints"].get("allTrue") is True),
+            "getSupportedConstraints：键集 == WebKit 白名单（按 iOS 版本）": (
+                isinstance(state.get("supportedConstraints"), dict)
+                and state["supportedConstraints"].get("keys")
+                == sorted(
+                    ["aspectRatio", "deviceId", "displaySurface",
+                     "echoCancellation", "facingMode", "frameRate", "groupId",
+                     "height", "sampleRate", "sampleSize", "torch", "volume",
+                     "whiteBalanceMode", "width", "zoom"]
+                    + (["backgroundBlur", "powerEfficient"]
+                       if _ios_at_least(18) else []))),
             # ---- F-90：iOS 普通浏览上下文 Notification 整族缺席 ----
             # NotificationsEnabled 的 defaultValue 在 PLATFORM(IOS_FAMILY)
             # 为 false，Notification.idl / PushManager.idl / SWR+PushAPI.idl
@@ -5177,6 +5412,23 @@ async def main() -> int:
                     "inn": True, "val": "normal"}
                 and all((state.get("addMembers") or {}).get("cssDecl", {}).get(k, {}).get("inn")
                         is True for k in ("cssRules", "getPropertyCSSValue"))),
+            # F-93②：canvas 通用族度量按 WebKit 的字体映射。真机 26.5 基线
+            # 逐值见 /tmp/f606/wk.py；仿真靠 Page.setFontFamilies 把通用族
+            # 指到 macOS 上与 WebKit 同源的字体（Times/Helvetica/Courier/
+            # Apple Chancery/Papyrus）。留 0.1 的容差吸收亚像素取整差异。
+            "字体：通用族 canvas 度量 == WebKit 映射（F-93②）": (
+                (lambda ff: bool(ff) and all(
+                    abs(ff.get(k, [0, 0])[0] - w[0]) < 0.1
+                    and abs(ff.get(k, [0, 0])[1] - w[1]) < 0.1
+                    for k, w in {
+                        "monospace": (240.04, 240.04),
+                        "serif": (111.13, 311.13),
+                        "sans-serif": (88.87, 333.2),
+                        "cursive": (118.36, 315.63),
+                        "fantasy": (83.59, 283.2),
+                    }.items())
+                    and ff.get("monoEq") is True)
+                ((state.get("addMembers") or {}).get("fontFam"))),
             # F-77 D3：三个全局项按真机形态补——webkitIndexedDB 是只读 getter
             # （同一对象）；openDatabase 是 get/set 访问器、未赋值读作
             # "undefined"（真机是 JSC 内部函数对象，typeof 相同，V8 造不出，
@@ -5543,8 +5795,11 @@ async def main() -> int:
                 not any(k.startswith("sec-ch") for k in ac_first)
                 and not any(k.startswith("sec-ch") for k in ac_second)),
             # ---- WebGPU：iOS 保持宿主 Apple 适配器（真机 iPhone 同为 Apple GPU）----
+            # navigator.gpu 自 Safari 26 起才有（_IOS_MIN_VERSIONS["gpu"]=(26,)）；
+            # 低版本档真机整块缺席，这里断言「缺席」而不是「vendor==apple」。
             "WebGPU：iOS 适配器 vendor == apple（真机一致）": (
-                wg.get("hasGpu") is True and wg.get("vendor") == "apple"),
+                (wg.get("hasGpu") is True and wg.get("vendor") == "apple")
+                if _ios_at_least(26) else wg.get("hasGpu") is False),
             # ---- iOS 两口径通用：普通页面无 window.chrome（报告 §4.4 / B1-5）----
             "window.chrome 为 undefined（iOS 普通页面无该对象）": state["hasChromeObj"] is False,
             # ---- 平台 API 差集（Chromium 专有面收敛；BCD safari_ios=false）----
@@ -5916,8 +6171,8 @@ async def main() -> int:
                 and eng.get("cssBadApplePay") is False
                 and eng.get("cssBadMarginTrimCond") is False
                 and eng.get("cssBadBackdropCond") is False),
-            "CSS：值域边界（margin-trim: inline / blur 无单位 → false；多函数与 || 组合 → true）": (
-                eng.get("cssMarginTrimInline") is False
+            "CSS：值域边界（margin-trim: inline / blur 无单位 → 前者 true 后者 false；多函数与 || 组合 → true）": (
+                eng.get("cssMarginTrimInline") is True
                 and eng.get("cssBackdropUnitless") is False
                 and eng.get("cssBackdropMulti") is True
                 and eng.get("cssMarginTrimCombo") is True
@@ -6306,6 +6561,16 @@ async def main() -> int:
     ok_all = True
     for name, passed in checks.items():
         print(("  ✅ " if passed else "  ❌ ") + name)
+        # start_url 是外网地址：失败时区分「内核没按 start_url 导航」和
+        # 「本机网络/系统代理不通」。内核继承 macOS 系统代理（真机 Chrome
+        # 同样如此，不额外注入 --no-proxy-server），代理端口挂掉时导航必然
+        # 落在 chrome-error://chromewebdata/——这是环境问题，不是仿真缺陷。
+        if not passed and "start_url" in name:
+            print("      start_url 落点:", start_url_href)
+            if str(start_url_href).startswith("chrome-error:"):
+                print("      ↑ 落在 chrome-error://：本机到 start_url 的导航失败"
+                      "（常见于 macOS 系统代理端口未监听）。可用 "
+                      "--no-proxy-server 起内核复验，与仿真本身无关。")
         if not passed and os.environ.get("VERIFY_DEBUG"):
             keys = (("wcCodecs",) if "codec 矩阵" in name
                     else ("wkIcs",) if "F-133" in name

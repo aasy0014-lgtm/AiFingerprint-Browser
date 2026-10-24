@@ -636,8 +636,8 @@ def test_engines_compat() -> None:
           "__csOwner.set(cs, el)" in inj
           and "if (computed && key === 'position'" in inj
           and "return 'sticky';" in inj)
-    check("F-98：applePayButtonStyle 驼峰访问器",
-          "'applePayButtonStyle', {" in inj)
+    check("F-98：ApplePayButtonStyle 驼峰访问器（真机大写首字母）",
+          "'ApplePayButtonStyle': '-apple-pay-button-style'" in inj)
 
     # ---- F-99 / F-100：computed 序列化口径与表单控件 UA 默认值 ----
     check("F-99：布局长度按 1/64px 量化，物理右侧外边距例外",

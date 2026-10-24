@@ -68,8 +68,11 @@ from .mobile_fingerprints import (
     _add_members,
     _drop_proto_members,
     _generate_mobile_font_subset,
+    _IOS_PROTO_ORDER,
+    _IOS_PROTO_ORDER_IPAD,
     _ios_av1_capable,
     _ios_permissions,
+    _ios_supported_constraints,
     _webgl_profile,
     _worker_add_members,
 )
@@ -338,14 +341,18 @@ _IOS_MIN_VERSIONS = {
     "GPUTexture": (26,), "GPUTextureUsage": (26,), "GPUTextureView": (26,),
     "GPUUncapturedErrorEvent": (26,), "GPUValidationError": (26,),
     "WGSLLanguageFeatures": (26,),
-    # 27+：ARIA Notifications
-    "ariaNotify": (27,),
     # 27+ 但**默认关闭**：WebKit `UnifiedWebPreferences.yaml` 的
     # `DevicePostureAPIEnabled` 是 `status: testable` + `defaultValue: false`
     # ——出货版 Safari 不开该偏好，普通浏览上下文里恒缺席，与版本无关。
     # 放这里会随版本门控在 27+ 档漏出（F-139），故归入无条件删除表。
     # 同族：BCD `api/DevicePosture.json` 的 safari_ios 条目本身就是
     # `flags: [{type: preference, name: DevicePostureEnabled}]`。
+    # ariaNotify 同理（F-141）：它是 `Element.prototype` 的方法
+    # （`Element.idl:106-107`，`EnabledBySetting=IsARIANotifyEnabled`），
+    # 该 pref 在 `UnifiedWebPreferences.yaml` 里是 `status: internal` +
+    # `default: false`（只有 `ENABLE(ARIA_NOTIFY)` 的构建才开）——出货
+    # Safari 恒缺席，与 iOS 版本无关。按全局名做版本门控对它**从不生效**
+    # （它不是全局），故必须走原型成员删除表，见 _IOS_DROP_PROTO_MEMBERS。
     # 26.x：F-85 普查余量（BCD 接口自身 safari_ios，逐族列明）。这些族
     # 在 WebKit 27.2 基线里同样存在，差集普查看不见，只能按版本门控。
     #   WebTransport 族 26.4 / Navigation API 族 26.2 / Streams BYOB 26.4
@@ -377,9 +384,13 @@ _IOS_MIN_VERSIONS = {
     "ScrollTimeline": (26,), "ViewTimeline": (26,), "URLPattern": (26,),
     "HTMLSelectedContentElement": (27,),
     # 16.4+：Home Screen Web App 推送 / 通知 / 徽标 / 音频会话 / 报表
-    "Notification": (16, 4), "PushManager": (16, 4),
-    "PushSubscription": (16, 4), "PushSubscriptionOptions": (16, 4),
-    "setAppBadge": (16, 4), "clearAppBadge": (16, 4),
+    # Notification / PushManager / PushSubscription / PushSubscriptionOptions
+    # 与 setAppBadge / clearAppBadge **不在**此表：它们整族由 pref 门控
+    # （NotificationsEnabled 在 PLATFORM(IOS_FAMILY) 为 false、
+    # PushAPIEnabled / AppBadgeEnabled 默认 false），已在
+    # _IOS_REMOVE_GLOBALS / _IOS_REMOVE_NAV_PROPS 里无条件删除。留在这里
+    # 会变成 vestigial 条目——将来有人按 16.4「放行」就会让低版本档泄漏
+    # （F-141 现象一）。
     "Report": (16, 4), "AudioSession": (16, 4),
     # 标准全屏族 5 名（webkit 前缀别名 8 名无条件保留，不进表）
     "fullscreen": (16, 4), "exitFullscreen": (16, 4),
@@ -529,7 +540,17 @@ def derive_spec(fingerprint: dict, target_os: str,
     # WebGPU（GPUAdapterInfo）真机 Android Chrome 口径（Dawn/Vulkan）：宿主
     # 是 Apple GPU（vendor "apple" / "metal-*"），与 Android 机型声明的 GPU
     # 直接矛盾，WebGL↔WebGPU 跨 API 对照可命中；映射见 _android_webgpu。
-    webgpu = _android_webgpu(renderer) if target_os == "android" else None
+    # iOS 侧走 WebKit 的隐私归一化输出：四个字段一律 "apple"（WebKit
+    # GPUAdapterInfo 的 Cocoa 实现把 vendor/architecture/device/description
+    # 全部抹成同一常量），宿主 Blink 透传的 "metal-3" + 空 device/description
+    # 是 macOS Metal 版本串，iOS 永不出现。
+    if target_os == "android":
+        webgpu = _android_webgpu(renderer)
+    elif target_os == "ios":
+        webgpu = {"vendor": "apple", "architecture": "apple",
+                  "device": "apple", "description": "apple"}
+    else:
+        webgpu = None
 
     # 媒体设备枚举（enumerateDevices）：真机 Android Chrome 至少枚举前后两个
     # 摄像头（videoinput ×2）；宿主 Mac 是单摄像头（×1），数量偏差可直接被
@@ -665,10 +686,11 @@ def derive_spec(fingerprint: dict, target_os: str,
         # 档案侧自定义值仍优先。
         merged = _codec_capability(target_os, av1=av1_capable)
         merged.update({str(k).lower(): v for k, v in codec_capability.items()})
-        # 机型能力位由运行期决定，不能被档案里的旧 '' 覆盖回去（存量档案
-        # 生成时未带 av1 分支）。
-        if av1_capable:
-            merged['video/mp4; codecs="av01.0.05m.08"'] = "probably"
+        # 机型能力位由运行期决定，不能被档案里的陈旧值覆盖（存量档案生成
+        # 时可能来自另一台机型）。两个方向都要钉死：非 AV1 机型上的
+        # av01='probably' 是假阳性（F-148），AV1 机型上的 '' 是假阴性。
+        merged['video/mp4; codecs="av01.0.05m.08"'] = (
+            "probably" if av1_capable else "")
         codec_capability = merged
 
     # WebGL 参数上限 / 扩展集：宿主是 Apple M 系列（16384 上限 + 桌面专属
@@ -761,8 +783,19 @@ def derive_spec(fingerprint: dict, target_os: str,
         "naturalLandscape": natural_landscape,
         # F-26/F-27：接口原型级成员差集（删除清单）
         "dropMembers": drop_members,
+        # 原型成员枚举顺序（见 mobile_fingerprints._IOS_PROTO_ORDER）
+        # 顺序表同时是成员白名单（重排实现会先删光再按序重建），所以 iPad
+        # 必须用含全屏族 7 名的变体，否则 Element.prototype 上会被整块删掉
+        # ——真机 iPad 有元素级全屏、iPhone 没有，同一份表覆盖不了两端。
+        "protoOrder": (
+            (_IOS_PROTO_ORDER_IPAD if _device_type == "tablet" else _IOS_PROTO_ORDER)
+            if target_os == "ios" else {}),
         # F-20：permissions.query 的真机口径表
         "permissions": _ios_permissions(target_os),
+        # F-94：getSupportedConstraints 的键集白名单（iOS 逐项回填，
+        # 桌面 Blink 是 36 项全集；按 Safari 17.x / 18.0+ 分两段）
+        "supportedConstraints": _ios_supported_constraints(
+            target_os, extra.get("osVersion")),
         # F-25/F-36：补成员清单（接口对象 / 原型成员 / 常量 / 事件处理器）
         # F-25/F-36：补成员清单（接口对象 / 原型成员 / 常量 / 事件处理器）
         "addMembers": _ios_add_members_gated(
@@ -1391,105 +1424,490 @@ _CPT_IOS_SRC = r"""function __cptIos(raw, opt) {
 }"""
 
 
-_WEBCODECS_ICS_SRC = r"""// ---- 编解码器能力判定（WebKit main 源码口径，F-133）----
-// 视频：WebCodecsVideoDecoder/Encoder.cpp isSupported*Codec——
-//   vp8* / avc1.* / vp09.*（profile 0 + 8bit）/ hev1.* / hvc1.*
-//   （WebCodecsHEVCEnabled，COCOA 默认 true）/ av01.0*
-//   （WebCodecsAV1Enabled，COCOA 默认 false、status: preview →
-//   出货版 Safari 不开，与机型有无 AV1 硬解无关）。
-// 音频：AudioDecoderCocoa::isCodecSupported 用前缀/精确匹配；
-//   AudioEncoder 的 mp4a 是精确串表 + 采样率区间。
+_WEBCODECS_ICS_SRC = r"""// ---- 编解码器能力判定（WebKit 26.5 出货基线实测口径，F-133 / F-146）----
+// 全部大小写敏感：'VP8' / 'AVC1.42001E' / 'MP4A.40.2' 一律不支持。
+// vp8 是整串精确匹配（'vp8.' / 'vp80' / 'vp8x' / 'vp08' 全 no）。
+// av01 在出货构建里是关的（WebCodecsAV1Enabled=false），与机型有无 AV1 硬解无关。
+var __wcHex = /^[0-9a-fA-F]+$/;
+var __wcTrim = function (s) {
+    return String(s).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
+};
+// avc1.<hex>：取点分后的首个非空段，去空白、容许前导 '+'，奇数位左补 0。
+// 首字节 = profile_idc（实测上限 0x64 = High）、末字节 = level_idc
+// （上限 0x34 = 5.2），中间 constraint 字节不限。
+//   avc1.42001E / avc1.640028 / avc1.4 / avc1.000034 → yes
+//   avc1.420035 / avc1.FF0034 / avc1.42001G / avc1.42 → no
+var __wcAvc1Ok = function (c) {
+    var segs = c.slice(5).split('.');
+    var s = null;
+    for (var i = 0; i < segs.length; i++) {
+        if (segs[i].length) { s = __wcTrim(segs[i]); break; }
+    }
+    if (s === null) { return false; }
+    if (s.charAt(0) === '+') { s = s.slice(1); }
+    if (!__wcHex.test(s)) { return false; }
+    if (s.length % 2) { s = '0' + s; }
+    return parseInt(s.slice(0, 2), 16) <= 0x64
+        && parseInt(s.slice(-2), 16) <= 0x34;
+};
+// vp09.<profile>...：出货版只校验 profile 的两位（'00' / '02'），其后随意。
+//   vp09.00 / vp09.02.10.10 / vp09.00.zzz → yes；vp09.0 / vp09.01 / vp09.10 → no
 var __wcVp9Ok = function (c) {
-    // vp09.<profile>.<level>.<bitDepth>
-    var p = c.split('.');
-    if (p.length < 4) { return false; }
-    var profile = parseInt(p[1], 10);
-    var depth = parseInt(p[3], 10);
-    // profile 2（10bit）另受 webRTCVP9Profile2CodecEnabled 门控，
-    // 出货版 WebCodecs 走不到 → 按 false。
-    return profile === 0 && depth === 8;
+    var p = c.slice(5, 7);
+    return p === '00' || p === '02';
+};
+// hev1./hvc1.<profile_idc>.<compat>.<tier><level>[.<constraint>...]
+//   profile_idc 1~4（'01' 也收，'06' 不收）；compat 为任意长度十六进制串；
+//   tier 为大写 L/H，level ≤ 186；其后每个 constraint 字节 0~2 位十六进制。
+var __wcHevcOk = function (c) {
+    var f = c.slice(5).split('.');
+    if (f.length < 3) { return false; }
+    var prof = __wcTrim(f[0]);
+    if (!/^[0-9]+$/.test(prof) || Number(prof) < 1 || Number(prof) > 4) {
+        return false;
+    }
+    var compat = __wcTrim(f[1]);
+    if (!compat || !__wcHex.test(compat)) { return false; }
+    var m = /^([LH])([0-9]+)$/.exec(f[2].replace(/[\t\n\f\r ]+$/, ''));
+    if (!m || Number(m[2]) > 186) { return false; }
+    for (var i = 3; i < f.length; i++) {
+        var b = __wcTrim(f[i]);
+        if (!b.length) { continue; }
+        if (b.length > 2 || !__wcHex.test(b)) { return false; }
+    }
+    return true;
 };
 var __wcPcmOk = function (c) {
-    var p = c.split('-');
-    return p.length === 2 && /^(u8|s16|s24|s32|f32)$/.test(p[1]);
+    return /^pcm-(u8|s16|s24|s32|f32)$/.test(c);
 };
+// ad / ae 的精确串表（实测）：mp4a.40.{2,02,5,05,29,42}、opus、alaw、ulaw、pcm-*。
+// flac / vorbis 两个面都不支持；mp3 只有解码侧支持。
+var __WC_AUDIO = ['mp4a.40.2', 'mp4a.40.02', 'mp4a.40.5', 'mp4a.40.05',
+                  'mp4a.40.29', 'mp4a.40.42', 'opus', 'alaw', 'ulaw'];
 var __wcCodecOk = function (codec, kind, cfg) {
     var c = String(codec || '');
-    var lc = c.toLowerCase();
     if (!c) { return false; }
     if (kind === 'vd' || kind === 've') {
-        return lc.indexOf('vp8') === 0
-            || lc.indexOf('avc1.') === 0
-            || (lc.indexOf('vp09.') === 0 && __wcVp9Ok(lc))
-            || lc.indexOf('hev1.') === 0
-            || lc.indexOf('hvc1.') === 0;
+        if (c === 'vp8') { return true; }
+        if (c.slice(0, 5) === 'avc1.') { return __wcAvc1Ok(c); }
+        if (c.slice(0, 5) === 'vp09.') { return __wcVp9Ok(c); }
+        if (c.slice(0, 5) === 'hev1.' || c.slice(0, 5) === 'hvc1.') {
+            return __wcHevcOk(c);
+        }
+        return false;
     }
-    if (kind === 'ad') {
-        return /^mp4a\.40\.(5|23|29|39)/.test(lc)
-            || lc.indexOf('mp4a') === 0
-            || lc === 'mp3' || lc === 'opus' || lc === 'alaw'
-            || lc === 'ulaw' || lc === 'flac' || lc === 'vorbis'
-            || (lc.indexOf('pcm-') === 0 && __wcPcmOk(lc));
-    }
-    // ae：mp4a 是精确串表（不吃 mp4a.40.6 之类）
-    var exact = /^(mp4a\.40\.(2|02|5|05|29|42)|mp3|opus|alaw|ulaw|flac|vorbis)$/
-        .test(lc);
-    if (!exact && !(lc.indexOf('pcm-') === 0 && __wcPcmOk(lc))) { return false; }
+    var known = __wcPcmOk(c) || __WC_AUDIO.indexOf(c) >= 0;
+    if (kind === 'ad') { return known || c === 'mp3'; }
+    if (!known) { return false; }
+    // 采样率区间是编码器侧独有的闸：实测 ad 在 1 / 2999 / 960000 上仍 supported。
     var sr = (cfg && cfg.sampleRate) ? Number(cfg.sampleRate) : 0;
     return sr >= 3000 && sr <= 384000;
 };
+// ---- F-147：isConfigSupported 的 WebIDL 转换层 ----
+// 宿主 Blink 走 V8 自己的字典转换，与 WebKit 的 JS*Dictionary 生成代码
+// 在三处不一致：同步抛 / 空字典判定 / [EnforceRange] 与必填成员的文案。
+// 这里按 WebKit IDL 逐成员复刻：字典转换 → 必填 → 有效性 → 能力 → 回显。
+var __WC_RANGE_U32 = [0, 4294967295];
+var __WC_RANGE_U64 = [0, 9007199254740991];
+// DOMString：Symbol 抛文案，其余走 String()（null → "null"、true → "true"）。
+var __wcStr = function (v) {
+    if (typeof v === 'symbol') {
+        throw new TypeError('Cannot convert a symbol to a string');
+    }
+    return String(v);
+};
+// [EnforceRange] 整数：非有限值按 NaN 报（实测 'abc' → NaN），越界报原值。
+var __wcRange = function (v, type, lo, hi) {
+    if (typeof v === 'symbol') {
+        throw new TypeError('Cannot convert a symbol to a number');
+    }
+    var n = Number(v);
+    if (!(n >= lo && n <= hi)) {
+        var shown = (typeof v === 'number' && n !== n) ? 'NaN' : String(n);
+        throw new TypeError('Value ' + shown + ' is outside the range ['
+                            + lo + ', ' + hi + ']');
+    }
+    return Math.floor(n);
+};
+// double：非有限值统一报 non-finite（不是 EnforceRange 文案）。
+var __wcDouble = function (v) {
+    if (typeof v === 'symbol') {
+        throw new TypeError('Cannot convert a symbol to a number');
+    }
+    var n = Number(v);
+    if (n !== n || n === Infinity || n === -Infinity) {
+        throw new TypeError('The provided value is non-finite');
+    }
+    return n;
+};
+// 枚举：显式 null 也走字符串转换（实测 null → "null" → Type error），
+// 只有 undefined 才按字典缺省处理。
+var __wcEnum = function (v, allowed) {
+    if (v === undefined) { return null; }
+    var s = __wcStr(v);
+    if (allowed.indexOf(s) < 0) { throw new TypeError('Type error'); }
+    return s;
+};
+// 可空枚举（VideoColorSpaceInit 的四个成员都是 `Enum?`）：null 是合法值。
+var __wcEnumN = function (v, allowed) {
+    if (v === undefined || v === null) { return null; }
+    return __wcEnum(v, allowed);
+};
+var __wcIsBuf = function (v) {
+    return (typeof ArrayBuffer === 'function' && v instanceof ArrayBuffer)
+        || (typeof SharedArrayBuffer === 'function' && v instanceof SharedArrayBuffer)
+        || (typeof ArrayBuffer.isView === 'function' && ArrayBuffer.isView(v));
+};
+// AllowSharedBufferSource：裸 ArrayBuffer 原样回显；视图回显成同一 buffer 上的
+// 新视图（实测 d !== 源视图，但 d.buffer === 源.buffer、byteOffset/长度/原型一致）。
+// 已转移的 buffer 交给有效性判定报 Config is not valid，这里不抛。
+var __wcBuf = function (v) {
+    if (v === undefined) { return null; }
+    if (v === null || !__wcIsBuf(v)) { throw new TypeError('Type error'); }
+    if (typeof ArrayBuffer === 'function' && v instanceof ArrayBuffer) { return v; }
+    if (typeof SharedArrayBuffer === 'function' && v instanceof SharedArrayBuffer) {
+        return v;
+    }
+    if (__wcIsDetached(v)) { return v; }
+    var len = (typeof DataView === 'function' && v instanceof DataView)
+        ? v.byteLength : v.length;
+    try {
+        return new v.constructor(v.buffer, v.byteOffset, len);
+    } catch (e) {
+        return v;
+    }
+};
+var __wcIsDetached = function (b) {
+    if (!b) { return false; }
+    try {
+        if (typeof ArrayBuffer === 'function' && b instanceof ArrayBuffer) {
+            // 已转移的 ArrayBuffer 上做视图构造会抛，用 slice 探测。
+            new Uint8Array(b, 0, 0);
+            return false;
+        }
+        return b.buffer ? __wcIsDetached(b.buffer) : false;
+    } catch (e) { return true; }
+};
+var __WC_PRIMARIES = ['bt709', 'bt470bg', 'smpte170m', 'bt470m', 'smpte240m',
+                      'film', 'bt2020', 'smpteSt4281', 'smpteRp431', 'smpte432',
+                      'jedecP22Phosphors', 'unspecified'];
+var __WC_TRANSFER = ['bt709', 'smpte170m', 'iec61966-2-1', 'gamma22curve',
+                     'gamma28curve', 'smpte240m', 'linear', 'log', 'logSqrt',
+                     'iec6196624', 'bt1361ExtendedColourGamut', 'bt2020_10bit',
+                     'bt2020_12bit', 'pq', 'smpteSt4281', 'hlg', 'unspecified'];
+var __WC_MATRIX = ['rgb', 'bt709', 'bt470bg', 'smpte170m', 'smpte240m', 'fcc',
+                   'yCgCo', 'bt2020-ncl', 'bt2020-cl', 'unspecified'];
+var __WC_HWACCEL = ['no-preference', 'prefer-hardware', 'prefer-software'];
+// VideoColorSpaceInit：四个成员全是 nullable，回显恒为四项齐全的对象。
+var __wcColorSpace = function (v) {
+    if (v === undefined) { return null; }
+    if (v === null) {
+        return { fullRange: null, matrix: null, primaries: null, transfer: null };
+    }
+    if (typeof v !== 'object' && typeof v !== 'function') {
+        throw new TypeError('Type error');
+    }
+    // 回显对象的键序是字典序（实测 WebKit 按此序列化），子字典同理。
+    var out = {};
+    out.fullRange = (v.fullRange === undefined || v.fullRange === null)
+        ? null : !!v.fullRange;
+    out.matrix = __wcEnumN(v.matrix, __WC_MATRIX);
+    out.primaries = __wcEnumN(v.primaries, __WC_PRIMARIES);
+    out.transfer = __wcEnumN(v.transfer, __WC_TRANSFER);
+    return out;
+};
+var __wcOpus = function (v) {
+    if (v === undefined) { return null; }
+    var o = (v === null) ? {} : v;
+    if (typeof o !== 'object' && typeof o !== 'function') {
+        throw new TypeError('Type error');
+    }
+    return {
+        complexity: (o.complexity === undefined || o.complexity === null)
+            ? 9 : __wcRange(o.complexity, 'u32', __WC_RANGE_U32[0], __WC_RANGE_U32[1]),
+        format: __wcEnum(o.format, ['opus', 'ogg']) || 'opus',
+        frameDuration: (o.frameDuration === undefined || o.frameDuration === null)
+            ? 20000 : __wcRange(o.frameDuration, 'u64', __WC_RANGE_U64[0], __WC_RANGE_U64[1]),
+        packetlossperc: (o.packetlossperc === undefined || o.packetlossperc === null)
+            ? 0 : __wcRange(o.packetlossperc, 'u32', __WC_RANGE_U32[0], __WC_RANGE_U32[1]),
+        usedtx: !!o.usedtx,
+        useinbandfec: !!o.useinbandfec,
+    };
+};
+var __wcAac = function (v) {
+    if (v === undefined) { return null; }
+    var o = (v === null) ? {} : v;
+    if (typeof o !== 'object' && typeof o !== 'function') {
+        throw new TypeError('Type error');
+    }
+    return { format: __wcEnum(o.format, ['aac', 'adts']) || 'aac' };
+};
+var __wcFlac = function (v) {
+    if (v === undefined) { return null; }
+    var o = (v === null) ? {} : v;
+    if (typeof o !== 'object' && typeof o !== 'function') {
+        throw new TypeError('Type error');
+    }
+    return {
+        blockSize: (o.blockSize === undefined || o.blockSize === null)
+            ? 0 : __wcRange(o.blockSize, 'u32', __WC_RANGE_U32[0], __WC_RANGE_U32[1]),
+        compressLevel: (o.compressLevel === undefined || o.compressLevel === null)
+            ? 5 : __wcRange(o.compressLevel, 'u32', __WC_RANGE_U32[0], __WC_RANGE_U32[1]),
+    };
+};
+var __wcAvc = function (v) {
+    if (v === undefined) { return null; }
+    var o = (v === null) ? {} : v;
+    if (typeof o !== 'object' && typeof o !== 'function') {
+        throw new TypeError('Type error');
+    }
+    return { format: __wcEnum(o.format, ['annexb', 'avc']) || 'avc' };
+};
+var __wcHevc = function (v) {
+    if (v === undefined) { return null; }
+    var o = (v === null) ? {} : v;
+    if (typeof o !== 'object' && typeof o !== 'function') {
+        throw new TypeError('Type error');
+    }
+    return { format: __wcEnum(o.format, ['annexb', 'hevc']) || 'hevc' };
+};
+var __wcOptInt = function (cfg, k, type, lo, hi) {
+    if (cfg[k] === undefined) { return undefined; }
+    return __wcRange(cfg[k], type, lo, hi);
+};
+var __wcReqInt = function (cfg, iface, k) {
+    if (cfg[k] === undefined) {
+        throw new TypeError('Member ' + iface + '.' + k
+                            + ' is required and must be an instance of unsigned long');
+    }
+    return __wcRange(cfg[k], 'u32', __WC_RANGE_U32[0], __WC_RANGE_U32[1]);
+};
+// 必填 DOMString：undefined 报文案；null 走 String() → "null"（实测如此）。
+var __wcReqStr = function (cfg, iface, k) {
+    if (cfg[k] === undefined) {
+        throw new TypeError('Member ' + iface + '.' + k
+                            + ' is required and must be an instance of DOMString');
+    }
+    return __wcStr(cfg[k]);
+};
+// 字典参数本身：undefined/null/数组/函数都按空字典处理（WebIDL 口径），
+// 只有原始值才 Type error。
+var __wcDict = function (v) {
+    if (v === undefined || v === null) { return {}; }
+    if (typeof v !== 'object' && typeof v !== 'function') {
+        throw new TypeError('Type error');
+    }
+    return v;
+};
+var __wcBlank = function (s) { return !String(s).replace(/[\t\n\f\r ]/g, ''); };
 var __wcSorted = function (o) {
     var out = {};
     Object.keys(o).sort().forEach(function (k) { out[k] = o[k]; });
     return out;
 };
-var __wcSupportResult = function (cfg, supported, fill) {
+// 回显只含 IDL 声明过的成员；undefined 的省略，null 的按各自转换结果。
+var __wcSupportResult = function (cfg, supported) {
     var out = {};
-    if (cfg && typeof cfg === 'object') {
-        for (var k in cfg) {
-            if (Object.prototype.hasOwnProperty.call(cfg, k)) { out[k] = cfg[k]; }
-        }
-    }
-    (fill || []).forEach(function (pair) {
-        if (!(pair[0] in out)) { out[pair[0]] = pair[1]; }
+    Object.keys(cfg).forEach(function (k) {
+        if (cfg[k] !== undefined) { out[k] = cfg[k]; }
     });
     return Promise.resolve({ config: __wcSorted(out), supported: !!supported });
 };
-// 真机必填项缺失时抛 WebKit 文案的 TypeError（实测
-// `Member WebCodecsAudioDecoderConfig.numberOfChannels is required and
-// must be an instance of unsigned long`）。
-var __wcReq = function (cfg, iface, member, type) {
-    if (cfg && cfg[member] !== undefined && cfg[member] !== null) { return; }
-    throw new TypeError('Member ' + iface + '.' + member
-                        + ' is required and must be an instance of ' + type);
+// ---- 各接口的字典转换 ----
+// 必填成员的报错顺序是字典内成员名的字典序（实测 ve 缺宽高先报 height、
+// ad 缺声道采样率先报 numberOfChannels），非 IDL 声明顺序；这里按序读。
+var __wcConv = {
+    VideoEncoder: function (iface, raw) {
+        var cfg = {};
+        cfg.codec = __wcReqStr(raw, iface, 'codec');
+        cfg.height = __wcReqInt(raw, iface, 'height');
+        cfg.width = __wcReqInt(raw, iface, 'width');
+        cfg.displayWidth = __wcOptInt(raw, 'displayWidth', 'u32',
+                                      __WC_RANGE_U32[0], __WC_RANGE_U32[1]);
+        cfg.displayHeight = __wcOptInt(raw, 'displayHeight', 'u32',
+                                       __WC_RANGE_U32[0], __WC_RANGE_U32[1]);
+        cfg.bitrate = __wcOptInt(raw, 'bitrate', 'u64',
+                                 __WC_RANGE_U64[0], __WC_RANGE_U64[1]);
+        if (raw.framerate !== undefined) { cfg.framerate = __wcDouble(raw.framerate); }
+        cfg.hardwareAcceleration = __wcEnum(raw.hardwareAcceleration, __WC_HWACCEL) || 'no-preference';
+        cfg.alpha = __wcEnum(raw.alpha, ['keep', 'discard']) || 'discard';
+        if (raw.scalabilityMode !== undefined) {
+            cfg.scalabilityMode = __wcStr(raw.scalabilityMode);
+        }
+        cfg.bitrateMode = __wcEnum(raw.bitrateMode, ['constant', 'variable']) || 'variable';
+        cfg.latencyMode = __wcEnum(raw.latencyMode, ['quality', 'realtime']) || 'quality';
+        if (raw.avc !== undefined) { cfg.avc = __wcAvc(raw.avc); }
+        if (raw.hevc !== undefined) { cfg.hevc = __wcHevc(raw.hevc); }
+        return cfg;
+    },
+    VideoDecoder: function (iface, raw) {
+        var cfg = {};
+        cfg.codec = __wcReqStr(raw, iface, 'codec');
+        if (raw.description !== undefined) { cfg.description = __wcBuf(raw.description); }
+        cfg.codedWidth = __wcOptInt(raw, 'codedWidth', 'u32',
+                                    __WC_RANGE_U32[0], __WC_RANGE_U32[1]);
+        cfg.codedHeight = __wcOptInt(raw, 'codedHeight', 'u32',
+                                     __WC_RANGE_U32[0], __WC_RANGE_U32[1]);
+        cfg.displayAspectWidth = __wcOptInt(raw, 'displayAspectWidth', 'u32',
+                                            __WC_RANGE_U32[0], __WC_RANGE_U32[1]);
+        cfg.displayAspectHeight = __wcOptInt(raw, 'displayAspectHeight', 'u32',
+                                             __WC_RANGE_U32[0], __WC_RANGE_U32[1]);
+        if (raw.colorSpace !== undefined) { cfg.colorSpace = __wcColorSpace(raw.colorSpace); }
+        cfg.hardwareAcceleration = __wcEnum(raw.hardwareAcceleration, __WC_HWACCEL) || 'no-preference';
+        if (raw.optimizeForLatency !== undefined) {
+            cfg.optimizeForLatency = !!raw.optimizeForLatency;
+        }
+        return cfg;
+    },
+    AudioDecoder: function (iface, raw) {
+        var cfg = {};
+        cfg.codec = __wcReqStr(raw, iface, 'codec');
+        cfg.numberOfChannels = __wcReqInt(raw, iface, 'numberOfChannels');
+        cfg.sampleRate = __wcReqInt(raw, iface, 'sampleRate');
+        if (raw.description !== undefined) { cfg.description = __wcBuf(raw.description); }
+        return cfg;
+    },
+    AudioEncoder: function (iface, raw) {
+        var cfg = {};
+        cfg.codec = __wcReqStr(raw, iface, 'codec');
+        cfg.numberOfChannels = __wcReqInt(raw, iface, 'numberOfChannels');
+        cfg.sampleRate = __wcReqInt(raw, iface, 'sampleRate');
+        cfg.bitrate = __wcOptInt(raw, 'bitrate', 'u64',
+                                 __WC_RANGE_U64[0], __WC_RANGE_U64[1]);
+        cfg.bitrateMode = __wcEnum(raw.bitrateMode, ['constant', 'variable']) || 'variable';
+        if (raw.opus !== undefined) { cfg.opus = __wcOpus(raw.opus); }
+        if (raw.aac !== undefined) { cfg.aac = __wcAac(raw.aac); }
+        if (raw.flac !== undefined) { cfg.flac = __wcFlac(raw.flac); }
+        return cfg;
+    },
+};
+// ---- 有效性判定（isValid*Config，返回 false 时统一 Config is not valid）----
+var __wcValid = {
+    // WebCodecsVideoEncoder.cpp isValidEncoderConfig：codec 去空白非空 →
+    // width → height → displayWidth → displayHeight（顺序即报错顺序）。
+    VideoEncoder: function (cfg) {
+        return !__wcBlank(cfg.codec) && !!cfg.width && !!cfg.height
+            && !!(cfg.displayWidth === undefined ? cfg.width : cfg.displayWidth)
+            && !!(cfg.displayHeight === undefined ? cfg.height : cfg.displayHeight);
+    },
+    // WebCodecsVideoDecoder.cpp isValidDecoderConfig 1~6 条。
+    VideoDecoder: function (cfg) {
+        if (__wcBlank(cfg.codec)) { return false; }
+        if (!!cfg.codedWidth !== !!cfg.codedHeight) { return false; }
+        if (cfg.codedWidth === 0 || cfg.codedHeight === 0) { return false; }
+        if (!!cfg.displayAspectWidth !== !!cfg.displayAspectHeight) { return false; }
+        if (cfg.displayAspectWidth === 0 || cfg.displayAspectHeight === 0) { return false; }
+        if (cfg.description && __wcIsDetached(cfg.description)) { return false; }
+        return true;
+    },
+    // WebCodecsAudioDecoder.cpp isValidDecoderConfig：codec → detached →
+    // 声道/采样率 → description 非空（空 description 判失败）→ opus 多声道。
+    AudioDecoder: function (cfg) {
+        if (__wcBlank(cfg.codec)) { return false; }
+        if (cfg.description && __wcIsDetached(cfg.description)) { return false; }
+        if (!cfg.numberOfChannels || !cfg.sampleRate) { return false; }
+        var len = 0;
+        if (cfg.description) {
+            len = cfg.description.byteLength !== undefined
+                ? cfg.description.byteLength : cfg.description.length || 0;
+        }
+        if (cfg.description && !len) { return false; }
+        if (cfg.codec === 'opus' && cfg.numberOfChannels > 2 && len < 10) { return false; }
+        return true;
+    },
+    // WebCodecsAudioEncoder.cpp isValidEncoderConfig：codec → 声道/采样率 →
+    // bitrate 上限 INT_MAX / 非零 → opus 区间 → opus/flac 子字典。
+    AudioEncoder: function (cfg) {
+        if (__wcBlank(cfg.codec)) { return false; }
+        if (!cfg.sampleRate || !cfg.numberOfChannels) { return false; }
+        if (cfg.bitrate !== undefined && cfg.bitrate > 2147483647) { return false; }
+        if (cfg.bitrate !== undefined && !cfg.bitrate) { return false; }
+        if (cfg.codec === 'opus' && cfg.bitrate !== undefined
+                && (cfg.bitrate < 6000 || cfg.bitrate > 510000)) { return false; }
+        if (cfg.opus) {
+            var ms = cfg.opus.frameDuration / 1000;
+            var okMs = [2.5, 5, 10, 20, 40, 60, 120].some(function (x) {
+                return Math.abs(x - ms) < 1e-6;
+            });
+            if (!okMs || cfg.opus.complexity > 10 || cfg.opus.packetlossperc > 100) {
+                return false;
+            }
+        }
+        if (cfg.flac && (cfg.flac.blockSize < 16 || cfg.flac.blockSize > 65535
+                         || cfg.flac.compressLevel > 8)) { return false; }
+        return true;
+    },
+};
+// 编码器侧的 avc1 不走上面那套宽松解析：平台编码器要求整串是六个十六进制
+// 位，profile ∈ {42, 4D, 58, 64}，constraint 字节与 level 各有一张白名单。
+//   avc1.42001E / avc1.42E01E / avc1.640C1E / avc1.58A01E → yes
+//   avc1.42 / avc1.4 / avc1.6400 / avc1.64081E / avc1.42E017 → no
+var __WC_AVC1_ENC_LEVEL = [10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52];
+var __WC_AVC1_ENC_CONS = {
+    '42': [0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70,
+           0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0],
+    '4D': [0x00, 0x10, 0x40, 0x50, 0x80, 0x90, 0xA0, 0xB0,
+           0xC0, 0xD0, 0xE0, 0xF0],
+    '58': [0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0],
+    '64': [0x00, 0x0C],
+};
+var __wcAvc1EncOk = function (c) {
+    var s = c.slice(5).toUpperCase();
+    if (!/^[0-9A-F]{6}$/.test(s)) { return false; }
+    var prof = s.slice(0, 2);
+    var cons = __WC_AVC1_ENC_CONS[prof];
+    if (!cons) { return false; }
+    return cons.indexOf(parseInt(s.slice(2, 4), 16)) >= 0
+        && __WC_AVC1_ENC_LEVEL.indexOf(parseInt(s.slice(4, 6), 16)) >= 0;
+};
+// ---- 能力判定（isSupported*Codec，WebKit 26.5 出货基线实测口径）----
+// 出货版没有 maxFrameDimension 那道闸（32767 是 main 新加的），实测上限来自
+// 平台编码器本身：vp8 单边 16383、avc1 只要求偶数边、其余无上限；解码侧
+// 一律不设上限（实测到 262144 仍 true）。
+var __wcVp8Cap = 16383;
+var __wcCapOk = function (kind, cfg) {
+    // 多声道 opus 解码要求 10 字节以上的 description；不足时有效性已判失败，
+    // 够长时仍走不到平台解码器 → supported false（实测 3 声道恒 false）。
+    if (kind === 'ad') {
+        return !(cfg.codec === 'opus' && cfg.numberOfChannels > 2);
+    }
+    if (kind !== 've') { return true; }
+    var c = cfg.codec;
+    if (c === 'vp8') {
+        return cfg.width <= __wcVp8Cap && cfg.height <= __wcVp8Cap;
+    }
+    if (c.indexOf('avc1.') === 0) {
+        return !(cfg.width % 2) && !(cfg.height % 2) && __wcAvc1EncOk(c);
+    }
+    return true;
+};
+// createVideoEncoderConfig 里会把整份配置判成不支持的几项（异常被
+// isConfigSupported 吞成 resolve(false)，不是 reject）。
+var __wcEncoderCreatable = function (cfg) {
+    if (cfg.alpha === 'keep') { return false; }
+    if (cfg.scalabilityMode !== undefined
+            && ['L1T1', 'L1T2', 'L1T3'].indexOf(cfg.scalabilityMode) < 0) {
+        return false;
+    }
+    return true;
 };
 var __wcIcsImpl = function (name, kind) {
     return function (t, args) {
-        var cfg = args[0];
-        if (cfg === undefined || cfg === null) {
-            throw new TypeError('Not enough arguments');
-        }
-        if (typeof cfg !== 'object') { throw new TypeError('Type error'); }
+        // WebKit 从不同步抛：所有失败都走 rejected promise。
         var iface = 'WebCodecs' + name + 'Config';
-        __wcReq(cfg, iface, 'codec', 'DOMString');
-        if (kind === 'ad' || kind === 'ae') {
-            // 实测校验顺序：codec → numberOfChannels → sampleRate
-            __wcReq(cfg, iface, 'numberOfChannels', 'unsigned long');
-            __wcReq(cfg, iface, 'sampleRate', 'unsigned long');
-            if (!cfg.sampleRate) { throw new TypeError('Config is not valid'); }
-            return __wcSupportResult(cfg, __wcCodecOk(cfg.codec, kind, cfg),
-                (kind === 'ae') ? [['bitrateMode', 'variable']] : []);
+        try {
+            if (!args.length) { throw new TypeError('Not enough arguments'); }
+            var cfg = __wcConv[name](iface, __wcDict(args[0]));
+            if (!__wcValid[name](cfg)) {
+                throw new TypeError('Config is not valid');
+            }
+            return __wcSupportResult(cfg, __wcCodecOk(cfg.codec, kind, cfg)
+                                             && __wcCapOk(kind, cfg)
+                                             && (kind !== 've'
+                                                 || __wcEncoderCreatable(cfg)));
+        } catch (e) {
+            return Promise.reject(e);
         }
-        if (kind === 've') {
-            __wcReq(cfg, iface, 'width', 'unsigned long');
-            __wcReq(cfg, iface, 'height', 'unsigned long');
-            return __wcSupportResult(cfg, __wcCodecOk(cfg.codec, kind, cfg),
-                [['alpha', 'discard'], ['bitrateMode', 'variable'],
-                 ['hardwareAcceleration', 'no-preference'],
-                 ['latencyMode', 'quality']]);
-        }
-        return __wcSupportResult(cfg, __wcCodecOk(cfg.codec, kind, cfg),
-            [['hardwareAcceleration', 'no-preference']]);
     };
 };
 var __wcIcsKind = function (name) {
@@ -2501,6 +2919,7 @@ _FONT_FACE_SRC = r"""var __ffWrap = (function () {
 })();
 """
 
+
 _PATCH_TEMPLATE = r"""
 (function () {
     var D;
@@ -2518,6 +2937,15 @@ __MC_SRC__
 __FF_SRC__
 
     // ---- 原生函数伪装：toString() 一律返回 [native code] 外观 ----
+    // F-162：`faked` 必须是**对原生函数的 Proxy**，不能是普通 JS 函数。
+    // 普通函数的源码本身可被读出：creepjs 的 `failed toString` 判据第二条是
+    //   scope.Function.prototype.toString.call(apiFunction.toString)
+    // ——每个函数的 `.toString` 都指向 Function.prototype.toString，一旦它被
+    // 换成 JS 函数，这条检查在任何函数上都读到那坨源码，于是 `lieProps` 里
+    // 每个被搜索的 API 都被记为 lie（实测 10 行标红：Timezone/Screen/Canvas/
+    // Fonts/Math/Navigator/WebGL/Audio/DOMRect/SVGRect）。Proxy 的 target 是
+    // 原生函数，apply 陷阱只在**本 realm 主动调用**时生效，跨 realm 直接
+    // toString 仍由原生实现作答（`function () { [native code] }`）。
     var __maskNative = (function () {
         try {
             var origToString = Function.prototype.toString;
@@ -2551,8 +2979,8 @@ __FF_SRC__
                     return __nativeToString(target, self);
                 },
             });
-            var __nativeToStringTail = function () {
-                var s = origToString.call(this);
+            var __nativeToString = function (target, self) {
+                var s = target.call(self);
                 // JSC 的原生函数是 `function f() {\n    [native code]\n}`（多行缩进），
                 // V8 是单行 `function f() { [native code] }`。未登记（未被本补丁
                 // 包装）的原生函数直接透传会暴露 V8 格式——检测站对
@@ -2649,10 +3077,39 @@ __FF_SRC__
         }
         return false;
     };
+    // 接收者校验的**文案**（不是是否抛）：iOS 的 WebKit 逐成员给出接口名
+    //   getter → The X.m getter can only be used on instances of X
+    //   setter → The X.m setter can only be used on instances of X
+    //   方法   → Can only call X.m on instances of X
+    // Android 目标是 Blink，统一就是 Illegal invocation，保持原样。
+    // 接口名取 proto.constructor.name：WebKit 每个接口原型都挂着自己的构造器
+    // （实测 /tmp/f506，九类接口全部命中）；取不到就退回 Blink 文案，不冒险。
+    var __ifaceName = function (proto) {
+        try {
+            var c = proto && proto.constructor;
+            if (typeof c === 'function' && c.prototype === proto && c.name) {
+                return String(c.name);
+            }
+        } catch (e) {}
+        return null;
+    };
+    var __brandErr = function (proto, member, kind) {
+        var iface = (D && D.ios) ? __ifaceName(proto) : null;
+        if (!iface) { return new TypeError('Illegal invocation'); }
+        if (kind === 'method') {
+            return new TypeError('Can only call ' + iface + '.' + member
+                                 + ' on instances of ' + iface);
+        }
+        return new TypeError('The ' + iface + '.' + member + ' ' + kind
+                             + ' can only be used on instances of ' + iface);
+    };
+
     var defineGet = function (proto, name, value) {
         try {
             var getter = __maskNative(function () {
-                if (!__slotHas(proto, this)) { throw new TypeError('Illegal invocation'); }
+                if (!__slotHas(proto, this)) {
+                    throw __brandErr(proto, name, 'getter');
+                }
                 return value;
             }, 'get ' + name);
             Object.defineProperty(proto, name, {
@@ -2679,7 +3136,7 @@ __FF_SRC__
             if (!noBrand && __isIfaceProto(proto)) {
                 impl = function () {
                     if (!__slotHas(proto, this)) {
-                        throw new TypeError('Illegal invocation');
+                        throw __brandErr(proto, name, 'method');
                     }
                     return fn.apply(this, arguments);
                 };
@@ -2721,7 +3178,7 @@ __FF_SRC__
             if (__isIfaceProto(proto)) {
                 impl = function () {
                     if (!__slotHas(proto, this)) {
-                        throw new TypeError('Illegal invocation');
+                        throw __brandErr(proto, name, 'method');
                     }
                     return fn.apply(this, arguments);
                 };
@@ -2735,18 +3192,23 @@ __FF_SRC__
     };
     // window 上的 [Replaceable] 属性（devicePixelRatio/outerWidth 等）：
     // 原生是「get/set 均存在、赋值时自我替换为数据属性」，保持同样形态。
-    // 原生访问器同样校验接收者，故这里也走 __slotHas。
+    // 原生访问器同样校验接收者，故这里也走 __slotHas；文案按内核分流——
+    // WebKit 抛 `The Window.<name> getter can only be used on instances of
+    // Window`（/tmp/f600 实测），Blink 抛 `Illegal invocation`。
     var replaceable = function (obj, name, value) {
         if (!obj) { return false; }
         var brand;
         try { brand = Object.getPrototypeOf(obj); } catch (e) { brand = null; }
+        var brandErr = function (kind) {
+            return __brandErr(brand, name, kind);
+        };
         try {
             var getter = __maskNative(function () {
-                if (!__slotHas(brand, this)) { throw new TypeError('Illegal invocation'); }
+                if (!__slotHas(brand, this)) { throw brandErr('getter'); }
                 return value;
             }, 'get ' + name);
             var setter = __maskNative(function (v) {
-                if (!__slotHas(brand, this)) { throw new TypeError('Illegal invocation'); }
+                if (!__slotHas(brand, this)) { throw brandErr('setter'); }
                 try {
                     Object.defineProperty(obj, name, {
                         value: v, writable: true, enumerable: true, configurable: true,
@@ -3892,26 +4354,74 @@ __FF_SRC__
                 __wf['-webkit-overflow-scrolling'] = {
                     camel: 'webkitOverflowScrolling', values: ['auto', 'touch'],
                 };
+                // F-162：-webkit-text-orientation 不是独立属性，而是
+                // text-orientation 的**级联别名**（WebKit CSSProperties.json
+                // 的 aliases 表）。真机只有一个存储槽：cssText / item() 都
+                // 序列化成无前缀名，读写/删除/优先级 API 双向互通（/tmp/f519、
+                // /tmp/f521、/tmp/f526、/tmp/f529 实测）。前缀名独有
+                // sideways-right 输入（归一为 sideways），无前缀名拒收。
+                // 故不能走 __wf 私有存储（那会造出 Blink 没有的第二个槽）。
+                // Blink 自带前缀名解析，但落在**自己的**前缀槽里：cssText 与
+                // item() 序列化成 -webkit- 名、无前缀 API 读不到——所以只
+                // 改写前缀名一侧，转发到无前缀名。
+                var __cssAlias = Object.create(null);
+                __cssAlias['-webkit-text-orientation'] = {
+                    key: 'text-orientation',
+                    camel: 'webkitTextOrientation',
+                    camel2: 'textOrientation',
+                    // 前缀名独有的输入名，序列化归一。
+                    canon: { 'sideways-right': 'sideways' },
+                };
+                // F-162：另外两个同批属性也是级联别名（/tmp/f541、/tmp/f542
+                // 实测：真机前缀名与无前缀名同槽，cssText / item() 序列化成
+                // 无前缀名，四个 API 双向互通）。Blink 原生就有这两个无前缀名
+                // 且值域一致，故只改写前缀名一侧即可。
+                __cssAlias['-webkit-text-underline-position'] = {
+                    key: 'text-underline-position',
+                    camel: 'webkitTextUnderlinePosition',
+                    // 真机按**调用名**决定 removeProperty 返回值：本属性两个
+                    // 名字都返回存储值（text-orientation / decoration-skip 的
+                    // 前缀名则返回 ""），/tmp/f544。
+                    removeReturnsValue: true,
+                };
+                __cssAlias['-webkit-text-decoration-skip'] = {
+                    key: 'text-decoration-skip-ink',
+                    camel: 'webkitTextDecorationSkip',
+                    // 真机把 ink 读回归一为 auto；无前缀名拒收 ink。
+                    canon: { 'ink': 'auto' },
+                };
+                // F-166：-webkit-hyphens 也是级联别名（CSSProperties.json
+                // aliases → hyphens），真机两个名字同槽、序列化成 hyphens、
+                // 两个名字的 removeProperty 都返回存储值（/tmp/f553）。但它
+                // **不能走别名转发**：转发会让内核自己持有 hyphens 槽，而
+                // 内核的索引属性是实例自有数据属性、不可删改（/tmp/f583），
+                // 会遮蔽本文件的数字索引访问器，声明序就丢了（/tmp/f582
+                // `step4`：真机把 hyphens 排在 margin-trim 之后，转发后它
+                // 落在内核序里）。故走 __cssAllow 的私有存储，见下方
+                // __cssAllow['-webkit-hyphens'] 与 __cssCamelExtra。
+                // 真机无前缀名拒收 sideways-right（/tmp/f529：WK
+                // text-orientation: sideways-right → len0，Blink 收下）。
+                var __cssAliasReject = Object.create(null);
+                __cssAliasReject['text-orientation'] = { 'sideways-right': 1 };
+                // 只有驼峰、没有级联别名的 WebKit 专有属性（F-162 同批）。
+                // underline-position / decoration-skip 已在 __cssAlias 里带
+                // camel，不重复登记（重复会让 __aliasCamel 跑两遍）。
+                // F-163：marginTrim / textAutospace 真机也有驼峰访问器
+                // （/tmp/f564），Blink 两项都没有。
+                var __cssCamelExtra = {
+                    '-webkit-nbsp-mode': 'webkitNbspMode',
+                    'margin-trim': 'marginTrim',
+                    'text-autospace': 'textAutospace',
+                    // F-166：-webkit-hyphens 已退出 __cssAlias（见上），驼峰
+                    // 名不再由别名循环补齐，在此登记。
+                    '-webkit-hyphens': 'webkitHyphens',
+                };
                 var __cssStore = new WeakMap();
-                // F-98：-apple-pay-button-style 在真机有驼峰访问器
-                // （applePayButtonStyle），其余专有属性的驼峰名在 WebKit 27.2
-                // 上已不存在（marginTrim / webkitBackdropFilter 均 null），不补。
-                try {
-                    if (!Object.getOwnPropertyDescriptor(
-                            CSSStyleDeclaration.prototype, 'applePayButtonStyle')) {
-                        Object.defineProperty(
-                            CSSStyleDeclaration.prototype, 'applePayButtonStyle', {
-                                configurable: true, enumerable: false,
-                                get: __maskNative(function () {
-                                    return this.getPropertyValue(
-                                        '-apple-pay-button-style');
-                                }, 'get applePayButtonStyle'),
-                                set: __maskNative(function (v) {
-                                    this.setProperty('-apple-pay-button-style', v);
-                                }, 'set applePayButtonStyle'),
-                            });
-                    }
-                } catch (e) {}
+                // F-163：__cssAllow 表命中项在真机同样有优先级槽（
+                // `-webkit-nbsp-mode: space !important` 的 getPropertyPriority
+                // 回读 "important"、cssText 带 `!important`，/tmp/f564）。
+                // 私有存储另存一份优先级。
+                var __cssPrio = new WeakMap();
                 // F-98：声明 → 插入序（规范名），供 length/item 合并枚举。
                 // __csOwner 在模板顶层声明（CSSOM 补丁与 getComputedStyle
                 // 包装不在同一作用域）。
@@ -3938,6 +4448,9 @@ __FF_SRC__
                     }
                     return s;
                 };
+                var __wfCanon = function (info, value) {
+                    return String(value).trim().toLowerCase();
+                };
                 for (var __wk in __wf) {
                     (function (key, info) {
                         try {
@@ -3954,7 +4467,7 @@ __FF_SRC__
                                 }, 'get ' + info.camel),
                                 set: __maskNative(function (v) {
                                     if (__wfValueOk(info, v)) {
-                                        __wfStore(this)[key] = String(v).trim().toLowerCase();
+                                        __wfStore(this)[key] = __wfCanon(info, v);
                                     }
                                 }, 'set ' + info.camel),
                             });
@@ -3977,36 +4490,101 @@ __FF_SRC__
                 // -webkit-hyphens 序列化为 hyphens（CSSProperties.json 的别名
                 // 目标），其余保持原名。
                 var __cssCanon = function (key) {
+                    if (__cssAlias[key]) { return __cssAlias[key].key; }
                     return key === '-webkit-hyphens' ? 'hyphens' : key;
                 };
                 var __cssStore_put = function (decl, key, val) {
                     __wfStore(decl)[key] = val;
                 };
+                var __cssPrioSet = function (decl, key, prio) {
+                    var p = __cssPrio.get(decl);
+                    if (!p) { p = Object.create(null); __cssPrio.set(decl, p); }
+                    if (prio) { p[key] = prio; } else { delete p[key]; }
+                };
+                var __cssPrioGet = function (decl, key) {
+                    var p = __cssPrio.get(decl);
+                    return (p && p[key]) || '';
+                };
+                // F-98：声明序里的规范名 → 私有存储键。级联别名的前缀名
+                // 与无前缀名同槽，存储键取前缀形态（__cssAllow 表的历史
+                // 口径），声明序里则一律是无前缀规范名。CSSOM 的读写入口
+                // 也用它做同一套同槽归一（hyphens 两个拼写共用一个私有槽）。
+                var __f98Key = function (name) {
+                    return name === 'hyphens' ? '-webkit-hyphens' : name;
+                };
+                // 只列私有存储里确有值的项——getAttribute / hasAttribute 靠
+                // 它判断「内核槽之外还有声明」。
                 var __f98Stored = function (decl) {
                     var o = __cssOrder.get(decl);
-                    return o ? o.slice() : [];
+                    if (!o) { return []; }
+                    var st = __cssStore.get(decl);
+                    var out = [];
+                    for (var i = 0; i < o.length; i++) {
+                        if (st && st[__f98Key(o[i])] !== undefined) {
+                            out.push(o[i]);
+                        }
+                    }
+                    return out;
                 };
                 var __origCSLength = Object.getOwnPropertyDescriptor(
                     __csProto, 'length');
                 var __origCSItem = __csProto.item;
+                var __f98InBase = function (decl, name) {
+                    var base = __origCSLength
+                        ? __origCSLength.get.call(decl) : 0;
+                    for (var i = 0; i < base; i++) {
+                        if (__cssCanon(__origCSItem.call(decl, i)) === name) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                // F-166：真机一个属性一个槽，**位置是首次声明点**，与写入时
+                // 用的是前缀名还是无前缀名无关（/tmp/f582 `step4`：
+                // color、-webkit-backdrop-filter、margin-trim 之后写
+                // -webkit-hyphens，序列化成第四位的 hyphens；`pFirst` 与
+                // `uFirst4` 同序）。仿真侧别名写进内核的无前缀槽，位置就
+                // 落在内核序里，与私有项的相对次序丢失。故枚举统一走这里：
+                // 内核槽里**没被声明序接管**的项按内核序在前，接管的项按
+                // 声明序接在后面。
+                var __f98Merged = function (decl) {
+                    var base = __origCSLength
+                        ? __origCSLength.get.call(decl) : 0;
+                    var o = __cssOrder.get(decl) || [];
+                    var st = __cssStore.get(decl);
+                    var out = [];
+                    var seen = Object.create(null);
+                    for (var i = 0; i < base; i++) {
+                        var nm = __cssCanon(__origCSItem.call(decl, i));
+                        if (o.indexOf(nm) !== -1 || seen[nm]) { continue; }
+                        seen[nm] = 1;
+                        out.push(nm);
+                    }
+                    for (var j = 0; j < o.length; j++) {
+                        var n = o[j];
+                        if (seen[n]) { continue; }
+                        if ((st && st[__f98Key(n)] !== undefined)
+                                || __f98InBase(decl, n)) {
+                            seen[n] = 1;
+                            out.push(n);
+                        }
+                    }
+                    return out;
+                };
                 if (__origCSLength && __origCSLength.get) {
                     Object.defineProperty(__csProto, 'length', {
                         configurable: true,
                         enumerable: __origCSLength.enumerable,
                         get: __maskNative(function () {
-                            var base = __origCSLength.get.call(this);
-                            return base + __f98Stored(this).length;
+                            return __f98Merged(this).length;
                         }, 'get length'),
                     });
                 }
                 __csProto.item = __maskNative(__matchLen(function (i) {
                     var n = Number(i) | 0;
-                    var base = __origCSLength ? __origCSLength.get.call(this) : 0;
                     if (n < 0) { return ''; }
-                    if (n < base) { return __origCSItem.call(this, n); }
-                    var mine = __f98Stored(this);
-                    var k = n - base;
-                    return k < mine.length ? mine[k] : '';
+                    var mine = __f98Merged(this);
+                    return n < mine.length ? mine[n] : '';
                 }, __origCSItem), 'item');
                 // F-98：数字索引。Blink 的 CSSStyleDeclaration 带索引拦截器，
                 // `Object.defineProperty(st, '1', …)` 直接抛「Index property
@@ -4016,8 +4594,9 @@ __FF_SRC__
                 // false，属于一行可查的暴露面。故按声明实例换原型：换上一个
                 // 继承 CSSStyleDeclaration.prototype 的中间对象，带 0..255 的
                 // 数字访问器。原生已解析的自有索引仍优先命中，只有 base 之后
-                // 的索引才落到访问器。真机 WebKit 的索引是实例自有可枚举数据
-                // 属性；这里拿不到 getOwnPropertyNames 等价物，且 Object
+                // 的索引才落到访问器（内核的索引属性不可删改，/tmp/f583）。
+                // 真机 WebKit 的索引是实例自有可枚举数据属性；这里拿不到
+                // getOwnPropertyNames 等价物，且 Object
                 // .getPrototypeOf(decl) 对该声明不再是 CSSStyleDeclaration
                 // .prototype——但方法身份、instanceof、品牌检查、toString 全部
                 // 保持，且未涉及 WebKit 专有属性的声明完全不受影响。
@@ -4036,14 +4615,13 @@ __FF_SRC__
                                 (function (idx) {
                                     Object.defineProperty(proto, String(idx), {
                                         configurable: true, enumerable: false,
+                                        // F-166：与 length / item 同一套合并
+                                        // 序——只有内核槽之后的下标才落到这里，
+                                        // 故直接取合并序的同一下标。
                                         get: __maskNative(function () {
-                                            var base = __origCSLength
-                                                ? __origCSLength.get.call(this) : 0;
-                                            var k = idx - base;
-                                            if (k < 0) { return undefined; }
-                                            var mine = __f98Stored(this);
-                                            return k < mine.length
-                                                ? mine[k] : undefined;
+                                            var mine = __f98Merged(this);
+                                            return idx < mine.length
+                                                ? mine[idx] : undefined;
                                         }, 'get ' + idx),
                                     });
                                 })(__f98i);
@@ -4071,22 +4649,71 @@ __FF_SRC__
                 var __origSetProperty = __csProto.setProperty;
                 var __origGetPropertyValue = __csProto.getPropertyValue;
                 var __origRemoveProperty = __csProto.removeProperty;
+                var __origGetPropertyPriority = __csProto.getPropertyPriority;
+                // F-162：别名解析。返回 null 表示不是别名属性；否则返回
+                // 归一后的值（非法值返回 false，调用方静默丢弃）。
+                var __aliasName = function (property) {
+                    if (typeof property !== 'string') { return null; }
+                    var k = property.trim().toLowerCase();
+                    return __cssAlias[k] ? k : null;
+                };
+                var __aliasValue = function (hit, value) {
+                    if (value === undefined || value === null) { return false; }
+                    // 真机对关键字列表做空白折叠后序列化（`" under  left "`
+                    // → `under left`，/tmp/f551）。别名目标由 Blink 解析，
+                    // 但值域校验走 __cssLookup 的字面表，故先折叠。
+                    var v = String(value).trim().toLowerCase()
+                        .replace(/\s+/g, ' ');
+                    var c = __cssAlias[hit].canon;
+                    return (c && c[v] !== undefined) ? c[v] : v;
+                };
                 __csProto.setProperty = __maskNative(__matchLen(function (property, value, priority) {
                     var hit = __wfInfo(property);
                     if (hit) {
                         if (__wfValueOk(hit.info, value)) {
-                            __wfStore(this)[hit.key] = String(value).trim().toLowerCase();
+                            __wfStore(this)[hit.key] = __wfCanon(hit.info, value);
                             __f98Track(this, hit.key);
                         }
+                        return;
+                    }
+                    // F-162：前缀名转发到无前缀名（值先按前缀值域归一）。
+                    var ak = __aliasName(property);
+                    if (ak) {
+                        var av = __aliasValue(ak, value);
+                        if (av === false || !__cssLookup(ak, av)) { return; }
+                        return __origSetProperty.call(
+                            this, __cssAlias[ak].key, av, priority);
+                    }
+                    // F-162：无前缀名拒收前缀名独有的输入名。
+                    var rk = String(property).trim().toLowerCase();
+                    var rej = __cssAliasReject[rk];
+                    if (rej && value !== undefined && value !== null
+                            && rej[String(value).trim().toLowerCase()]) {
                         return;
                     }
                     // F-98：值域白名单内的 WebKit 专有属性，内核不认（真机解析
                     // 后 getPropertyValue 原样回读）。合法值自行入库，非法值丢弃
                     // ——与真机「解析失败即不设置」同语义。
-                    var key = String(property).trim().toLowerCase();
+                    // F-166：hyphens 的两个拼写共用私有槽（真机同槽，/tmp/f582
+                    // `slotIdentity`），故先归一到存储键再查表——否则无前缀名会
+                    // 落进内核槽，丢掉声明序。
+                    var key = __f98Key(String(property).trim().toLowerCase());
                     if (!__cssGate[key] && __cssAllow[key] !== undefined
+                            && !__cssAliasReject[key]
                             && __cssLookup(key, value) === true) {
-                        __cssStore_put(this, key, String(value).trim());
+                        // F-163：真机按解析后的规范形式回读（大小写/空白折叠、
+                        // || 组合的固定顺序、ink→auto、滤镜函数序列化）。
+                        var sv = __cssValueCanon(key, value);
+                        if (sv === false) {
+                            return __origSetProperty.apply(this, arguments);
+                        }
+                        __cssStore_put(this, key, sv);
+                        // F-163：真机保留优先级（getPropertyPriority 回读
+                        // "important"，cssText 带 `!important`，/tmp/f564）。
+                        __cssPrioSet(this, key,
+                                     /^\s*important\s*$/i.test(
+                                         String(priority == null ? '' : priority))
+                                         ? 'important' : '');
                         __f98Track(this, __cssCanon(key));
                         return;
                     }
@@ -4108,8 +4735,26 @@ __FF_SRC__
                         var s = __cssStore.get(this);
                         return (s && s[hit.key] !== undefined) ? s[hit.key] : '';
                     }
+                    // F-162：前缀名与无前缀名同槽（真机双向互通）。style
+                    // 属性解析绕过 setProperty，仍落在 Blink 的前缀槽里，
+                    // 故两个方向都要回落一次。
+                    var ak = __aliasName(property);
+                    if (ak) {
+                        var got2 = __origGetPropertyValue.call(
+                            this, __cssAlias[ak].key);
+                        return got2 !== '' ? got2
+                            : __origGetPropertyValue.call(this, ak);
+                    }
+                    var rk2 = String(property).trim().toLowerCase();
+                    if (__cssAliasReject[rk2]) {
+                        var got3 = __origGetPropertyValue.call(this, rk2);
+                        if (got3 !== '') { return got3; }
+                        return __origGetPropertyValue.call(
+                            this, '-webkit-' + rk2);
+                    }
                     // F-98：computed 声明回落到所属元素的 inline 存储
-                    var key = String(property).trim().toLowerCase();
+                    // F-166：hyphens 两个拼写读同一个私有槽（真机同槽）。
+                    var key = __f98Key(String(property).trim().toLowerCase());
                     var src = this;
                     var owner = __csOwner.get(this);
                     var computed = false;
@@ -4124,7 +4769,20 @@ __FF_SRC__
                                 && got === '-webkit-sticky') {
                             return 'sticky';
                         }
+                        // F-162：级联关键字在 computed 上解析成初始值。
+                        if (computed && __cssWide[got.toLowerCase()]
+                                && __cssInit[key] !== undefined) {
+                            return __cssInit[key];
+                        }
                         return got;
+                    }
+                    // F-162：computed 上未设过的属性答真机初始值（Blink 的
+                    // UA 样式表里没有这些 WebKit 专有属性的项，回读为 ""）。
+                    if (computed && __cssInit[key] !== undefined
+                            && __cssAllow[key] !== undefined
+                            && !__cssWideExempt[key]
+                            && __origGetPropertyValue.apply(this, arguments) === '') {
+                        return __cssInit[key];
                     }
                     return __origGetPropertyValue.apply(this, arguments);
                 }, __origGetPropertyValue), 'getPropertyValue');
@@ -4137,11 +4795,41 @@ __FF_SRC__
                         __f98Untrack(this, hit.key);
                         return prev;
                     }
-                    var key = String(property).trim().toLowerCase();
-                    if (!__cssGate[key] && __cssAllow[key] !== undefined) {
+                    // F-162：真机按**调用名**决定返回值——text-orientation /
+                    // decoration-skip 的前缀名返回 ""，underline-position 与
+                    // hyphens 的前缀名返回存储值（/tmp/f528、/tmp/f544、
+                    // /tmp/f553），但两者都清槽。
+                    var ak = __aliasName(property);
+                    if (ak) {
+                        var keep = __cssAlias[ak].removeReturnsValue
+                            ? __origGetPropertyValue.call(
+                                this, __cssAlias[ak].key)
+                            : '';
+                        __origRemoveProperty.call(this, __cssAlias[ak].key);
+                        __origRemoveProperty.call(this, ak);
+                        return keep;
+                    }
+                    var rk3 = String(property).trim().toLowerCase();
+                    if (__cssAliasReject[rk3]) {
+                        var pv = __origRemoveProperty.call(this, rk3);
+                        if (pv === '') {
+                            pv = __origRemoveProperty.call(
+                                this, '-webkit-' + rk3);
+                        } else {
+                            __origRemoveProperty.call(this, '-webkit-' + rk3);
+                        }
+                        return pv;
+                    }
+                    // F-166：hyphens 的两个拼写清同一个私有槽，且都返回存储值
+                    // （真机 `removeProperty('-webkit-hyphens')` → "auto"，
+                    // /tmp/f582 `rmRet`）。
+                    var key = __f98Key(String(property).trim().toLowerCase());
+                    if (!__cssGate[key] && __cssAllow[key] !== undefined
+                            && !__cssAliasReject[key]) {
                         var s2 = __cssStore.get(this);
                         var prev2 = (s2 && s2[key] !== undefined) ? s2[key] : '';
                         if (s2) { delete s2[key]; }
+                        __cssPrioSet(this, key, '');
                         __f98Untrack(this, __cssCanon(key));
                         return prev2;
                     }
@@ -4155,6 +4843,368 @@ __FF_SRC__
                     }
                     return __origRemoveProperty.apply(this, arguments);
                 }, __origRemoveProperty), 'removeProperty');
+                // F-162：优先级同样双向互通（真机前缀名/无前缀名读同一个槽
+                // 的优先级；Blink 前缀槽另存一份，必须转发）。
+                __csProto.getPropertyPriority = __maskNative(__matchLen(function (property) {
+                    var ak = __aliasName(property);
+                    if (ak) {
+                        return __origGetPropertyPriority.call(
+                            this, __cssAlias[ak].key);
+                    }
+                    // F-163：私有存储项（__wf 与 __cssAllow 表）的优先级。
+                    // F-166：hyphens 两个拼写读同一个私有槽。
+                    var key = __f98Key(String(property).trim().toLowerCase());
+                    var st = __cssStore.get(this);
+                    if (st && st[key] !== undefined) {
+                        return __cssPrioGet(this, key);
+                    }
+                    return __origGetPropertyPriority.apply(this, arguments);
+                }, __origGetPropertyPriority), 'getPropertyPriority');
+                // F-162：两个驼峰名（webkitTextOrientation / textOrientation）
+                // 都是同一个槽的入口，真机读写同源。Blink 的两个驼峰名是**各自
+                // 绑定一个槽**的具名属性（前缀名写进前缀槽、无前缀名读无前缀
+                // 槽），故必须都改写成走 setProperty/getPropertyValue。原型上
+                // 的访问器在 Blink 会遮蔽具名属性拦截器（/tmp/f529 实测
+                // protoShadow），本文件其余 WebKit 专有属性同理，属已知边界。
+                var __aliasCamel = function (camel, kebab) {
+                    try {
+                        // F-165：真机的 CSS 属性访问器在
+                        // CSSStyleProperties.prototype 上全部
+                        // `enumerable:true`（/tmp/f575 `enumSample`：
+                        // WebkitNbspMode=enum:true,conf:true,get:function），
+                        // 故 for...in 能枚举到。Blink 的具名属性拦截器在
+                        // 实例上，原型上补的这批必须自己声明可枚举。
+                        Object.defineProperty(__csProto, camel, {
+                            configurable: true, enumerable: true,
+                            get: __maskNative(function () {
+                                return this.getPropertyValue(kebab);
+                            }, 'get ' + camel),
+                            set: __maskNative(function (v) {
+                                this.setProperty(kebab, v);
+                            }, 'set ' + camel),
+                        });
+                    } catch (e) {}
+                };
+                for (var __ac in __cssAlias) {
+                    // F-163：驼峰访问器走**前缀名**入口，而不是无前缀名——
+                    // 前缀名入口才做值域归一（decoration-skip 的 ink→auto、
+                    // text-orientation 的 sideways-right→sideways）。真机
+                    // `webkitTextDecorationSkip = 'ink'` 回读 'auto'。
+                    __aliasCamel(__cssAlias[__ac].camel, __ac);
+                    if (__cssAlias[__ac].camel2) {
+                        __aliasCamel(__cssAlias[__ac].camel2,
+                                     __cssAlias[__ac].key);
+                    }
+                }
+                // F-162：同一批 WebKit 专有属性的驼峰访问器（真机有、Blink 无）。
+                // 值域校验与 setProperty 同源，故直接走 setProperty。
+                for (var __ce in __cssCamelExtra) {
+                    __aliasCamel(__cssCamelExtra[__ce], __ce);
+                }
+                // F-164：真机的 CSS 属性是原型上的具名访问器，
+                // `'-webkit-nbsp-mode' in el.style` 为 true（/tmp/f569、
+                // /tmp/f570）。Blink 把支持的属性挂在**实例**的具名属性拦截器
+                // 上，本文件私有表那批内核不支持，`in` 为 false。补同名访问器
+                // 让 `in` 与索引读写和 CSSOM 三个入口同源。
+                // -webkit-text-orientation / text-autospace 内核原生支持，
+                // -webkit-text-size-adjust 内核原生支持（真机 iOS 也支持，
+                // WebKit CSSProperties.json 仅以 textAutosizingEnabled 门控，
+                // 该设置 iOS 默认开、macOS 关），均不补。
+                var __cssKebabIn = [
+                    '-webkit-touch-callout', '-webkit-overflow-scrolling',
+                    '-webkit-text-underline-position',
+                    '-webkit-text-decoration-skip', '-webkit-hyphens',
+                    '-webkit-nbsp-mode', 'margin-trim',
+                    '-apple-pay-button-style', '-webkit-backdrop-filter',
+                ];
+                for (var __ki = 0; __ki < __cssKebabIn.length; __ki++) {
+                    __aliasCamel(__cssKebabIn[__ki], __cssKebabIn[__ki]);
+                }
+                // F-165：WebKit 的 CSSOM 为每个属性生成**两个**驼峰名
+                // （`process-css-properties.py` 的
+                // `_generate_css_style_declaration_property_names_idl_section`）：
+                //  · CamelCased：`lowercase_first=False` —— 首字母保留原样，
+                //    `-webkit-nbsp-mode` → `WebkitNbspMode`、`-apple-pay-button-style`
+                //    → `ApplePayButtonStyle`
+                //  · WebKitCased：只对 `-webkit-` 开头的名字，`lowercase_first=True`
+                //    —— `-webkit-nbsp-mode` → `webkitNbspMode`
+                // 两个变体都挂在原型上且 `enumerable:true`（/tmp/f574、
+                // /tmp/f573 实测）。Blink 只为**内核支持**的属性生成这两种形态
+                // （`WebkitTextOrientation`/`webkitTextSizeAdjust` 等原生就有），
+                // 本文件私有表那批内核不支持，故缺名、写入落空（/tmp/f573
+                // `capsWrite`/`apCapsWrite`）。补齐后 `in`、读写、cssText 与
+                // CSSOM 三个入口同源。
+                // 注意 -apple-pay-button-style 只有大写驼峰名，真机的
+                // `applePayButtonStyle` 是 undefined（/tmp/f573 `camelIn`）。
+                var __cssCapsCamel = {
+                    'webkitBackdropFilter': '-webkit-backdrop-filter',
+                    'WebkitBackdropFilter': '-webkit-backdrop-filter',
+                    'WebkitHyphens': '-webkit-hyphens',
+                    'WebkitTextUnderlinePosition':
+                        '-webkit-text-underline-position',
+                    'WebkitTextDecorationSkip': '-webkit-text-decoration-skip',
+                    'WebkitNbspMode': '-webkit-nbsp-mode',
+                    'ApplePayButtonStyle': '-apple-pay-button-style',
+                    'WebkitTouchCallout': '-webkit-touch-callout',
+                    'WebkitOverflowScrolling': '-webkit-overflow-scrolling',
+                };
+                for (var __cc in __cssCapsCamel) {
+                    __aliasCamel(__cc, __cssCapsCamel[__cc]);
+                }
+                // F-162：cssText 的序列化口径——真机只写无前缀名，且无前缀名
+                // 拒收 sideways-right（该声明整条丢弃）。前缀名写入由
+                // setProperty 转发后已落在无前缀槽，这里只需处理两处：
+                // style 属性解析（绕过 setProperty，进前缀槽）与 cssText 赋值。
+                // F-163：赋值侧还要接管 Blink 解析不了的 WebKit 专有属性
+                // （真机 style 属性 / cssText 都能设，Blink 一律 len0，
+                // /tmp/f559），把它们收进私有存储。
+                var __aliasCtDecl = function (decl) {
+                    var m = /^(\s*)([-a-zA-Z][\w-]*)(\s*:\s*)([\s\S]*?)(\s*)$/.exec(decl);
+                    if (!m) { return decl; }
+                    var name = m[2].toLowerCase();
+                    var rest = m[4];
+                    var prio = '';
+                    var pm = /\s*!\s*important\s*$/i.exec(rest);
+                    if (pm) {
+                        prio = ' !important';
+                        rest = rest.slice(0, pm.index);
+                    }
+                    var v = rest.trim();
+                    var vl = v.toLowerCase().replace(/\s+/g, ' ');
+                    if (__cssAlias[name]) {
+                        var av = __aliasValue(name, v);
+                        if (av === false || !__cssLookup(name, av)) { return ''; }
+                        return m[1] + __cssAlias[name].key + m[3] + av + prio;
+                    }
+                    if (name === 'text-orientation' && vl === 'sideways-right') {
+                        return '';
+                    }
+                    return m[1] + m[2] + m[3] + v + prio;
+                };
+                // 返回 { text, store }：text 交给内核，store 是本轮 cssText
+                // 覆盖后仍要保留的私有声明（真机整块替换，故先清后写）。
+                // 按 ';' 切分必须跳过引号与括号内部——`url("a;b")` 会被切坏。
+                var __ctSplit = function (text) {
+                    var out = [], cur = '', depth = 0, q = '';
+                    for (var __ci2 = 0; __ci2 < text.length; __ci2++) {
+                        var ch = text.charAt(__ci2);
+                        if (q) {
+                            cur += ch;
+                            if (ch === q && text.charAt(__ci2 - 1) !== '\\') {
+                                q = '';
+                            }
+                            continue;
+                        }
+                        if (ch === '"' || ch === "'") { q = ch; cur += ch; continue; }
+                        if (ch === '(') { depth++; cur += ch; continue; }
+                        if (ch === ')') { if (depth) { depth--; } cur += ch; continue; }
+                        if (ch === ';' && depth === 0) { out.push(cur); cur = ''; continue; }
+                        cur += ch;
+                    }
+                    if (cur) { out.push(cur); }
+                    return out;
+                };
+                var __aliasCt = function (text) {
+                    var parts = __ctSplit(String(text));
+                    var out = [];
+                    var store = [];
+                    for (var __ai = 0; __ai < parts.length; __ai++) {
+                        var p = parts[__ai];
+                        if (!p.trim()) { continue; }
+                        var m = /^(\s*)([-a-zA-Z][\w-]*)(\s*:\s*)([\s\S]*?)(\s*)$/
+                            .exec(p);
+                        if (m) {
+                            // F-166：hyphens 两个拼写同槽，统一按存储键查表，
+                            // 否则无前缀名会漏进内核槽（声明序就丢了）。
+                            var nm = __f98Key(m[2].toLowerCase());
+                            var raw = m[4];
+                            var pm2 = /\s*!\s*important\s*$/i.exec(raw);
+                            if (pm2) { raw = raw.slice(0, pm2.index); }
+                            if (!__cssAlias[nm] && __cssAllow[nm] !== undefined
+                                    && !__cssAliasReject[nm]
+                                    && !__cssGate[nm]
+                                    && __cssLookup(nm, raw) === true) {
+                                store.push([nm, __cssValueCanon(nm, raw),
+                                            pm2 ? 'important' : '']);
+                                continue;
+                            }
+                        }
+                        var d = __aliasCtDecl(p);
+                        if (d === '') { continue; }
+                        out.push(d);
+                    }
+                    return {
+                        text: out.join(';') + (out.length ? ';' : ''),
+                        store: store,
+                    };
+                };
+                var __origCssText = Object.getOwnPropertyDescriptor(
+                    __csProto, 'cssText');
+                if (__origCssText && __origCssText.get && __origCssText.set) {
+                    Object.defineProperty(__csProto, 'cssText', {
+                        configurable: true,
+                        enumerable: __origCssText.enumerable,
+                        get: __maskNative(function () {
+                            var t = __origCssText.get.call(this);
+                            if (typeof t !== 'string') { return t; }
+                            // F-163：真机把级联别名的前缀名一律序列化成
+                            // 无前缀名（/tmp/f559：style 属性与 cssText 两条
+                            // 路径都是）。
+                            for (var __an in __cssAlias) {
+                                if (!Object.prototype.hasOwnProperty.call(
+                                        __cssAlias, __an)) { continue; }
+                                var __anRe = new RegExp(
+                                    __an.replace(/[-]/g, '\\-') + '(\\s*:)', 'g');
+                                t = t.replace(__anRe, __cssAlias[__an].key + '$1');
+                            }
+                            // F-162：私有存储里的声明（__wf 与 __cssAllow 表
+                            // 命中项）不参与 Blink 的 cssText 序列化，真机会
+                            // 一并输出。按 length/item 的同一顺序追加。
+                            var mine = __f98Stored(this);
+                            if (!mine.length) { return t; }
+                            var s = __cssStore.get(this);
+                            if (!s) { return t; }
+                            var has = Object.create(null);
+                            var base = __origCSLength
+                                ? __origCSLength.get.call(this) : 0;
+                            for (var __ni = 0; __ni < base; __ni++) {
+                                has[__origCSItem.call(this, __ni)] = 1;
+                            }
+                            var out = t;
+                            for (var __mi = 0; __mi < mine.length; __mi++) {
+                                var n = mine[__mi];
+                                var sk = n === 'hyphens' ? '-webkit-hyphens' : n;
+                                if (has[n] || s[sk] === undefined) { continue; }
+                                if (out && out.charAt(out.length - 1) !== ';') {
+                                    out += ';';
+                                }
+                                out += (out ? ' ' : '') + n + ': ' + s[sk]
+                                    + (__cssPrioGet(this, sk)
+                                        ? ' !important' : '') + ';';
+                            }
+                            return out;                        }, 'get cssText'),
+                        set: __maskNative(function (v) {
+                            var s = String(v);
+                            // 只有涉及别名或 WebKit 专有属性时才重写，其余
+                            // 原样交给内核——按 ';' 切分会破坏 url()/字符串里
+                            // 的分号。
+                            if (!/text-orientation|text-underline-position|text-decoration-skip|hyphens|-webkit-|margin-trim|text-autospace|apple-pay-button-style/i
+                                    .test(s)) {
+                                return __origCssText.set.call(this, v);
+                            }
+                            var r = __aliasCt(s);
+                            __origCssText.set.call(this, r.text);
+                            // cssText 赋值是整块替换：私有存储里的旧声明一律
+                            // 作废（真机同样只保留新块里的声明）。
+                            var old = __cssStore.get(this);
+                            if (old) {
+                                for (var __ok in old) {
+                                    if (Object.prototype.hasOwnProperty.call(
+                                            old, __ok)) {
+                                        delete old[__ok];
+                                    }
+                                }
+                            }
+                            var ord = __cssOrder.get(this);
+                            if (ord) { ord.length = 0; }
+                            for (var __si = 0; __si < r.store.length; __si++) {
+                                __cssStore_put(this, r.store[__si][0],
+                                               r.store[__si][1]);
+                                __cssPrioSet(this, r.store[__si][0],
+                                             r.store[__si][2]);
+                                __f98Track(this, __cssCanon(r.store[__si][0]));
+                            }
+                        }, 'set cssText'),
+                    });
+                }
+                // F-163：style **属性** 是第三条写入路径——它绕过 setProperty，
+                // 直接落进内核解析器。真机把属性文本当整块声明表解析，WebKit
+                // 专有属性照收、别名前缀名照序列化成无前缀名（/tmp/f559、
+                // /tmp/f565）。Blink 对这批属性一律不解析（len0），故在此补齐：
+                // 文本先按 cssText 的同一套规则改写，私有表命中的声明另存。
+                var __styleAttrSplit = function (el, text) {
+                    var s = String(text);
+                    if (!/text-orientation|text-underline-position|text-decoration-skip|hyphens|-webkit-|margin-trim|text-autospace|apple-pay-button-style/i
+                            .test(s)) { return null; }
+                    var r = __aliasCt(s);
+                    var st = el.style;
+                    var old = __cssStore.get(st);
+                    if (old) {
+                        for (var __o2 in old) {
+                            if (Object.prototype.hasOwnProperty.call(old, __o2)) {
+                                delete old[__o2];
+                            }
+                        }
+                    }
+                    var ord2 = __cssOrder.get(st);
+                    if (ord2) { ord2.length = 0; }
+                    for (var __s3 = 0; __s3 < r.store.length; __s3++) {
+                        __cssStore_put(st, r.store[__s3][0], r.store[__s3][1]);
+                        __cssPrioSet(st, r.store[__s3][0], r.store[__s3][2]);
+                        __f98Track(st, __cssCanon(r.store[__s3][0]));
+                    }
+                    return r.text;
+                };
+                var __elProto = Element.prototype;
+                var __origSetAttr = __elProto.setAttribute;
+                __elProto.setAttribute = __maskNative(__matchLen(function (name, value) {
+                    if (typeof name === 'string'
+                            && name.toLowerCase() === 'style'
+                            && arguments.length >= 2) {
+                        var txt = __styleAttrSplit(this, value);
+                        if (txt !== null) {
+                            return __origSetAttr.call(this, name, txt);
+                        }
+                    }
+                    return __origSetAttr.apply(this, arguments);
+                }, __origSetAttr), 'setAttribute');
+                var __origRemoveAttr = __elProto.removeAttribute;
+                __elProto.removeAttribute = __maskNative(__matchLen(function (name) {
+                    if (typeof name === 'string' && name.toLowerCase() === 'style') {
+                        var st2 = this.style;
+                        var o3 = __cssStore.get(st2);
+                        if (o3) {
+                            for (var __o4 in o3) {
+                                if (Object.prototype.hasOwnProperty.call(o3, __o4)) {
+                                    delete o3[__o4];
+                                }
+                            }
+                        }
+                        var od3 = __cssOrder.get(st2);
+                        if (od3) { od3.length = 0; }
+                        var pr3 = __cssPrio.get(st2);
+                        if (pr3) {
+                            for (var __o5 in pr3) {
+                                if (Object.prototype.hasOwnProperty.call(pr3, __o5)) {
+                                    delete pr3[__o5];
+                                }
+                            }
+                        }
+                    }
+                    return __origRemoveAttr.apply(this, arguments);
+                }, __origRemoveAttr), 'removeAttribute');
+                // 真机的 style 属性与 CSSOM 同源：私有存储里的声明同样出现在
+                // 属性文本里（/tmp/f565：无属性元素 setProperty 之后
+                // getAttribute('style') 给出该声明）。内核只序列化自己的槽，
+                // 故有私有声明时改用 cssText（已合并私有项）。
+                var __origGetAttr = __elProto.getAttribute;
+                __elProto.getAttribute = __maskNative(__matchLen(function (name) {
+                    var v = __origGetAttr.apply(this, arguments);
+                    if (typeof name === 'string' && name.toLowerCase() === 'style'
+                            && __f98Stored(this.style).length) {
+                        return this.style.cssText;
+                    }
+                    return v;
+                }, __origGetAttr), 'getAttribute');
+                // hasAttribute / getAttributeNames 同源
+                var __origHasAttr = __elProto.hasAttribute;
+                __elProto.hasAttribute = __maskNative(__matchLen(function (name) {
+                    if (typeof name === 'string' && name.toLowerCase() === 'style'
+                            && __f98Stored(this.style).length) {
+                        return true;
+                    }
+                    return __origHasAttr.apply(this, arguments);
+                }, __origHasAttr), 'hasAttribute');
                 // 双向差集（F-07 / F-24）：桌面 Chromium 与 iOS WebKit 各有
                 // 对方没有的 CSS 属性。deny 表命中直接 false；allow 表命中直接
                 // true（不落到内核的解析器——内核解析器对 WebKit 专有属性
@@ -4174,10 +5224,20 @@ __FF_SRC__
                 var __cssAllow = Object.create(null);
                 __cssAllow['-webkit-touch-callout'] = ['default', 'none'];
                 __cssAllow['-webkit-overflow-scrolling'] = ['auto', 'touch'];
-                // margin-trim：none | block | [ block-start || block-end ]
-                // （inline / inline-start 在真机为 false，不在值域内）
-                __cssAllow['margin-trim'] = ['none', 'block', 'block-start',
-                                             'block-end'];
+                // F-162：真机值域含 mixed（Blink 不认）；sideways-right 是真机
+                // 认可的输入，序列化时归一为 sideways（__cssAlias.canon）。
+                // 无前缀名的值域不含 sideways-right（/tmp/f529：WK false）。
+                __cssAllow['-webkit-text-orientation'] = ['mixed', 'upright',
+                                                          'sideways',
+                                                          'sideways-right'];
+                __cssAllow['text-orientation'] = ['mixed', 'upright', 'sideways'];
+                // margin-trim：none | block | inline |
+                // [ block-start || block-end || inline-start || inline-end ]
+                // （/tmp/f560、/tmp/f561：inline / inline-start / inline-end
+                // 在真机两参 supports 与 setProperty 均为 true）
+                __cssAllow['margin-trim'] = ['none', 'block', 'inline',
+                                             'block-start', 'block-end',
+                                             'inline-start', 'inline-end'];
                 // text-autospace：normal | auto | no-autospace |
                 // [ ideograph-alpha || ideograph-numeric || insert ]
                 __cssAllow['text-autospace'] = ['normal', 'auto', 'no-autospace',
@@ -4191,6 +5251,16 @@ __FF_SRC__
                 // -webkit-backdrop-filter：none | <filter-value-list>，函数式
                 // 值域（consumeFilter），逐函数校验 + 至少一项。
                 __cssAllow['-webkit-backdrop-filter'] = ['none'];
+                // F-162：同一批 WebKit 专有属性（真机有值域、有驼峰访问器、
+                // computed 有初始值；Blink 三项全无）。值域 /tmp/f538 实测：
+                //   nbsp-mode      normal | space
+                //   underline-pos  auto | under | left | right | "under left" |
+                //                  "under right"
+                //   decoration-skip auto | none | ink（'ink' 读回归一为 auto）
+                __cssAllow['-webkit-nbsp-mode'] = ['normal', 'space'];
+                __cssAllow['-webkit-text-underline-position'] = [
+                    'auto', 'under', 'left', 'right', 'under left', 'under right'];
+                __cssAllow['-webkit-text-decoration-skip'] = ['auto', 'none', 'ink'];
                 var __cssFilterFns = ['blur', 'brightness', 'contrast', 'grayscale',
                                       'hue-rotate', 'invert', 'opacity', 'saturate',
                                       'sepia', 'drop-shadow', 'url'];
@@ -4233,18 +5303,108 @@ __FF_SRC__
                     if (key === 'position' && v === '-webkit-sticky') { return true; }
                     return null;
                 };
+                // F-162：真机的 CSS 级联关键字对所有**标准/别名**属性成立
+                // （/tmp/f527 实测：inherit|initial|unset|revert|revert-layer
+                // 两参 supports 与 setProperty 往返都为真）。仅
+                // -webkit-touch-callout / -webkit-overflow-scrolling 例外——
+                // 它们不走级联，只认各自的字面值域。
+                var __cssWide = Object.create(null);
+                ['inherit', 'initial', 'revert', 'unset', 'revert-layer']
+                    .forEach(function (w) { __cssWide[w] = 1; });
+                var __cssWideExempt = Object.create(null);
+                __cssWideExempt['-webkit-touch-callout'] = 1;
+                __cssWideExempt['-webkit-overflow-scrolling'] = 1;
+                // 级联关键字在 computed 上解析成属性的初始值（/tmp/f527）。
+                var __cssInit = Object.create(null);
+                __cssInit['margin-trim'] = 'none';
+                __cssInit['text-autospace'] = 'no-autospace';
+                __cssInit['-webkit-hyphens'] = 'manual';
+                __cssInit['-apple-pay-button-style'] = 'black';
+                __cssInit['-webkit-backdrop-filter'] = 'none';
+                __cssInit['text-orientation'] = 'mixed';
+                __cssInit['-webkit-nbsp-mode'] = 'normal';
+                __cssInit['-webkit-text-underline-position'] = 'auto';
+                __cssInit['-webkit-text-decoration-skip'] = 'auto';
+                // F-163：真机回读的是**解析后的规范形式**，不是输入原文。
+                // 实测（/tmp/f543、/tmp/f551、/tmp/f553、/tmp/f558、/tmp/f560、
+                // /tmp/f561，Playwright WebKit 26.5 移动上下文）：
+                //   · 关键字一律小写、空白折叠（`BLOCK`→`block`，
+                //     `" under  left "`→`under left`）
+                //   · margin-trim 的 || 组合只在**整体等价于单关键字**时折叠
+                //     （block-start+block-end → block，inline-start+inline-end
+                //     → inline，四者全给 → "block inline"；带第三项则原样）
+                //   · text-autospace 组合按 ideograph-alpha, ideograph-numeric,
+                //     insert 的固定顺序序列化
+                //   · decoration-skip 的 ink 归一为 auto
+                //   · 滤镜值由引擎序列化（`BLUR(4PX)`→`blur(4px)`，
+                //     `url(X)`→`url("X")`）——交给 Blink 自己的解析器，不手写
+                var __cssFilterScratch = null;
+                var __cssValueCanon = function (key, value) {
+                    var v = String(value == null ? '' : value).trim()
+                        .toLowerCase().replace(/\s+/g, ' ');
+                    if (key === '-webkit-backdrop-filter') {
+                        try {
+                            if (!__cssFilterScratch) {
+                                __cssFilterScratch =
+                                    document.createElement('div').style;
+                            }
+                            __cssFilterScratch.cssText = '';
+                            __cssFilterScratch.setProperty(
+                                'backdrop-filter', v);
+                            var ser = __cssFilterScratch.getPropertyValue(
+                                'backdrop-filter');
+                            if (ser) { return ser; }
+                        } catch (e) {}
+                        return v;
+                    }
+                    if (key === '-webkit-text-decoration-skip' && v === 'ink') {
+                        return 'auto';
+                    }
+                    if (key === 'margin-trim') {
+                        var mt = v.split(' ');
+                        var has = Object.create(null);
+                        for (var __m1 = 0; __m1 < mt.length; __m1++) {
+                            has[mt[__m1]] = 1;
+                        }
+                        var b2 = has['block-start'] && has['block-end'];
+                        var i2 = has['inline-start'] && has['inline-end'];
+                        if (mt.length === 4 && b2 && i2) { return 'block inline'; }
+                        if (mt.length === 2 && b2) { return 'block'; }
+                        if (mt.length === 2 && i2) { return 'inline'; }
+                        return mt.join(' ');
+                    }
+                    if (key === 'text-autospace') {
+                        var ta = v.split(' ');
+                        var order = ['ideograph-alpha', 'ideograph-numeric',
+                                     'insert'];
+                        var kept = [];
+                        for (var __t1 = 0; __t1 < order.length; __t1++) {
+                            if (ta.indexOf(order[__t1]) !== -1) {
+                                kept.push(order[__t1]);
+                            }
+                        }
+                        return kept.length ? kept.join(' ') : v;
+                    }
+                    return v;
+                };
                 var __cssLookup = function (prop, value) {
                     var key = String(prop).trim().toLowerCase();
                     if (__cssGate[key]) { return false; }
                     var vals = __cssAllow[key];
                     if (vals !== undefined) {
-                        var v = String(value == null ? '' : value).trim().toLowerCase();
+                        // F-163：真机解析前先折叠空白（`" under  left "` 与
+                        // `"  UNDER\tLEFT  "` 都合法，/tmp/f564）。
+                        var v = String(value == null ? '' : value).trim()
+                            .toLowerCase().replace(/\s+/g, ' ');
+                        if (__cssWide[v] && !__cssWideExempt[key]) { return true; }
                         if (key === '-webkit-backdrop-filter') {
                             return __cssFilterOk(v);
                         }
                         if (key === 'margin-trim') {
                             return __cssComboOk(vals, v,
-                                ['none', 'block'], ['block-start', 'block-end']);
+                                ['none', 'block', 'inline'],
+                                ['block-start', 'block-end',
+                                 'inline-start', 'inline-end']);
                         }
                         if (key === 'text-autospace') {
                             return __cssComboOk(vals, v,
@@ -4288,7 +5448,18 @@ __FF_SRC__
                         'gi');
                     var __rewriteConditions = function (text) {
                         return text.replace(__wkDeclRe, function (m, prop, val) {
-                            var v = String(val).replace(/\)\s*$/, '');
+                            // 尾部的 `)` 是单声明外层的那一对，只在值本身括号
+                            // 已配平时才剥。函数式值（blur(4px)）自带一层配平
+                            // 括号，无条件剥会把值变成 `blur(4px`，__cssFilterOk
+                            // 解析失败 → 同一属性两参 true、单参 false（实测
+                            // /tmp/f515）。复合条件里属性组同样会带尾 `)`。
+                            var raw = String(val).replace(/\s+$/, '');
+                            var v = raw;
+                            var open = (raw.match(/\(/g) || []).length;
+                            var close = (raw.match(/\)/g) || []).length;
+                            if (raw.charAt(raw.length - 1) === ')' && close > open) {
+                                v = raw.slice(0, -1);
+                            }
                             // 与两参形态同源：走 __cssLookup（含 F-88 值域校验
                             // 与 F-89 版本门控），避免两条路径各判一套。
                             var ok = __cssLookup(prop, v) === true;
@@ -5588,8 +6759,14 @@ __FF_SRC__
                         // 造出假阳性（audio/mp3; codecs="mp3" 应为 probably）；
                         // 逐个 codecs 标签取首个命中也会漏掉同串里另一个不受
                         // 支持的 codec（"hvc1, opus" → 应为 ''）。
-                        var exact = __cptTable[String(type).toLowerCase()];
-                        if (exact !== undefined) { return exact; }
+                        var lowered = String(type).toLowerCase();
+                        // F-148：av01 只认机型能力位。表是生成时的快照，改机型
+                        // 或迁移档案后可能与运行期 mseTypes.av1 脱钩；精确命中
+                        // 优先于算法会让陈旧条目把非 AV1 机型答成 probably。
+                        if (lowered.indexOf('av01') < 0) {
+                            var exact = __cptTable[lowered];
+                            if (exact !== undefined) { return exact; }
+                        }
                         return __cptIos(String(type), { av1: __cptAV1 });
                     }
                     var v = __cptLookup(type);
@@ -5793,10 +6970,23 @@ __FF_SRC__
         // valhall|gen-5、samsung/rdna-N、img-tec/d-series，见 _android_webgpu），
         // 跨 API 对照可直接命中（GPUAdapterInfo 属性在原型上，实例无 own
         // property；device/description 宿主本就为空串，与真机相同，无需处理）。
+        // iOS 走 WebKit 的归一化输出：四字段同值 "apple"，且 GPUAdapter 有
+        // 一个 Blink 没有的 `isFallbackAdapter` 只读属性（WebKit GPUAdapter.idl）。
         if (D.webgpu && typeof GPUAdapterInfo !== 'undefined' && GPUAdapterInfo.prototype) {
             try {
                 defineGet(GPUAdapterInfo.prototype, 'vendor', D.webgpu.vendor);
                 defineGet(GPUAdapterInfo.prototype, 'architecture', D.webgpu.architecture);
+                if (D.webgpu.device !== undefined) {
+                    defineGet(GPUAdapterInfo.prototype, 'device', D.webgpu.device);
+                    defineGet(GPUAdapterInfo.prototype, 'description', D.webgpu.description);
+                }
+            } catch (e) {}
+        }
+        if (D.ios && typeof GPUAdapter !== 'undefined' && GPUAdapter.prototype
+                && !('isFallbackAdapter' in GPUAdapter.prototype)) {
+            try {
+                // 真机恒 false（没有软渲染回落适配器）
+                defineGet(GPUAdapter.prototype, 'isFallbackAdapter', false);
             } catch (e) {}
         }
 
@@ -5834,13 +7024,69 @@ __FF_SRC__
                         Object.defineProperty(__acOwner, 'state', {
                             get: __maskNative(function () {
                                 if (!__slotHas(__acOwner, this)) {
-                                    throw new TypeError('Illegal invocation');
+                                    throw __brandErr(__acOwner, 'state', 'getter');
                                 }
+                                var __st = __acDesc.get.call(this);
+                                // closed 是三态里唯一不受手势规则约束的：
+                                // close() 之后真机恒读 closed（/tmp/f586
+                                // `closed_*`），压成 suspended 会与
+                                // baseLatency 归 0 自相矛盾。
+                                if (__st === 'closed') { return 'closed'; }
                                 if (!__acGesture) { return 'suspended'; }
-                                return __acDesc.get.call(this);
+                                return __st;
                             }, 'get state'),
                             enumerable: true, configurable: true,
                         });
+                    }
+                    // F-96：baseLatency 真机 = framesPerBuffer(128) / sampleRate
+                    // （WebKit `AudioContext::baseLatency()` 直接除
+                    // destination()->framesPerBuffer()，iOS 缓冲深度 128；
+                    // /tmp/f585 五个采样率逐值命中，128 恒定）。Blink 除的是
+                    // 自己的缓冲深度（48k 256 / 44.1k 236 / 96k 512），倍差
+                    // 单行可读。关闭后归 0（/tmp/f586 `closed_*`）。
+                    // 只改 iOS：Android 的真机就是 Blink，内核值即真值。
+                    if (D.ios) {
+                        try {
+                            var __acLatWrap = function (__name, __conv) {
+                                var __owner = null;
+                                var __desc = null;
+                                var __p = __AC.prototype;
+                                for (var __i = 0; __p && __i < 6; __i++) {
+                                    var __d = Object.getOwnPropertyDescriptor(
+                                        __p, __name);
+                                    if (__d && typeof __d.get === 'function') {
+                                        __owner = __p; __desc = __d; break;
+                                    }
+                                    __p = Object.getPrototypeOf(__p);
+                                }
+                                if (!__owner) { return; }
+                                Object.defineProperty(__owner, __name, {
+                                    get: __maskNative(function () {
+                                        if (!__slotHas(__owner, this)) {
+                                            throw __brandErr(
+                                                __owner, __name, 'getter');
+                                        }
+                                        var __raw = __desc.get.call(this);
+                                        return __conv ? __conv.call(this, __raw)
+                                                      : __raw;
+                                    }, 'get ' + __name),
+                                    enumerable: true, configurable: true,
+                                });
+                            };
+                            __acLatWrap('baseLatency', function (__raw) {
+                                if (__acDesc.get.call(this) === 'closed') {
+                                    return 0;
+                                }
+                                var __sr = 0;
+                                try { __sr = this.sampleRate; } catch (e) {}
+                                return __sr ? 128 / __sr : __raw;
+                            });
+                            // outputLatency 的取值两端本就一致（未播放时恒 0，
+                            // /tmp/f585 `dflt_outputLatency`、`byRate.*.out`），
+                            // 但品牌文案还是 Blink 的 Illegal invocation——
+                            // 真机按 AudioContext 接口名报（/tmp/f588）。
+                            __acLatWrap('outputLatency', null);
+                        } catch (e) {}
                     }
                 }
             } catch (e) {}
@@ -6638,20 +7884,33 @@ __FF_SRC__
                             if (!c) { return orig.apply(this, arguments); }
                             // 没有日期/时间组件时内核给的是日期 + 时间，而
                             // 上面的 DateTimeFormat 默认只有日期，需按真机
-                            // 口径补齐（hourCycle 不指定，跟随 locale）
+                            // 口径补齐（hourCycle 不指定，跟随 locale）。
+                            // 补齐的组件集合必须按方法分派：toLocaleTimeString
+                            // 只补时间、toLocaleDateString 只补日期。用同一套
+                            // 「日期+时间」会让 toLocaleTimeString() 返回日期串
+                            // （实测 /tmp/f514：真机 22:30:45 / 仿真 2026/1/15）。
                             var hasPart = false;
                             ['year', 'month', 'day', 'hour', 'minute',
                              'second', 'weekday', 'dateStyle', 'timeStyle'
                             ].forEach(function (k) {
                                 if (o[k] !== undefined) { hasPart = true; }
                             });
-                            if (!forbidden && !hasPart) {
-                                var full = new Intl.DateTimeFormat(
-                                    arguments[0], {
-                                        year: 'numeric', month: 'numeric',
+                            // 判据不是 `!forbidden`：forbidden 只表示「带了
+                            // 对侧 style 就透传」，与「无组件时该补哪套」无关。
+                            // toLocaleTimeString 的 forbidden 是 dateStyle，
+                            // 用 !forbidden 会把它挡在补齐之外。
+                            if (!hasPart) {
+                                var pad = (m === 'toLocaleTimeString')
+                                    ? { hour: 'numeric', minute: 'numeric',
+                                        second: 'numeric' }
+                                    : (m === 'toLocaleDateString')
+                                    ? { year: 'numeric', month: 'numeric',
+                                        day: 'numeric' }
+                                    : { year: 'numeric', month: 'numeric',
                                         day: 'numeric', hour: 'numeric',
-                                        minute: 'numeric', second: 'numeric',
-                                    });
+                                        minute: 'numeric', second: 'numeric' };
+                                var full = new Intl.DateTimeFormat(
+                                    arguments[0], pad);
                                 c = __dtfCtx(full, this) || c;
                             }
                             return __dtfText(c);
@@ -6736,6 +7995,28 @@ __FF_SRC__
                         var usage = (r && typeof r.usage === 'number') ? r.usage : 0;
                         return { quota: 1048576000, usage: usage };
                     });
+                });
+            } catch (e) {}
+        }
+
+        // ---- getSupportedConstraints：WebKit 逐项回填的 15/17 项（F-94）----
+        // Blink 返回引擎全能力（36 项），WebKit 只回填 MediaDevices.cpp 里
+        // 显式赋值的那些键（未赋值 = 字典默认值不输出）。检测站一行
+        // `getSupportedConstraints().voiceIsolation` 即判平台。
+        // 键序是字母序（WebKit 字典转换按排序成员表遍历，真机 Object.keys
+        // 实测同序，/tmp/f589）；属性描述符两端都是 writable/enumerable/
+        // configurable = true，故普通赋值即可复现。
+        if (D.ios && D.supportedConstraints && D.supportedConstraints.length
+                && typeof MediaDevices !== 'undefined' && MediaDevices.prototype
+                && MediaDevices.prototype.getSupportedConstraints) {
+            try {
+                var __scNames = D.supportedConstraints;
+                defineFn(MediaDevices.prototype, 'getSupportedConstraints', function () {
+                    var out = {};
+                    for (var i = 0; i < __scNames.length; i++) {
+                        out[__scNames[i]] = true;
+                    }
+                    return out;
                 });
             } catch (e) {}
         }
@@ -7061,6 +8342,15 @@ __FF_SRC__
                         var gpv = __maskNative(function (p) {
                             var k = String(p).toLowerCase();
                             if (ovFix && __ovLong[k]) { return 'visible'; }
+                            // F-162：真机 computed 对两个名字都答 text-orientation
+                            // 的级联值（默认 mixed）；Blink 前缀名答
+                            // vertical-right、无前缀名答 ""。
+                            if (k === 'text-orientation'
+                                    || k === '-webkit-text-orientation') {
+                                var to = cs.getPropertyValue('text-orientation');
+                                if (to === '') { to = 'mixed'; }
+                                return to;
+                            }
                             var raw = cs.getPropertyValue(p);
                             return __f99Norm(cs, k, raw, el);
                         }, 'getPropertyValue');
@@ -7077,6 +8367,11 @@ __FF_SRC__
                                 }
                                 if (k === 'getPropertyValue') { return gpv; }
                                 if (ovFix && __ovKeys[k]) { return 'visible'; }
+                                // F-162：computed 的两个驼峰名同源。
+                                if (k === 'webkitTextOrientation'
+                                        || k === 'textOrientation') {
+                                    return gpv('text-orientation');
+                                }
                                 var v = Reflect.get(t, k, t);
                                 if (typeof v === 'function') {
                                     return bindTo(v, k);
@@ -7132,6 +8427,135 @@ __FF_SRC__
                     root.insertBefore(st, root.firstChild);
                 };
                 __putUaFormDroid();
+            } catch (e) {}
+        }
+
+        // ---- Android：Contact Picker 补建（F-95）----
+        // `ContactsManager` 在 Blink 的 runtime_enabled_features.json5 里是
+        // `{"Android": "stable", "default": "test"}`——桌面构建默认关，所以
+        // 宿主内核上 `navigator.contacts` 恒 undefined，真机 Chrome Android
+        // 却有（BCD chrome_android 80）。检测站 `'contacts' in navigator`
+        // 一行即判「桌面装 Android」。
+        // 面取自 Chromium `modules/contacts_picker/*.idl`：
+        //   · ContactProperty 枚举 = address/email/icon/name/tel
+        //   · getProperties() 恒解析 email/name/tel/address/icon（后者两项由
+        //     ContactsManagerExtraProperties 门控，Android 同为 stable）
+        //   · select() 的错误顺序（contacts_manager.cc）：非顶层帧
+        //     InvalidStateError → 无 transient activation SecurityError →
+        //     空属性 TypeError → 已在用 InvalidStateError → 属性非法 TypeError
+        //   · ContactAddress 继承 PaymentAddress（宿主内核有，可直接借）
+        if (D.android && typeof navigator !== 'undefined'
+                && !('contacts' in navigator)) {
+            try {
+                var __ctProps = ['address', 'email', 'icon', 'name', 'tel'];
+                var __ctHasProp = function (v) {
+                    for (var i = 0; i < __ctProps.length; i++) {
+                        if (__ctProps[i] === v) { return true; }
+                    }
+                    return false;
+                };
+                // ContactAddress：真机是 `interface ContactAddress :
+                // PaymentAddress`，只多一个构造器身份，成员全继承。
+                var __ctAddr = window.ContactAddress;
+                if (typeof __ctAddr !== 'function'
+                        && typeof PaymentAddress === 'function') {
+                    __ctAddr = function ContactAddress() {
+                        throw new TypeError('Illegal constructor');
+                    };
+                    try {
+                        Object.setPrototypeOf(__ctAddr.prototype,
+                                              PaymentAddress.prototype);
+                    } catch (e) {}
+                    Object.defineProperty(__ctAddr, 'length', { value: 0 });
+                    Object.defineProperty(window, 'ContactAddress', {
+                        value: __ctAddr, writable: true,
+                        enumerable: false, configurable: true,
+                    });
+                }
+                var __ctMgr = function ContactsManager() {
+                    throw new TypeError('Illegal constructor');
+                };
+                // 原生 Blink 接口原型都带 Symbol.toStringTag（原型自身与实例
+                // 的 Object.prototype.toString 因此是 [object ContactsManager]）
+                try {
+                    Object.defineProperty(__ctMgr.prototype, Symbol.toStringTag, {
+                        value: 'ContactsManager', writable: false,
+                        enumerable: false, configurable: true,
+                    });
+                } catch (e) {}
+                if (__ctAddr && __ctAddr.prototype) {
+                    try {
+                        Object.defineProperty(__ctAddr.prototype,
+                            Symbol.toStringTag, {
+                                value: 'ContactAddress', writable: false,
+                                enumerable: false, configurable: true,
+                            });
+                    } catch (e) {}
+                }
+                Object.defineProperty(__ctMgr.prototype, 'getProperties', {
+                    value: __maskNative(function () {
+                        if (!__slotHas(__ctMgr.prototype, this)) {
+                            throw new TypeError('Illegal invocation');
+                        }
+                        return Promise.resolve(__ctProps.slice());
+                    }, 'getProperties'),
+                    writable: true, enumerable: true, configurable: true,
+                });
+                var __ctSelect = function (properties) {
+                    if (!__slotHas(__ctMgr.prototype, this)) {
+                        throw new TypeError('Illegal invocation');
+                    }
+                    // 顺序照 contacts_manager.cc 的 throw 次序
+                    if (window.top !== window.self) {
+                        return Promise.reject(new DOMException(
+                            'The contacts API can only be used in the top frame',
+                            'InvalidStateError'));
+                    }
+                    if (!navigator.userActivation
+                            || !navigator.userActivation.isActive) {
+                        return Promise.reject(new DOMException(
+                            'A user gesture is required to call this method',
+                            'SecurityError'));
+                    }
+                    var list = properties;
+                    if (typeof list === 'string') { list = [list]; }
+                    if (!list || !list.length) {
+                        return Promise.reject(new TypeError(
+                            'At least one property must be provided'));
+                    }
+                    for (var i = 0; i < list.length; i++) {
+                        if (!__ctHasProp(list[i])) {
+                            return Promise.reject(new TypeError(
+                                "The provided value '" + list[i]
+                                + "' is not a valid enum value of type "
+                                + 'ContactProperty'));
+                        }
+                    }
+                    // 手势已具备：真机此处弹出系统选择器。仿真无选择器，
+                    // 按「用户取消」返回空序列（规范里取消即空数组）。
+                    return Promise.resolve([]);
+                };
+                Object.defineProperty(__ctMgr.prototype, 'select', {
+                    value: __maskNative(__ctSelect, 'select'),
+                    writable: true, enumerable: true, configurable: true,
+                });
+                Object.defineProperty(__ctMgr, 'length', { value: 0 });
+                Object.defineProperty(window, 'ContactsManager', {
+                    value: __ctMgr, writable: true,
+                    enumerable: false, configurable: true,
+                });
+                // navigator.contacts：真机是 Navigator 上的 [SameObject] getter
+                var __ctInst = Object.create(__ctMgr.prototype);
+                var __ctNavProto = Object.getPrototypeOf(navigator);
+                Object.defineProperty(__ctNavProto, 'contacts', {
+                    get: __maskNative(function () {
+                        if (!__slotHas(__ctNavProto, this)) {
+                            throw new TypeError('Illegal invocation');
+                        }
+                        return __ctInst;
+                    }, 'get contacts'),
+                    enumerable: true, configurable: true,
+                });
             } catch (e) {}
         }
 
@@ -7847,13 +9271,161 @@ __FF_SRC__
                         __addIfaceObj(__ifName, __addIface[__ifName]);
                     }
                 }
+                // 构造器的父链要在整表建完之后再挂一次：`extends` 的父接口
+                // 若自己也带 repair（MediaSource），建子接口时抓到的是 repair
+                // 之前的原生构造器，父接口随后被换成代理，两者就不再同一。
+                // 真机 `Object.getPrototypeOf(ManagedMediaSource) === MediaSource`
+                // 是同一对象（WebKit 的子类构造器原型链），差一个包装即判假。
+                for (var __rlName in __addIface) {
+                    if (!Object.prototype.hasOwnProperty.call(__addIface, __rlName)) {
+                        continue;
+                    }
+                    var __rlSpec = __addIface[__rlName];
+                    if (!__rlSpec || !__rlSpec.extends) { continue; }
+                    try {
+                        var __rlChild = window[__rlName];
+                        var __rlParent = window[__rlSpec.extends];
+                        if (typeof __rlChild === 'function'
+                                && typeof __rlParent === 'function'
+                                && Object.getPrototypeOf(__rlChild) !== __rlParent) {
+                            Object.setPrototypeOf(__rlChild, __rlParent);
+                        }
+                    } catch (e) {}
+                }
+                // F-141 / F-159：ARIA 元素反射的两套口径共用工具。
+                //   Element（`Element::elementsArrayForAttributeInternal`，
+                //   /tmp/wkv/Element.cpp）：先看内部列表、属性不是空串时改按
+                //   属性文本解析；可见性 = host.isShadowIncludingDescendantOf(
+                //   target.rootNode())。
+                //   ElementInternals（`CustomElementDefaultARIA.cpp`）：只看内部
+                //   列表，属性文本完全无影响；可见性 = !connected ||
+                //   inDocumentTree || host.isShadowIncludingDescendantOf(rootNode)。
+                var __erCache = new WeakMap();
+                var __erRootOf = function (n) {
+                    return n && n.getRootNode ? n.getRootNode() : document;
+                };
+                // 节点的 shadow-including 根：沿 shadow 宿主一路向上到最外层根。
+                // ShadowRoot 自己是 root node（getRootNode() 返回自身），但它
+                // 的 shadow-including 根要穿过 host 继续往上，不能就地返回。
+                var __erInclRoot = function (n) {
+                    var cur = n;
+                    for (var i = 0; i < 64; i++) {
+                        var root = __erRootOf(cur);
+                        if (!root) { return cur; }
+                        if (root.host) { cur = root.host; continue; }
+                        return root;
+                    }
+                    return cur;
+                };
+                // node 是否是 anc 的 shadow-including **严格**子孙
+                // （Node::isShadowIncludingDescendantOf，/tmp/wkv/Node.cpp:1163：
+                // 同根 + 严格 parentNode 祖先链，或某一级 shadow 宿主被 anc 包含）。
+                var __erDescendsFrom = function (node, anc) {
+                    if (!node || !anc) { return false; }
+                    if (__erInclRoot(node) !== __erInclRoot(anc)) { return false; }
+                    for (var p = node.parentNode; p; p = p.parentNode) {
+                        if (p === anc) { return true; }
+                    }
+                    var cur = node;
+                    for (var i = 0; i < 64; i++) {
+                        var root = __erRootOf(cur);
+                        if (!root || root === cur || !root.host) { return false; }
+                        var host = root.host;
+                        if (host === anc || anc.contains(host)) { return true; }
+                        cur = host;
+                    }
+                    return false;
+                };
+                // F-159：ElementInternals 的可见性判定需要宿主元素
+                // （`CustomElementDefaultARIA::isElementVisible` 的第三个条件），
+                // 而实例本身在 JS 里没有回指宿主的属性。这里把 attachInternals
+                // 包一层，把「实例 → 宿主」记进 WeakMap；原函数照常执行
+                // （非自定义元素照抛 NotSupportedError）。
+                var __eiHost = new WeakMap();
+                var __eiHooked = false;
+                var __erHookInternals = function () {
+                    if (__eiHooked) { return; }
+                    __eiHooked = true;
+                    try {
+                        var HP = window.HTMLElement && window.HTMLElement.prototype;
+                        var orig = HP ? HP.attachInternals : null;
+                        if (typeof orig !== 'function') { return; }
+                        var wrapped = function () {
+                            var inst = Reflect.apply(orig, this, arguments);
+                            try {
+                                if (inst !== null && typeof inst === 'object') {
+                                    __eiHost.set(inst, this);
+                                }
+                            } catch (e) {}
+                            return inst;
+                        };
+                        try {
+                            Object.defineProperty(wrapped, 'length', {
+                                value: orig.length, configurable: true,
+                            });
+                        } catch (e) {}
+                        Object.defineProperty(HP, 'attachInternals', {
+                            value: __maskNative(wrapped, 'attachInternals'),
+                            writable: true, enumerable: true, configurable: true,
+                        });
+                    } catch (e) {}
+                };
+                var __erVisible = function (host, el, ei) {
+                    if (!el) { return false; }
+                    if (ei) {
+                        // 断连目标恒可见（WebKit 的 isElementVisible 第一条）；
+                        // 在文档树里（含 iframe 文档）也恒可见。
+                        if (!el.isConnected) { return true; }
+                        var root = __erRootOf(el);
+                        if (root && root.nodeType === 9) { return true; }
+                        return __erDescendsFrom(host, root);
+                    }
+                    return __erDescendsFrom(host, __erRootOf(el));
+                };
+                var __erFromAttr = function (el, attr) {
+                    var root = __erRootOf(el);
+                    var ids = String(attr).split(/[\t\n\f\r ]+/);
+                    var out = [];
+                    var byId = (root && typeof root.getElementById === 'function')
+                        ? root.getElementById : null;
+                    var all = null;
+                    for (var q = 0; q < ids.length; q++) {
+                        var id = ids[q];
+                        if (!id) { continue; }
+                        var hit = null;
+                        if (byId) {
+                            hit = byId.call(root, id);
+                        } else if (root && root.nodeType === 1) {
+                            // 断连宿主：WebKit 退回到 rootElement 的子孙里
+                            // 逐个比 id（rootNode 本身不算）。
+                            if (all === null) { all = root.getElementsByTagName('*'); }
+                            for (var j = 0; j < all.length; j++) {
+                                if (all[j].getAttribute('id') === id) {
+                                    hit = all[j]; break;
+                                }
+                            }
+                        }
+                        if (hit) { out.push(hit); }
+                    }
+                    return out;
+                };
+                var __erSameList = function (a, b) {
+                    if (a === null || b === null) { return a === b; }
+                    if (!a || !b || a.length !== b.length) { return false; }
+                    for (var q = 0; q < a.length; q++) {
+                        if (a[q] !== b[q]) { return false; }
+                    }
+                    return true;
+                };
                 // 既有原型：'!m' = 方法（返回 value）；'=m' = 可写属性（初值 value）；
                 // singleton = 与接口同实例的只读单例（F-84：navigator.audioSession
                 // 与 window.AudioSession 同源，真机每次读同一个实例、零自有属性）。
                 (__add.protos || []).forEach(function (r) {
                     var C = window[r.ctor];
                     if (!C || !C.prototype) { return; }
-                    if (r.name in C.prototype) { return; }
+                    // F-159：force 用于「原生已有但口径不同」的成员——Blink
+                    // 的实现能跑，但可见性/身份/文案与真机背离，必须整条换掉。
+                    if (r.name in C.prototype && !r.force) { return; }
                     try {
                         if (r.singleton) {
                             var S = window[r.singleton];
@@ -7878,6 +9450,260 @@ __FF_SRC__
                         if (r.kind === 'fn') {
                             var __rv = r.value;
                             defineFn(C.prototype, r.name, function () { return __rv; });
+                        } else if (r.kind === 'elementRef') {
+                            // F-141（Element）/ F-159（ElementInternals）：ARIA 元素
+                            // 反射。两套口径的差别见上方共用工具处的注释；这里只写
+                            // 两边一致的存储模型：
+                            //   * 内部元素列表存在每个 (宿主, 成员) 的槽里，IDL setter
+                            //     写它；Element 额外把属性写成空串（null/undefined
+                            //     则移除属性），ElementInternals 完全不碰属性。
+                            //   * Element 的列表会被**任何属性值变化**清掉
+                            //     （`Element::notifyAttributeChanged` 的 default 分支
+                            //     map->remove）。注意 `attributeChanged` 在
+                            //     oldValue == newValue 时直接返回，所以页面把属性
+                            //     重设成同一个值（典型：'' 再设 ''）不会清列表——
+                            //     判据是「属性当前值 vs setter 写下的值」，不是
+                            //     「属性是否为空串」。
+                            //   * 清掉之后退回属性文本解析；属性缺席 → null，属性在
+                            //     而解析为空 → 冻结的空数组。
+                            //   * 结果冻结且按内容缓存：内容不变时重复读拿到同一个
+                            //     数组对象（JSC 的 cachedAttrAssociatedElements 槽）。
+                            var __erIface = r.iface || r.ctor;
+                            var __erEI = __erIface === 'ElementInternals';
+                            if (__erEI) { __erHookInternals(); }
+                            var __erAttr = r.attr || null;
+                            var __erSingle = !!r.single;
+                            var __erBadEl = new TypeError('The ' + __erIface + '.' + r.name
+                                + ' attribute must be an instance of Element');
+                            // ElementInternals 的可见性要看宿主元素；拿不到宿主时
+                            // 只保留前两条（断连 / 在文档树里）判定。
+                            var __erHostOf = function (x) {
+                                if (!__erEI) { return x; }
+                                return __eiHost.get(x) || null;
+                            };
+                            var __erVisibleList = function (el, raw) {
+                                var host = __erHostOf(el);
+                                var out = [];
+                                for (var q = 0; q < raw.length; q++) {
+                                    if (__erVisible(host, raw[q], __erEI)) { out.push(raw[q]); }
+                                }
+                                return out;
+                            };
+                            var __erById = function (el, id) {
+                                if (!id) { return null; }
+                                var root = __erRootOf(el);
+                                if (root && typeof root.getElementById === 'function') {
+                                    return root.getElementById(id) || null;
+                                }
+                                if (root && root.nodeType === 1) {
+                                    // 断连宿主：只在 rootElement 的**子孙**里找，
+                                    // rootNode 本身不算。
+                                    var all = root.getElementsByTagName('*');
+                                    for (var j = 0; j < all.length; j++) {
+                                        if (all[j].getAttribute('id') === id) { return all[j]; }
+                                    }
+                                }
+                                return null;
+                            };
+                            var __erParseList = function (el) {
+                                var a = __erAttr;
+                                // ElementInternals 的成员没有对应属性（内部列表
+                                // 是唯一来源），属性面恒为 null。
+                                if (a === null) { return null; }
+                                // WebKit 的拼写回退：aria-labelledby 缺席而
+                                // aria-labeledby 在时按后者解析。
+                                if (a === 'aria-labelledby' && !el.hasAttribute(a)
+                                        && el.hasAttribute('aria-labeledby')) {
+                                    a = 'aria-labeledby';
+                                }
+                                if (!el.hasAttribute(a)) { return null; }
+                                return __erFromAttr(el, el.getAttribute(a));
+                            };
+                            var __erParseOne = function (el) {
+                                if (!el.hasAttribute(__erAttr)) { return null; }
+                                return __erById(el, el.getAttribute(__erAttr));
+                            };
+                            // 内部列表何时失效。WebKit 是在 `Element::attributeChanged`
+                            // 的 default 分支里 map->remove(name)，而该函数第一行就是
+                            // `if (oldValue == newValue) return;`——所以「重设成同一个
+                            // 值」（典型：页面把已经是 '' 的属性再设一次 ''）**不会**
+                            // 丢列表，只有真正改变值的写入才丢。判据因此必须是
+                            // 「有没有发生过值变化」，不是「属性当前值是什么」：
+                            // 从 '' 改成 'zzz' 再改回 '' 时 WebKit 已经丢了列表，
+                            // 只看当前值会误判成仍然有效。
+                            // 两个引擎都会为**同值写入**排一条 MutationRecord（实测
+                            // /tmp/f503：''→'' 也有一条），所以「队列非空」不等于值变过。
+                            // 但记录带 oldValue（需 attributeOldValue: true），把每条
+                            // 记录的 oldValue 与「它之后的值」逐条比对，就正好还原出
+                            // WebKit 的 oldValue != newValue 判据。
+                            var __erMOs = new WeakMap();
+                            var __erApply = function (w, el, recs) {
+                                if (!recs || !recs.length) { return; }
+                                var cur = el.hasAttribute(__erAttr)
+                                    ? el.getAttribute(__erAttr) : null;
+                                for (var i = 0; i < recs.length; i++) {
+                                    var next = (i + 1 < recs.length)
+                                        ? recs[i + 1].oldValue : cur;
+                                    if (recs[i].oldValue !== next) { w.gen++; return; }
+                                }
+                            };
+                            var __erWatch = function (el) {
+                                var o = __erMOs.get(el);
+                                if (!o) { o = {}; __erMOs.set(el, o); }
+                                var w = o[r.name];
+                                if (!w) {
+                                    w = { mo: null, gen: 0 };
+                                    o[r.name] = w;
+                                    if (__erAttr !== null
+                                            && typeof MutationObserver !== 'undefined') {
+                                        try {
+                                            var mo = new MutationObserver(function (recs) {
+                                                __erApply(w, el, recs);
+                                            });
+                                            mo.observe(el, {
+                                                attributes: true,
+                                                attributeOldValue: true,
+                                                attributeFilter: [__erAttr],
+                                            });
+                                            w.mo = mo;
+                                        } catch (e) { w.mo = null; }
+                                    }
+                                }
+                                return w;
+                            };
+                            // 排空待派发记录并返回当前代数；写入方改完属性后立刻
+                            // 调一次，就能把自己那条记录吃掉。
+                            var __erGen = function (el) {
+                                var w = __erWatch(el);
+                                if (w.mo) { __erApply(w, el, w.mo.takeRecords()); }
+                                return w.gen;
+                            };
+                            var __erStore = function (el, rec) {
+                                var slot = __erCache.get(el);
+                                if (!slot) { slot = {}; __erCache.set(el, slot); }
+                                slot[r.name] = rec;
+                            };
+                            // 取槽里的记录。代数变了说明内部列表已被属性变化清掉，
+                            // 只把 raw 置空（退回属性解析），els/arr 留着给 JSC 那套
+                            // 「按内容比对复用同一个数组对象」用。
+                            var __erLive = function (el, gen) {
+                                var slot = __erCache.get(el);
+                                var rec = slot ? slot[r.name] : null;
+                                if (!rec) { return null; }
+                                if (rec.gen !== gen) {
+                                    rec.raw = null;
+                                    rec.gen = gen;
+                                }
+                                return rec;
+                            };
+                            // IDL 序列转换的错误分档（实测 /tmp/f493、/tmp/f499）：
+                            // 非对象 → `Value is not a sequence`；对象但没有可用
+                            // @@iterator、或序列里混了非 Element → `Type error`。
+                            var __erSeq = function (v) {
+                                if (v === null
+                                        || (typeof v !== 'object' && typeof v !== 'function')) {
+                                    throw new TypeError('Value is not a sequence');
+                                }
+                                var it = typeof Symbol !== 'undefined' ? v[Symbol.iterator] : null;
+                                if (typeof it !== 'function') {
+                                    throw new TypeError('Type error');
+                                }
+                                var out = [];
+                                for (var step = it.call(v), cur = step.next();
+                                        !cur.done; cur = step.next()) {
+                                    var item = cur.value;
+                                    if (!item || typeof item !== 'object' || item.nodeType !== 1
+                                            || typeof item.getRootNode !== 'function') {
+                                        throw new TypeError('Type error');
+                                    }
+                                    out.push(item);
+                                }
+                                return out;
+                            };
+                            var __erReadArr = function (el) {
+                                var gen = __erGen(el);
+                                var prev = __erLive(el, gen);
+                                var next = prev && prev.raw !== null
+                                    ? __erVisibleList(el, prev.raw) : __erParseList(el);
+                                // 列表内容与上次返回的相同就复用同一个数组对象
+                                // （JSC 的 cachedAttrAssociatedElements 槽按内容比对）。
+                                if (prev && prev.els !== undefined && prev.arr !== undefined
+                                        && __erSameList(prev.els, next)) {
+                                    return prev.arr;
+                                }
+                                var arr = next === null ? null : Object.freeze(next);
+                                __erStore(el, {
+                                    gen: gen, raw: prev ? prev.raw : null,
+                                    els: next, arr: arr,
+                                });
+                                return arr;
+                            };
+                            var __erReadOne = function (el) {
+                                var gen = __erGen(el);
+                                var prev = __erLive(el, gen);
+                                if (prev && prev.raw !== null) {
+                                    // 内部列表存在时**不**回退到属性文本：元素不可见
+                                    // 就读作 null（Element::elementForAttributeInternal
+                                    // 里 hasExplicitlySetElement 之后没有 fallback）。
+                                    var t = prev.raw[0];
+                                    return t && __erVisible(__erHostOf(el), t, __erEI) ? t : null;
+                                }
+                                return __erAttr === null ? null : __erParseOne(el);
+                            };
+                            var __erWrite = function (el, v) {
+                                var gen = __erGen(el);
+                                var prev = __erLive(el, gen);
+                                var keepEls = prev && prev.els !== undefined ? prev.els : undefined;
+                                var keepArr = prev && prev.arr !== undefined ? prev.arr : undefined;
+                                if (v === null || v === undefined) {
+                                    // 内部列表清掉、退回属性解析；Element 还要把
+                                    // 属性移除（Element::setElementAttribute 的
+                                    // 空值分支）。
+                                    if (__erAttr !== null) { el.removeAttribute(__erAttr); }
+                                    __erStore(el, {
+                                        gen: __erGen(el), raw: null,
+                                        els: keepEls, arr: keepArr,
+                                    });
+                                    return;
+                                }
+                                var raw;
+                                if (__erSingle) {
+                                    if (!v || typeof v !== 'object' || v.nodeType !== 1
+                                            || typeof v.getRootNode !== 'function') {
+                                        throw __erBadEl;
+                                    }
+                                    raw = [v];
+                                } else {
+                                    // 先整段转完再落属性：序列里混了非 Element 时
+                                    // WebKit 抛错且属性保持不变。
+                                    raw = __erSeq(v);
+                                }
+                                if (__erAttr !== null) { el.setAttribute(__erAttr, ''); }
+                                // 先改属性、再取代数：自己那条记录在 __erGen 里被
+                                // 吃掉，所以刚写下的列表不会立刻被自己判失效
+                                // （WebKit 也是先 setAttribute 清 map、再写 map）。
+                                // els/arr 保留：getter 拿新列表与上次返回值按内容
+                                // 比对，相同则复用同一个数组对象（identReset）。
+                                __erStore(el, {
+                                    gen: __erGen(el), raw: raw,
+                                    els: keepEls, arr: keepArr,
+                                });
+                            };
+                            Object.defineProperty(C.prototype, r.name, {
+                                get: __maskNative(function () {
+                                    if (!__slotHas(C.prototype, this)) {
+                                        throw __wkBrandErr(__erIface, r.name, 'getter');
+                                    }
+                                    return __erSingle ? __erReadOne(this) : __erReadArr(this);
+                                }, 'get ' + r.name),
+                                set: __maskNative(function (v) {
+                                    if (!__slotHas(C.prototype, this)) {
+                                        throw __wkBrandErr(__erIface, r.name, 'setter');
+                                    }
+                                    __erWrite(this, v);
+                                }, 'set ' + r.name),
+                                enumerable: true, configurable: true,
+                            });
                         } else if (r.kind === 'rw') {
                             var __wv = r.value;
                             Object.defineProperty(C.prototype, r.name, {
@@ -8717,6 +10543,24 @@ __FF_SRC__
                     }
                     return mvhd && trak;
                 };
+                // F-158：moov 里是否有视频轨（trak/mdia/hdlr 的
+                // handler_type == 'vide'）。WebKit 的配额上限按
+                // SourceBuffer::maximumBufferSize() 算：无轨/仅音频取
+                // 5% 预算，hasVideo() 后再加上 95%（SourceBuffer.cpp:702）。
+                var __wkMoovVideo = function (u, s, e) {
+                    var ks = __wkBoxKids(u, s, e);
+                    for (var i = 0; i < ks.length; i++) {
+                        if (ks[i].t !== 'trak') { continue; }
+                        var mdia = __wkKid(u, ks[i].b, ks[i].e, 'mdia');
+                        if (!mdia) { continue; }
+                        var hdlr = __wkKid(u, mdia.b, mdia.e, 'hdlr');
+                        if (!hdlr || hdlr.e - hdlr.b < 12) { continue; }
+                        if (u[hdlr.b + 8] === 0x76 && u[hdlr.b + 9] === 0x69
+                                && u[hdlr.b + 10] === 0x64
+                                && u[hdlr.b + 11] === 0x65) { return true; }
+                    }
+                    return false;
+                };
                 var __wkFtypOk = function (u, s, e) {
                     if (e - s < 8) { return false; }
                     for (var i = s; i < s + 4; i++) {
@@ -8760,6 +10604,7 @@ __FF_SRC__
                         } else if (t === 'moov') {
                             if (!__wkMoovOk(u, body, e)) { return true; }
                             st.moov = true;
+                            if (__wkMoovVideo(u, body, e)) { st.video = true; }
                         } else if (t === 'mdat') {
                             if (st.ftyp && !prevMoof) { return true; }
                         } else if (t === 'emsg') {
@@ -8790,18 +10635,121 @@ __FF_SRC__
                             SourceBuffer.prototype, 'appendBuffer');
                         var __sbApOrig = __sbApD && __sbApD.value;
                         if (typeof __sbApOrig === 'function') {
+                            // F-158：WebKit 在 prepare-append 的第 3/4 步同步
+                            // 做配额判定（SourceBuffer.cpp:610-619，早于任何
+                            // 解析），Blink 完全没有这一层。真机阈值实测
+                            // （/tmp/f411、/tmp/f412）：无视频轨 15938355，
+                            // hasVideo() 后 318767091——即 maximumBufferSize
+                            // 318767104 的 5% 与 5%+95%。判据是 `>`（恰好
+                            // 等于阈值仍接受），超限抛标准 DOMException，
+                            // SB 状态不动、后续小 append 照常。
+                            var __wkQuotaBudget = function (st) {
+                                return st.video ? 318767091 : 15938355;
+                            };
+                            var __wkQuotaFail = function () {
+                                try {
+                                    return new DOMException(
+                                        __WK_DOM_MSG.QuotaExceededError,
+                                        'QuotaExceededError');
+                                } catch (e) {
+                                    return new Error('The quota has been '
+                                                     + 'exceeded.');
+                                }
+                            };
+                            // WebKit 的 contentSize 只算已解析的 coded frame
+                            // （SourceBufferPrivate::contentSize），init 段不
+                            // 贡献——实测 /tmp/f412 有轨阈值恰好等于整份预算，
+                            // 说明 init 之后 contentSize 仍为 0。这里按 mdat
+                            // 载荷近似；垃圾段（无盒）恒为 0，于是判据退化成
+                            // 「本次 append 的字节数」——正是 F-158 复现里
+                            // 首个 16MB 即被拒的形态。
+                            var __wkMdatBytes = function (buf) {
+                                var u;
+                                try {
+                                    u = (buf instanceof ArrayBuffer)
+                                        ? new Uint8Array(buf)
+                                        : new Uint8Array(buf.buffer,
+                                            buf.byteOffset, buf.byteLength);
+                                } catch (e) { return 0; }
+                                var i = 0, sum = 0;
+                                while (i + 8 <= u.length) {
+                                    var sz = ((u[i] << 24) | (u[i + 1] << 16)
+                                              | (u[i + 2] << 8) | u[i + 3]) >>> 0;
+                                    var isMdat = (u[i + 4] === 0x6d
+                                        && u[i + 5] === 0x64
+                                        && u[i + 6] === 0x61
+                                        && u[i + 7] === 0x74);
+                                    var body = i + 8;
+                                    if (sz === 1) {
+                                        if (i + 16 > u.length) { break; }
+                                        sz = ((u[i + 12] << 24) | (u[i + 13] << 16)
+                                              | (u[i + 14] << 8) | u[i + 15]) >>> 0;
+                                        body = i + 16;
+                                    }
+                                    if (sz < 8) { break; }
+                                    if (isMdat) { sum += u.length - body; }
+                                    if (i + sz > u.length) { break; }
+                                    i += sz;
+                                }
+                                return sum;
+                            };
+                            var __wkQuotaHook = function (sb, st) {
+                                if (st.qh) { return; }
+                                st.qh = true;
+                                try {
+                                    sb.addEventListener('error', function () {
+                                        try { __wkSt(this).bytes = 0; }
+                                        catch (e) {}
+                                    });
+                                } catch (e) {}
+                            };
                             var __sbApImpl = function (buf) {
                                 if (!arguments.length) {
                                     return __sbApOrig.call(this);
                                 }
+                                var st = null;
+                                try { st = __wkSt(this); } catch (e) { st = null; }
+                                if (st && !st.gone) {
+                                    var upd = true;
+                                    try { upd = !!this.updating; }
+                                    catch (e) { upd = true; }
+                                    // updating 时真机先抛 InvalidStateError
+                                    // （第 1/2 步），配额根本不判——交给原生。
+                                    if (!upd) {
+                                        // 判据是 contentSize() + data.size()
+                                        // >= 上限（SourceBufferPrivate.cpp:768）
+                                        // ——data.size() 是本次 append 的**原始**
+                                        // 字节数，垃圾段也一样算，所以 16MB 全零
+                                        // 缓冲在真机上首个 append 就被拒。
+                                        var n = 0;
+                                        try {
+                                            if (buf && typeof buf.byteLength
+                                                    === 'number') {
+                                                n = buf.byteLength;
+                                            }
+                                        } catch (e) { n = 0; }
+                                        if ((st.bytes || 0) + n
+                                                > __wkQuotaBudget(st)) {
+                                            throw __wkQuotaFail();
+                                        }
+                                        __wkQuotaHook(this, st);
+                                    }
+                                }
                                 var bad = false;
                                 try {
-                                    bad = __wkMseBad(buf, __wkSt(this));
+                                    bad = __wkMseBad(buf, st || __wkSt(this));
                                 } catch (e) { bad = false; }
                                 if (bad) {
                                     return __sbApOrig.call(this, __wkBadSeg);
                                 }
-                                return __sbApOrig.call(this, buf);
+                                var r = __sbApOrig.call(this, buf);
+                                if (st) {
+                                    try {
+                                        st.bytes = (st.bytes || 0)
+                                            + __wkMdatBytes(buf);
+                                    } catch (e) {}
+                                }
+                                return r;
                             };
                             try {
                                 Object.defineProperty(__sbApImpl, 'length', {
@@ -9345,6 +11293,10 @@ __FF_SRC__
                                     throw __wk156Fail('InvalidStateError');
                                 }
                                 var r = prev.apply(this, arguments);
+                                if (n === 'remove' || n === 'changeType') {
+                                    try { __wkSt(this).bytes = 0; }
+                                    catch (e) {}
+                                }
                                 var s = __sb156Ms(this);
                                 // 规范：ended 态下成功的 append / remove /
                                 // changeType 把 readyState 同步打回 open，并
@@ -9423,6 +11375,36 @@ __FF_SRC__
             }
         }
 
+        // ---- 原型成员枚举顺序 ----
+        // 放在删除段之后：按目标顺序重定义时，已被删掉的成员自然缺席。
+        // 做法是「删光可配置成员 → 按目标序重新 defineProperty」，描述符
+        // 原样复用，getter/setter/value 身份不变（/tmp/f473 实测 0 变化，
+        // 47 项功能冒烟全过，`Illegal invocation` 仍抛）。非可配置成员删不掉、
+        // 会始终排在最前，收录表已按这一约束筛过（见 _IOS_PROTO_ORDER 注释）。
+        var __protoOrder = D.protoOrder || {};
+        for (var __poName in __protoOrder) {
+            if (!Object.prototype.hasOwnProperty.call(__protoOrder, __poName)) { continue; }
+            var __poCtor = null;
+            try { __poCtor = window[__poName]; } catch (e) {}
+            if (!__poCtor || !__poCtor.prototype) { continue; }
+            var __poProto = __poCtor.prototype;
+            var __poWant = String(__protoOrder[__poName]).split(',');
+            try {
+                var __poDescs = {};
+                var __poNames = Object.getOwnPropertyNames(__poProto);
+                for (var __pi = 0; __pi < __poNames.length; __pi++) {
+                    var __pd = Object.getOwnPropertyDescriptor(__poProto, __poNames[__pi]);
+                    if (!__pd || !__pd.configurable) { continue; }
+                    __poDescs[__poNames[__pi]] = __pd;
+                    delete __poProto[__poNames[__pi]];
+                }
+                for (var __pj = 0; __pj < __poWant.length; __pj++) {
+                    var __pdd = __poDescs[__poWant[__pj]];
+                    if (__pdd) { Object.defineProperty(__poProto, __poWant[__pj], __pdd); }
+                }
+            } catch (e) {}
+        }
+
         // ---- FontFace：裁掉宿主本地字体（F-163）----
         // 放在最后：包装器复用原生原型对象，前面的成员差集/顺序重排都作用在
         // 同一个原型上，先装后删/后装都不影响结果。
@@ -9477,11 +11459,19 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "viewportHeight": int(spec.get("viewportHeight") or 0),
         "dpr": float(spec.get("dpr") or 0),
         "dropMembers": dict(spec.get("dropMembers") or {}),
+        "protoOrder": dict(spec.get("protoOrder") or {}),
         # F-89：CSS.supports 白名单的版本门控（低于 profile 版本的属性 false）
         "cssGate": list(spec.get("cssGate") or []),
         "permissions": dict(spec.get("permissions") or {}),
+        # F-94：getSupportedConstraints 的键集白名单（iOS 逐项回填）
+        "supportedConstraints": list(spec.get("supportedConstraints") or []),
         "addMembers": spec.get("addMembers") or {},
         "av1": bool(spec.get("av1")),
+        # F-140：机型类别（phone/tablet）。元素级全屏的 iPad 保留路径按
+        # `D.deviceType === 'tablet'` 判断——derive_spec 早已下发该字段，
+        # 但载荷没透传，页面上取到 undefined，iPad 于是落进 iPhone 的整块
+        # 抹除分支（Element 侧被删、Document 侧保留的「半残」形态）。
+        "deviceType": str(spec.get("deviceType") or ""),
         # F-142：MSE 真值表的运行期开关（见 _MSE_SUPPORT_SRC）
         "mseTypes": spec.get("mseTypes") or {},
         # F-163：设备声明的字体表（FontFace 的 local() 白名单）
@@ -9520,6 +11510,7 @@ __FF_SRC__
             var origToString = Function.prototype.toString;
             if (typeof WeakMap === 'undefined') { return function (fn) { return fn; }; }
             var registry = new WeakMap();
+            // F-162：必须是**对原生函数的 Proxy**（理由见页面补丁同名处）。
             // 顶层 realm 的 toString，用于跨 realm 查询（见下方 apply）。
             var __topFts = null;
             var __topFtsTried = false;
@@ -9548,8 +11539,8 @@ __FF_SRC__
                     return __nativeToString(target, self);
                 },
             });
-            var __nativeToStringTail = function () {
-                var s = origToString.call(this);
+            var __nativeToString = function (target, self) {
+                var s = target.call(self);
                 // JSC 的原生函数是 `function f() {\n    [native code]\n}`（多行缩进），
                 // V8 是单行 `function f() { [native code] }`。未登记（未被本补丁
                 // 包装）的原生函数直接透传会暴露 V8 格式——检测站对
@@ -9633,10 +11624,39 @@ __FF_SRC__
         }
         return false;
     };
+    // 接收者校验的**文案**（不是是否抛）：iOS 的 WebKit 逐成员给出接口名
+    //   getter → The X.m getter can only be used on instances of X
+    //   setter → The X.m setter can only be used on instances of X
+    //   方法   → Can only call X.m on instances of X
+    // Android 目标是 Blink，统一就是 Illegal invocation，保持原样。
+    // 接口名取 proto.constructor.name：WebKit 每个接口原型都挂着自己的构造器
+    // （实测 /tmp/f506，九类接口全部命中）；取不到就退回 Blink 文案，不冒险。
+    var __ifaceName = function (proto) {
+        try {
+            var c = proto && proto.constructor;
+            if (typeof c === 'function' && c.prototype === proto && c.name) {
+                return String(c.name);
+            }
+        } catch (e) {}
+        return null;
+    };
+    var __brandErr = function (proto, member, kind) {
+        var iface = (D && D.ios) ? __ifaceName(proto) : null;
+        if (!iface) { return new TypeError('Illegal invocation'); }
+        if (kind === 'method') {
+            return new TypeError('Can only call ' + iface + '.' + member
+                                 + ' on instances of ' + iface);
+        }
+        return new TypeError('The ' + iface + '.' + member + ' ' + kind
+                             + ' can only be used on instances of ' + iface);
+    };
+
     var defineGet = function (proto, name, value) {
         try {
             var getter = __maskNative(function () {
-                if (!__slotHas(proto, this)) { throw new TypeError('Illegal invocation'); }
+                if (!__slotHas(proto, this)) {
+                    throw __brandErr(proto, name, 'getter');
+                }
                 return value;
             }, 'get ' + name);
             Object.defineProperty(proto, name, {
@@ -9663,7 +11683,7 @@ __FF_SRC__
             if (!noBrand && __isIfaceProto(proto)) {
                 impl = function () {
                     if (!__slotHas(proto, this)) {
-                        throw new TypeError('Illegal invocation');
+                        throw __brandErr(proto, name, 'method');
                     }
                     return fn.apply(this, arguments);
                 };
@@ -11778,6 +13798,14 @@ __MC_SRC__
         if (D.webgpu && typeof GPUAdapterInfo !== 'undefined' && GPUAdapterInfo.prototype) {
             defineGet(GPUAdapterInfo.prototype, 'vendor', D.webgpu.vendor);
             defineGet(GPUAdapterInfo.prototype, 'architecture', D.webgpu.architecture);
+            if (D.webgpu.device !== undefined) {
+                defineGet(GPUAdapterInfo.prototype, 'device', D.webgpu.device);
+                defineGet(GPUAdapterInfo.prototype, 'description', D.webgpu.description);
+            }
+        }
+        if (D.ios && typeof GPUAdapter !== 'undefined' && GPUAdapter.prototype
+                && !('isFallbackAdapter' in GPUAdapter.prototype)) {
+            defineGet(GPUAdapter.prototype, 'isFallbackAdapter', false);
         }
 
         // ---- FontFace：裁掉宿主本地字体（F-163）----
@@ -11878,10 +13906,16 @@ _WORKER_LATE_TEMPLATE = r"""
         try {
             var origToString = Function.prototype.toString;
             var registry = new WeakMap();
-            var faked = function toString() {
-                var v = registry.get(this);
-                if (v !== undefined) { return v; }
-                var s = origToString.call(this);
+            // F-162：必须是**对原生函数的 Proxy**（理由见页面补丁同名处）。
+            var faked = new Proxy(origToString, {
+                apply: function (target, self, args) {
+                    var v = registry.get(self);
+                    if (v !== undefined) { return v; }
+                    return __nativeToString(target, self);
+                },
+            });
+            var __nativeToString = function (target, self) {
+                var s = target.call(self);
                 if (D.ios && typeof s === 'string'
                         && s.indexOf('[native code]') !== -1
                         && s.indexOf('\n') === -1) {
@@ -13079,6 +15113,27 @@ class MobileEmulationSession:
             with contextlib.suppress(CDPError):
                 await self._send("Emulation.setLocaleOverride",
                                  {"locale": self.locale}, session_id=sid)
+
+        # 5c. 字体族映射（F-93②）：canvas 的通用族度量走内核的字体回退链，
+        #     桌面 Chromium 落到 macOS 的 Blink 映射（sans-serif→Arial
+        #     102.4/342、serif→Times 108/314、monospace→Menlo 240.82），
+        #     与 WebKit 的 Helvetica/Times/Courier 口径可区分
+        #     （88.87/333.2、111.13/311.13、240.04）。Page.setFontFamilies
+        #     把通用族指到 macOS 上与 WebKit 同源的字体，实测七个族里六个
+        #     逐值相同（/tmp/f606）；`ui-monospace` 仍差（WebKit 用它自己的
+        #     `.AppleSystemUIFontMonospaced`，该名在 Chromium 里解析不到）。
+        #     命令按页面会话生效：同页跨导航保持、Worker 继承，但**不跨页**
+        #     （新标签页回到宿主映射），故在每次页面级仿真时重发。
+        if self.ios:
+            with contextlib.suppress(CDPError):
+                await self._send("Page.setFontFamilies", {
+                    "fontFamilies": {
+                        "standard": "Times", "serif": "Times",
+                        "fixed": "Courier", "sansSerif": "Helvetica",
+                        "cursive": "Apple Chancery", "fantasy": "Papyrus",
+                        "math": "Latin Modern Math",
+                    },
+                }, session_id=sid)
 
         # 6. Accept-CH：站点声明高熵提示后，对其后续请求回送 Sec-CH-UA-* 高熵头
         #    （内核完全不处理 Accept-CH；真机 Chrome 全量支持，缺回送是明显破绽）

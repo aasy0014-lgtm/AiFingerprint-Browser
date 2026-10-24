@@ -1210,11 +1210,32 @@ _IOS_DROP_PROTO_MEMBERS: Dict[str, List[str]] = {
         # F-115：Blink 把 onbeforecopy/cut/paste 挂在 Element，WebKit 挂在
         # HTMLElement（下方 add-spec 补回）；onsearch 是 Blink 专有事件。
         "onbeforecopy", "onbeforecut", "onbeforepaste", "onsearch",
+        # F-141：ariaNotify 是 `EnabledBySetting=IsARIANotifyEnabled` 的
+        # Element 方法，该 pref 在出货版 Safari 恒为 false（不是版本门控，
+        # 按全局名门控对它无效——它不是全局），故走原型删除表。
+        # WebKit 27.2 实测 Element/Document 两端皆缺席（/tmp/f476）。
+        "ariaNotify",
+        # F-160：Blink 在 Element.prototype 上留了 requestPointerLock 的
+        # 兼容垫片（真实现挂在 Document）。WebKit 27.2 实测 Element /
+        # Document 两侧都没有指针锁面（requestPointerLock / exitPointerLock /
+        # pointerLockElement / onpointerlockchange / onpointerlockerror 全缺席，
+        # /tmp/f507）。Element 侧直接删；Document 侧不补，保持 WebKit 缺席。
+        "requestPointerLock",
+    ],
+    "ElementInternals": [
+        # F-159：Blink 的 ElementInternals 比 WebKit 多三名字符串反射属性
+        # （ariaColIndexText / ariaRowIndexText / ariaDescription）。WebKit
+        # `AriaAttributes.idl` 只在 Element 一侧声明它们，ElementInternals
+        # 走的是 `ElementInternals.idl` 里另列的 ARIA mixin 面，缺这三名
+        # （实测 WebKit 27.2 `/tmp/f485`、`/tmp/f498`）。
+        "ariaColIndexText", "ariaRowIndexText", "ariaDescription",
     ],
     "Document": [
         "exitPointerLock", "requestStorageAccessFor", "featurePolicy",
         "hasPrivateToken", "hasRedemptionRecord", "hasUnpartitionedCookieAccess",
         "wasDiscarded", "prerendering", "pointerLockElement",
+        # F-141：见上条 Element 项。
+        "ariaNotify",
     ],
     # isExtended 是 F-09 的同一项；onchange 为 WebKit 未实现的 Screen 事件
     "Screen": ["isExtended", "onchange"],
@@ -1303,7 +1324,11 @@ _IOS_DROP_PROTO_MEMBERS: Dict[str, List[str]] = {
     # F-17 附带项：Chromium 的 AudioContext 输出设备选择 / 播放统计面
     # （BCD safari_ios=false）。注意这些成员实际定义在 BaseAudioContext /
     # AudioContext 各自的原型上，两边都尝试删。
-    "AudioContext": ["playbackStats", "setSinkId", "sinkId", "onsinkchange"],
+    # F-96：onerror 是 Blink 独有的 EventHandler（Blink `audio_context.idl`
+    # 有 `attribute EventHandler onerror`，WebKit `AudioContext.idl` 没有；
+    # /tmp/f586 `onerror` 三端对照）。同表内一并删。
+    "AudioContext": ["playbackStats", "setSinkId", "sinkId", "onsinkchange",
+                     "onerror"],
     "BaseAudioContext": ["playbackStats"],
     # 真机实测（/tmp/wkprobe/f25all.py）：RTCDataChannel.reliable 是 Chromium
     # 专有（WebKit 原型无此成员）。
@@ -1373,6 +1398,54 @@ _IOS_PERMISSIONS: Dict[str, str] = {
 
 def _ios_permissions(target_os: str) -> Dict[str, str]:
     return dict(_IOS_PERMISSIONS) if target_os == "ios" else {}
+
+
+# --------------------------------------------------------------------------
+# iOS 的 MediaTrackSupportedConstraints 白名单（F-94）
+# --------------------------------------------------------------------------
+# WebKit 不跑 Blink 那套「引擎全能力」表，而是逐项回填
+# `MediaDevices::getSupportedConstraints()`（Source/WebCore/Modules/
+# mediastream/MediaDevices.cpp），未回填的键一律缺席。桌面内核是 Blink，
+# 36 项全集，检测站 `getSupportedConstraints().voiceIsolation` 一行即判。
+#
+# 版本差异（WebKit 发布分支逐支核对）：
+#   · 618.x（Safari 17.x）：15 项，无 backgroundBlur / powerEfficient
+#   · 619.x 起（Safari 18.0+）：17 项，加 backgroundBlur / powerEfficient
+# 设备库最低档是 iOS 17.5.1，故按版本分两段。torch 在 618 的
+# MediaDevices.cpp 里没有显式赋值，但 IDL 默认 `= true`，输出仍在。
+# 键序是**字母序**而非 IDL 声明序：WebKit 的字典转换（convertDictionaryToJS）
+# 按生成代码里的排序成员表遍历，真机 Object.keys 实测即字母序（/tmp/f589）。
+_IOS_SUPPORTED_CONSTRAINTS_BASE: List[str] = [
+    "aspectRatio", "deviceId", "displaySurface", "echoCancellation",
+    "facingMode", "frameRate", "groupId", "height", "sampleRate", "sampleSize",
+    "torch", "volume", "whiteBalanceMode", "width", "zoom",
+]
+# Safari 18.0（WebKit 619）起新增
+_IOS_SUPPORTED_CONSTRAINTS_180: List[str] = ["backgroundBlur", "powerEfficient"]
+
+
+def _ios_supported_constraints(target_os: str, os_version: Any = None) -> List[str]:
+    """iOS 的 getSupportedConstraints 键集；非 iOS 返回空表（保持内核口径）。"""
+    if target_os != "ios":
+        return []
+    names = list(_IOS_SUPPORTED_CONSTRAINTS_BASE)
+    version = _parse_ios_version_local(os_version)
+    if version is None or version >= (18,):
+        names.extend(_IOS_SUPPORTED_CONSTRAINTS_180)
+    return sorted(names)
+
+
+def _parse_ios_version_local(value: Any) -> Optional[tuple]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parts = []
+    for chunk in text.split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) if parts else None
 
 
 # --------------------------------------------------------------------------
@@ -1467,6 +1540,109 @@ def _pick_default_voice(rows: List[List[Any]], locale: str) -> Optional[int]:
     return None
 
 
+# --------------------------------------------------------------------------
+# 原型成员枚举顺序
+# --------------------------------------------------------------------------
+# `Object.getOwnPropertyNames(Ctor.prototype)` 的顺序是独立判据：JSC 按 IDL
+# 声明序、V8 按字典序（且 constructor 排最后）。本表 = WebKit 27.2 实测
+# （/tmp/f471，105 个构造器全扫；/tmp/f473 验重排不改变任何描述符身份、
+# 47 项功能冒烟全过）。
+#
+# 未收录的构造器：非可配置成员删不掉、始终排在最前，收录了也对不齐——
+#   * Node（18 名 ELEMENT_NODE 一族）、WebGL2RenderingContext（559 名常量）；
+#   * Event / FileReader / KeyboardEvent / PerformanceNavigation / WebSocket /
+#     XMLHttpRequest（各自的常量族在 V8 里钉在最前、JSC 里在尾部）。
+# MediaDevices 顺序本可对齐，但 getDisplayMedia 按版本门控删除（F-40），
+# 删除后目标序失效，故不收录（/tmp/f475 实测）。
+# 值 = 目标顺序，逗号分隔；缺席成员自动跳过。
+_IOS_PROTO_ORDER: Dict[str, str] = {
+    "AbortController":         "constructor,signal,abort",
+    "AbortSignal":             "constructor,aborted,reason,onabort,throwIfAborted",
+    "Attr":                    "constructor,namespaceURI,prefix,localName,name,value,ownerElement,specified",
+    "Blob":                    "constructor,size,type,slice,stream,text,arrayBuffer,bytes",
+    "BroadcastChannel":        "constructor,name,onmessage,onmessageerror,postMessage,close",
+    "CookieStore":             "constructor,onchange,get,getAll,set,delete",
+    "Crypto":                  "constructor,subtle,getRandomValues,randomUUID",
+    "CustomEvent":             "constructor,detail,initCustomEvent",
+    "DOMMatrix":               "constructor,a,b,c,d,e,f,m11,m12,m13,m14,m21,m22,m23,m24,m31,m32,m33,m34,m41,m42,m43,m44,multiplySelf,preMultiplySelf,translateSelf,scaleSelf,scale3dSelf,rotateSelf,rotateFromVectorSelf,rotateAxisAngleSelf,skewXSelf,skewYSelf,invertSelf,setMatrixValue",
+    "DOMPoint":                "constructor,x,y,z,w",
+    "DOMQuad":                 "constructor,p1,p2,p3,p4,getBounds,toJSON",
+    "DOMRect":                 "constructor,x,y,width,height",
+    "DOMRectReadOnly":         "constructor,x,y,width,height,top,right,bottom,left,toJSON",
+    "DOMTokenList":            "constructor,length,value,item,contains,add,remove,toggle,replace,supports,toString,entries,forEach,keys,values",
+    "Element":                 "constructor,namespaceURI,prefix,localName,tagName,id,className,classList,slot,part,customElementRegistry,attributes,shadowRoot,onfocusin,onfocusout,onbeforeload,onwebkitneedkey,onwebkitpresentationmodechanged,onwebkitcurrentplaybacktargetiswirelesschanged,onwebkitplaybacktargetavailabilitychanged,role,ariaActiveDescendantElement,ariaAtomic,ariaAutoComplete,ariaBrailleLabel,ariaBrailleRoleDescription,ariaBusy,ariaChecked,ariaColCount,ariaColIndex,ariaColIndexText,ariaColSpan,ariaControlsElements,ariaCurrent,ariaDescribedByElements,ariaDescription,ariaDetailsElements,ariaDisabled,ariaErrorMessageElements,ariaExpanded,ariaFlowToElements,ariaHasPopup,ariaHidden,ariaInvalid,ariaKeyShortcuts,ariaLabel,ariaLabelledByElements,ariaLevel,ariaLive,ariaModal,ariaMultiLine,ariaMultiSelectable,ariaOrientation,ariaOwnsElements,ariaPlaceholder,ariaPosInSet,ariaPressed,ariaReadOnly,ariaRelevant,ariaRequired,ariaRoleDescription,ariaRowCount,ariaRowIndex,ariaRowIndexText,ariaRowSpan,ariaSelected,ariaSetSize,ariaSort,ariaValueMax,ariaValueMin,ariaValueNow,ariaValueText,scrollTop,scrollLeft,scrollWidth,scrollHeight,clientTop,clientLeft,clientWidth,clientHeight,currentCSSZoom,outerHTML,innerHTML,previousElementSibling,nextElementSibling,children,firstElementChild,lastElementChild,childElementCount,assignedSlot,hasAttributes,getAttributeNames,getAttribute,getAttributeNS,setAttribute,setAttributeNS,removeAttribute,removeAttributeNS,toggleAttribute,hasAttribute,hasAttributeNS,getAttributeNode,getAttributeNodeNS,setAttributeNode,setAttributeNodeNS,removeAttributeNode,attachShadow,closest,matches,webkitMatchesSelector,getElementsByTagName,getElementsByTagNameNS,getElementsByClassName,insertAdjacentElement,insertAdjacentText,animate,getAnimations,before,after,replaceWith,remove,getClientRects,getBoundingClientRect,checkVisibility,scrollIntoView,scroll,scrollTo,scrollBy,scrollIntoViewIfNeeded,insertAdjacentHTML,setPointerCapture,releasePointerCapture,hasPointerCapture,computedStyleMap,setHTMLUnsafe,getHTML,prepend,append,replaceChildren,querySelector,querySelectorAll",
+    "ElementInternals":        "constructor,shadowRoot,form,willValidate,validity,validationMessage,labels,states,role,ariaActiveDescendantElement,ariaAtomic,ariaAutoComplete,ariaBrailleLabel,ariaBrailleRoleDescription,ariaBusy,ariaChecked,ariaColCount,ariaColIndex,ariaColSpan,ariaControlsElements,ariaCurrent,ariaDescribedByElements,ariaDetailsElements,ariaDisabled,ariaErrorMessageElements,ariaExpanded,ariaFlowToElements,ariaHasPopup,ariaHidden,ariaInvalid,ariaKeyShortcuts,ariaLabel,ariaLabelledByElements,ariaLevel,ariaLive,ariaModal,ariaMultiLine,ariaMultiSelectable,ariaOrientation,ariaOwnsElements,ariaPlaceholder,ariaPosInSet,ariaPressed,ariaReadOnly,ariaRelevant,ariaRequired,ariaRoleDescription,ariaRowCount,ariaRowIndex,ariaRowSpan,ariaSelected,ariaSetSize,ariaSort,ariaValueMax,ariaValueMin,ariaValueNow,ariaValueText,setFormValue,setValidity,checkValidity,reportValidity",
+    "EventTarget":             "constructor,addEventListener,removeEventListener,dispatchEvent",
+    "File":                    "constructor,name,lastModified,webkitRelativePath",
+    "FormData":                "constructor,append,delete,get,getAll,has,set,entries,keys,values,forEach",
+    "Geolocation":             "constructor,getCurrentPosition,watchPosition,clearWatch",
+    "HTMLCanvasElement":       "constructor,width,height,getContext,toDataURL,toBlob,transferControlToOffscreen,captureStream",
+    "HTMLCollection":          "constructor,length,item,namedItem",
+    "HTMLDivElement":          "constructor,align",
+    "HTMLFormElement":         "constructor,acceptCharset,action,autocomplete,enctype,encoding,method,name,noValidate,target,rel,relList,elements,length,submit,requestSubmit,reset,checkValidity,reportValidity",
+    "HTMLIFrameElement":       "constructor,src,srcdoc,name,sandbox,allow,allowFullscreen,width,height,referrerPolicy,loading,contentDocument,contentWindow,align,scrolling,frameBorder,longDesc,marginHeight,marginWidth,getSVGDocument",
+    "HTMLImageElement":        "constructor,alt,src,srcset,sizes,crossOrigin,useMap,isMap,width,height,naturalHeight,naturalWidth,complete,currentSrc,referrerPolicy,decoding,loading,name,lowsrc,align,hspace,vspace,longDesc,border,fetchPriority,x,y,decode",
+    "HTMLScriptElement":       "constructor,text,innerText,textContent,htmlFor,event,charset,async,defer,src,type,crossOrigin,noModule,integrity,referrerPolicy,fetchPriority,blocking",
+    "Headers":                 "constructor,append,delete,get,getSetCookie,has,set,entries,keys,values,forEach",
+    "History":                 "constructor,length,scrollRestoration,state,back,forward,go,pushState,replaceState",
+    "ImageData":               "constructor,width,height,data,colorSpace",
+    "IntersectionObserver":    "constructor,root,rootMargin,scrollMargin,thresholds,observe,unobserve,disconnect,takeRecords",
+    "MediaQueryList":          "constructor,media,matches,onchange,addListener,removeListener",
+    "MessageChannel":          "constructor,port1,port2",
+    "MessagePort":             "constructor,onmessage,onmessageerror,postMessage,start,close",
+    "MutationObserver":        "constructor,observe,disconnect,takeRecords",
+    "NamedNodeMap":            "constructor,length,item,getNamedItem,getNamedItemNS,setNamedItem,setNamedItemNS,removeNamedItem,removeNamedItemNS",
+    "NodeList":                "constructor,length,item,entries,forEach,keys,values",
+    "OfflineAudioContext":     "constructor,length,oncomplete,startRendering,resume,suspend",
+    "Performance":             "constructor,timeOrigin,eventCounts,interactionCount,navigation,timing,onresourcetimingbufferfull,now,toJSON,getEntries,getEntriesByType,getEntriesByName,clearResourceTimings,setResourceTimingBufferSize,mark,clearMarks,measure,clearMeasures",
+    "PerformanceObserver":     "constructor,observe,disconnect,takeRecords",
+    "PerformanceTiming":       "constructor,navigationStart,unloadEventStart,unloadEventEnd,redirectStart,redirectEnd,fetchStart,domainLookupStart,domainLookupEnd,connectStart,connectEnd,secureConnectionStart,requestStart,responseStart,responseEnd,domLoading,domInteractive,domContentLoadedEventStart,domContentLoadedEventEnd,domComplete,loadEventStart,loadEventEnd,toJSON",
+    "Permissions":             "constructor,query",
+    "PointerEvent":            "constructor,pointerId,width,height,pressure,tangentialPressure,tiltX,tiltY,twist,altitudeAngle,azimuthAngle,pointerType,isPrimary,getCoalescedEvents,getPredictedEvents",
+    "RTCPeerConnection":       "constructor,localDescription,currentLocalDescription,pendingLocalDescription,remoteDescription,currentRemoteDescription,pendingRemoteDescription,signalingState,iceGatheringState,iceConnectionState,connectionState,canTrickleIceCandidates,onnegotiationneeded,onicecandidate,onsignalingstatechange,oniceconnectionstatechange,onicegatheringstatechange,onconnectionstatechange,onicecandidateerror,ontrack,sctp,ondatachannel,createOffer,createAnswer,setLocalDescription,setRemoteDescription,addIceCandidate,restartIce,getConfiguration,setConfiguration,close,getSenders,getReceivers,getTransceivers,addTrack,removeTrack,addTransceiver,createDataChannel,getStats",
+    "Request":                 "constructor,method,url,headers,destination,referrer,referrerPolicy,mode,credentials,cache,redirect,integrity,keepalive,duplex,signal,body,bodyUsed,clone,arrayBuffer,blob,bytes,formData,json,text",
+    "ResizeObserver":          "constructor,observe,unobserve,disconnect",
+    "Response":                "constructor,type,url,redirected,status,ok,statusText,headers,body,bodyUsed,clone,arrayBuffer,blob,bytes,formData,json,text",
+    "Screen":                  "constructor,height,width,colorDepth,pixelDepth,availLeft,availTop,availHeight,availWidth,orientation",
+    "ServiceWorkerContainer":  "constructor,controller,ready,oncontrollerchange,onmessage,onmessageerror,register,getRegistration,getRegistrations,startMessages",
+    "SharedWorker":            "constructor,port,onerror",
+    "SpeechSynthesis":         "constructor,pending,speaking,paused,onvoiceschanged,speak,cancel,pause,resume,getVoices",
+    "SpeechSynthesisUtterance": "constructor,text,lang,voice,volume,rate,pitch,onstart,onend,onerror,onpause,onresume,onmark,onboundary",
+    "Storage":                 "constructor,length,key,getItem,setItem,removeItem,clear",
+    "StorageManager":          "constructor,persisted,persist,estimate,getDirectory",
+    "SubtleCrypto":            "constructor,encrypt,decrypt,sign,verify,digest,generateKey,deriveKey,deriveBits,importKey,exportKey,wrapKey,unwrapKey",
+    "TextDecoder":             "constructor,encoding,fatal,ignoreBOM,decode",
+    "TextEncoder":             "constructor,encoding,encode,encodeInto",
+    "UIEvent":                 "constructor,view,detail,layerX,layerY,pageX,pageY,which,initUIEvent",
+    "URL":                     "constructor,href,origin,protocol,username,password,host,hostname,port,pathname,hash,search,searchParams,toJSON,toString",
+    "URLSearchParams":         "constructor,size,append,delete,get,getAll,has,set,sort,entries,keys,values,forEach,toString",
+    "VisualViewport":          "constructor,offsetLeft,offsetTop,pageLeft,pageTop,width,height,scale,onresize,onscroll",
+    "Worker":                  "constructor,onmessage,onmessageerror,onerror,terminate,postMessage",
+}
+
+# iPad 的 Element 面比 iPhone 多一整块全屏族（BCD：safari_ios 16.4 注
+# 「Only available on iPad, not on iPhone」；桌面 WebKit 27.2 实测 149 名，
+# 上表 141 名恰为其去掉这 7 名，/tmp/f610）。顺序按桌面 WebKit 实测插入位：
+# 4 个处理属性在 currentCSSZoom/outerHTML 之后、innerHTML 之前；3 个方法在
+# insertAdjacentHTML 之后、setPointerCapture 之前。
+#
+# 为什么必须补进顺序表：__protoOrder 的实现是「删光可配置成员 → 按目标序
+# 重新 defineProperty」，顺序表因此同时是**成员集合**的白名单——iPad 上
+# 全屏族被删掉后没有回到表里，Element.prototype 上就永久缺失（真机 iPad
+# 有、仿真没有，一行 `'requestFullscreen' in document.documentElement` 判假）。
+_IOS_PROTO_ORDER_IPAD: Dict[str, str] = {
+    **_IOS_PROTO_ORDER,
+    "Element": _IOS_PROTO_ORDER["Element"]
+        .replace("currentCSSZoom,outerHTML,innerHTML",
+                 "currentCSSZoom,outerHTML,"
+                 "onfullscreenchange,onfullscreenerror,"
+                 "onwebkitfullscreenchange,onwebkitfullscreenerror,innerHTML")
+        .replace("insertAdjacentHTML,setPointerCapture",
+                 "insertAdjacentHTML,requestFullscreen,webkitRequestFullScreen,"
+                 "webkitRequestFullscreen,setPointerCapture"),
+}
+
+
 def _drop_proto_members(target_os: str,
                         os_version: Any = None) -> Dict[str, List[str]]:
     """目标平台需要从接口原型上删除的成员（F-26/F-27）。
@@ -1511,7 +1687,8 @@ def _drop_proto_members(target_os: str,
 # 一律不登记（GestureEvent.rotation、DeviceOrientationEvent.webkitCompass*、
 # SpeechRecognitionAlternative/Result 在 macOS WebKit 亦缺，故不补）。
 #
-# protos 的 kind：fn = 方法（固定返回值），get = 只读属性，rw = 可写属性。
+# protos 的 kind：fn = 方法（固定返回值），get = 只读属性，rw = 可写属性，
+# elementRef = ARIA 元素反射（内部元素列表 + 属性文本两条来源，见下方 F-141 项）。
 # interfaces 的 members：'!m' 前缀为方法，其余为属性 getter。
 _IOS_ADD_SPEC: Dict[str, Any] = {
     # 复杂语义的成员（Canvas 状态改写、媒体轨道对象、事件访问器）在注入器里
@@ -1552,6 +1729,55 @@ _IOS_ADD_SPEC: Dict[str, Any] = {
         # undefined）；Chromium 内核没有，且 BCD chrome_android=false，只补 iOS。
         {"ctor": "MediaSession", "name": "setScreenshareActive", "kind": "fn",
          "value": None},
+        # F-141 / F-159：ARIA 元素反射（`FrozenArray<Element>?` /
+        # `Element?`）。WebKit 的模型是「内部元素列表 + 属性文本」两条来源：
+        #   * Element 侧（`Element::elementsArrayForAttributeInternal`）：setter
+        #     只把内部列表记进 explicitlySetAttrElementsMap、并把属性写成空串；
+        #     任何**值变化**的属性写入都会清掉内部列表（`attributeChanged`
+        #     的 default 分支，而它第一行是 oldValue == newValue 就返回），
+        #     清掉后退回按属性文本里的 id 解析。
+        #   * ElementInternals 侧（`CustomElementDefaultARIA`）：只有内部列表，
+        #     属性文本完全不参与，且可见性多两条（目标断连恒可见、目标在文档
+        #     树里恒可见）。
+        # Blink 同名成员在语义上基本一致，但接收者校验文案（Illegal
+        # invocation）、序列转换文案、shadow 可见性口径都不同，故整条强制
+        # 替换（force）。实测 /tmp/f493、/tmp/f494、/tmp/f496、/tmp/f499。
+        {"ctor": "Element", "name": "ariaControlsElements", "kind": "elementRef",
+         "force": True, "iface": "Element", "attr": "aria-controls"},
+        {"ctor": "Element", "name": "ariaDescribedByElements", "kind": "elementRef",
+         "force": True, "iface": "Element", "attr": "aria-describedby"},
+        {"ctor": "Element", "name": "ariaDetailsElements", "kind": "elementRef",
+         "force": True, "iface": "Element", "attr": "aria-details"},
+        {"ctor": "Element", "name": "ariaErrorMessageElements", "kind": "elementRef",
+         "force": True, "iface": "Element", "attr": "aria-errormessage"},
+        {"ctor": "Element", "name": "ariaFlowToElements", "kind": "elementRef",
+         "force": True, "iface": "Element", "attr": "aria-flowto"},
+        {"ctor": "Element", "name": "ariaLabelledByElements", "kind": "elementRef",
+         "force": True, "iface": "Element", "attr": "aria-labelledby"},
+        {"ctor": "Element", "name": "ariaOwnsElements", "kind": "elementRef",
+         "force": True, "iface": "Element", "attr": "aria-owns"},
+        {"ctor": "Element", "name": "ariaActiveDescendantElement",
+         "kind": "elementRef", "force": True, "iface": "Element",
+         "single": True, "attr": "aria-activedescendant"},
+        # ElementInternals 的成员没有对应属性面（attr 省略 = null）。
+        {"ctor": "ElementInternals", "name": "ariaControlsElements",
+         "kind": "elementRef", "force": True, "iface": "ElementInternals"},
+        {"ctor": "ElementInternals", "name": "ariaDescribedByElements",
+         "kind": "elementRef", "force": True, "iface": "ElementInternals"},
+        {"ctor": "ElementInternals", "name": "ariaDetailsElements",
+         "kind": "elementRef", "force": True, "iface": "ElementInternals"},
+        {"ctor": "ElementInternals", "name": "ariaErrorMessageElements",
+         "kind": "elementRef", "force": True, "iface": "ElementInternals"},
+        {"ctor": "ElementInternals", "name": "ariaFlowToElements",
+         "kind": "elementRef", "force": True, "iface": "ElementInternals"},
+        {"ctor": "ElementInternals", "name": "ariaLabelledByElements",
+         "kind": "elementRef", "force": True, "iface": "ElementInternals"},
+        # Blink 的 ElementInternals 完全没有这一名（实测 /tmp/f499）。
+        {"ctor": "ElementInternals", "name": "ariaOwnsElements",
+         "kind": "elementRef", "iface": "ElementInternals"},
+        {"ctor": "ElementInternals", "name": "ariaActiveDescendantElement",
+         "kind": "elementRef", "force": True, "iface": "ElementInternals",
+         "single": True},
     ],
     "statics": [
         {"ctor": "DataView", "name": "BYTES_PER_ELEMENT", "value": 1},
@@ -1789,6 +2015,19 @@ _IOS_ADD_SPEC: Dict[str, Any] = {
                                # MediaSource，静态 isTypeSupported 必须存在
                                # （主世界表此前漏了这一项，Worker 表有）。
                                "statics": ["!isTypeSupported"]},
+        # F-157 残项：Blink 的原生构造器文案带 `Failed to construct 'X': …`
+        # 前缀，WebKit 是裸文案。两者原型面已完全对齐（/tmp/f512：成员
+        # 顺序、描述符、toString、原型链、length 全同），只需 repair 构造
+        # 语义，故 members 留空。
+        #   SourceBuffer / SourceBufferList：new 与不带 new 都是
+        #     `Illegal constructor`；
+        #   MediaSource：new 正常，不带 new 是
+        #     `Constructor requires 'new' operator`（construct='args' 且
+        #     length=0，缺参判定因此永远不触发）。
+        "SourceBuffer": {"construct": "illegal", "length": 0, "repair": True},
+        "SourceBufferList": {"construct": "illegal", "length": 0,
+                             "repair": True},
+        "MediaSource": {"construct": "args", "length": 0, "repair": True},
         "ManagedSourceBuffer": {"construct": "illegal", "length": 0,
                                 "extends": "SourceBuffer",
                                 "members": ["=onbufferedchange"]},
@@ -2010,7 +2249,7 @@ def _add_members(target_os: str, os_version: Any = None) -> Dict[str, Any]:
                            "init": dict(v.get("init") or {}),
                            "argInit": list(v.get("argInit") or []),
                            "statics": list(v.get("statics") or []),
-                           "members": list(v["members"])}
+                           "members": list(v.get("members") or [])}
                        for k, v in _IOS_ADD_SPEC["interfaces"].items()},
     }
 
