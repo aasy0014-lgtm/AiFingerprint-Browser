@@ -12129,8 +12129,6 @@ class MobileEmulationSession:
         self._emu_ok = False
         # 注入后读数校验结果：None = 尚未校验，False = 通道在线但仿真未生效
         self._emu_verified: Optional[bool] = None
-        # 设备度量覆盖三级降参全部失败（视口已退回宿主窗口）
-        self._metrics_unapplied = False
         self._reconnects = 0
         self._last_error = ""
         self.profile_id = ""
@@ -12171,7 +12169,6 @@ class MobileEmulationSession:
         self._sensor_supported = None
         self._sensor_session = None
         self._emu_verified = None
-        self._metrics_unapplied = False
         self._ua_guard.clear()
         self._ua_guard_busy.clear()
         self._first_page_task = None
@@ -12256,11 +12253,6 @@ class MobileEmulationSession:
     def emulation_verified(self) -> Optional[bool]:
         """首屏读数校验：True = 仿真确实生效，False = 在线但未生效。"""
         return self._emu_verified
-
-    @property
-    def metrics_unapplied(self) -> bool:
-        """设备度量覆盖三级降参全部失败：视口仍是宿主窗口尺寸。"""
-        return self._metrics_unapplied
 
     @property
     def reconnect_count(self) -> int:
@@ -13003,8 +12995,8 @@ class MobileEmulationSession:
         }
         # 逐级降参：部分内核版本拒收 screenOrientation 或 screen* 字段。
         # 三级全败时**不能静默**——此前 `continue` 吞掉全部 CDPError，结果
-        # 是视口退回宿主窗口而没有任何日志（F-166）。这里记一次 error 并
-        # 置 _metrics_unapplied，随后的 _verify_emulation 会再以读数复核。
+        # 是视口退回宿主窗口而没有任何日志（F-166）。这里记一次 error，
+        # 随后的 _verify_emulation 会以读数复核并置 degraded。
         metrics_applied = False
         last_metrics_err: Optional[Exception] = None
         for drop in (None, "screenOrientation", ("screenWidth", "screenHeight")):
@@ -13021,7 +13013,6 @@ class MobileEmulationSession:
                 last_metrics_err = e
                 continue
         if not metrics_applied:
-            self._metrics_unapplied = True
             log.error("设备度量覆盖全部降参尝试失败，视口将退回宿主窗口：%s "
                       "[%s] 目标=%s", last_metrics_err,
                       self.profile_name or self.profile_id or "?", self.css_w)
