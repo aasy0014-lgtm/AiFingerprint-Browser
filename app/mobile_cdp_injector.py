@@ -67,6 +67,7 @@ from .mobile_fingerprints import (
     _codec_capability,
     _add_members,
     _drop_proto_members,
+    _generate_mobile_font_subset,
     _ios_av1_capable,
     _ios_permissions,
     _webgl_profile,
@@ -779,6 +780,12 @@ def derive_spec(fingerprint: dict, target_os: str,
         # F-89：CSS 白名单的版本门控（低于 profile 版本的属性一律 false）
         "cssGate": (_css_version_gated(extra.get("osVersion"))
                     if target_os == "ios" else []),
+        # F-163：设备声明的字体子集。宿主 macOS 的本地字体（Helvetica Neue /
+        # Luminari / Galvji / InaiMathi Bold / PingFang HK Light）会经
+        # `new FontFace(n, 'local("<n>")').load()` 解析成功，creepjs 的
+        # isFontOSBad 据此判定「Android UA 却是 Apple 字体」记 bold。
+        # 注入器据此白名单裁剪 local() 源。
+        "fonts": [str(f) for f in (fp.get("fonts") or []) if str(f)],
     }
 
 
@@ -2377,6 +2384,123 @@ var __mc = (function () {
 """
 
 
+# F-163：字体面收口。宿主 macOS 的本地字体经 FontFace 的 local() 源泄漏：
+# `new FontFace(n, 'local("<n>")').load()` 对 Helvetica Neue / Luminari /
+# Galvji / InaiMathi Bold / PingFang HK Light 全部解析成功，creepjs 的
+# isFontOSBad 见 Android UA 却拿到 Apple 字体即记 bold（LowerEntropy.FONTS）。
+# `document.fonts.check()` 不参与判定——宿主对任意家族都返回 true，creepjs
+# 的 gate（`!check(随机名)`）为假，整条路径被跳过。
+#
+# 做法是在构造期改写 src：按顶层逗号切分，丢掉家族不在设备声明字体表里的
+# local() 片段，其余（url()/format() 等）原样保留；没有 local() 的源整条
+# 原样返回，保住空源的 SyntaxError。被丢掉的片段交给原生 load() 拒绝，
+# 错误形状（NetworkError / code 19）天然正确，实例仍是纯原生对象——
+# 0 个自有属性、load 与 family 都是原生实现，creepjs 的
+# searchLies(FontFace, ['family','load','status']) 因此读不到任何改写痕迹。
+#
+# 构造器面同样按原生复刻：new.target 透传给 Reflect.construct（子类实例
+# 原型链正确）、无 new 时借用原生报错文案、prototype 复用原生对象并置
+# 不可写、length 2、原型上的 constructor 指回包装器。
+_FONT_FACE_SRC = r"""var __ffWrap = (function () {
+    try {
+        var RealFF = (typeof self !== 'undefined' && self.FontFace)
+            || (typeof FontFace !== 'undefined' ? FontFace : null);
+        if (typeof RealFF !== 'function') { return null; }
+        var allow = {};
+        var list = (D && D.fonts) || [];
+        for (var i = 0; i < list.length; i++) {
+            allow[String(list[i]).toLowerCase()] = 1;
+        }
+
+        // 顶层逗号切分：括号内与引号内的逗号不算分隔（url(data:...;base64,..)）
+        var tok = function (s) {
+            var parts = [], cur = '', depth = 0, q = null;
+            for (var j = 0; j < s.length; j++) {
+                var ch = s.charAt(j);
+                if (q) {
+                    cur += ch;
+                    if (ch === '\\') { j++; if (j < s.length) { cur += s.charAt(j); } }
+                    else if (ch === q) { q = null; }
+                    continue;
+                }
+                if (ch === '"' || ch === "'") { q = ch; cur += ch; continue; }
+                if (ch === '(') { depth++; cur += ch; continue; }
+                if (ch === ')') { if (depth > 0) { depth--; } cur += ch; continue; }
+                if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; continue; }
+                cur += ch;
+            }
+            parts.push(cur);
+            return parts;
+        };
+
+        // 整段必须恰好是一个 local()：`local("X") format("woff2")` 原生就是
+        // 语法错误，不能按前缀匹配当成 local 处理
+        var famOf = function (part) {
+            var m = /^\s*local\s*\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\)\s*$/i.exec(part);
+            if (!m) { return null; }
+            var f = (m[1] !== undefined ? m[1]
+                : (m[2] !== undefined ? m[2] : m[3]));
+            return f.replace(/^\s+|\s+$/g, '');
+        };
+
+        var fix = function (src) {
+            // ArrayBuffer / TypedArray 源合法，String() 会毁掉它们
+            if (typeof src !== 'string') { return src; }
+            if (src.indexOf('local(') < 0) { return src; }
+            var parts = tok(src), keep = [], dropped = 0;
+            for (var k = 0; k < parts.length; k++) {
+                var fam = famOf(parts[k]);
+                if (fam === null) { keep.push(parts[k]); continue; }
+                // CSS 家族名忽略大小写，子族名（"Helvetica Neue Bold"）按
+                // 完整串比较——声明表里没有就丢
+                if (allow[fam.toLowerCase()]) { keep.push(parts[k]); }
+                else { dropped++; }
+            }
+            if (!dropped) { return src; }
+            var out = keep.join(',');
+            out = out.replace(/^\s+|\s+$/g, '');
+            return out || 'local("__fp_absent__")';
+        };
+
+        var W = function FontFace(family, source, descriptors) {
+            var nt = new.target;
+            if (nt === undefined) {
+                // 原生在参数个数检查之前就拒绝无 new 调用，直接借它的文案
+                return RealFF.apply(this, arguments);
+            }
+            if (arguments.length < 2) {
+                return Reflect.construct(RealFF,
+                    arguments.length === 1 ? [family] : [], nt);
+            }
+            var args = arguments.length < 3
+                ? [family, fix(source)]
+                : [family, fix(source), descriptors];
+            return Reflect.construct(RealFF, args, nt);
+        };
+        W.prototype = RealFF.prototype;
+        try {
+            Object.defineProperty(W, 'prototype', {
+                value: RealFF.prototype, writable: false,
+                enumerable: false, configurable: false,
+            });
+        } catch (e) {}
+        try {
+            Object.defineProperty(W, 'length', {
+                value: 2, writable: false, enumerable: false, configurable: true,
+            });
+        } catch (e) {}
+        try {
+            Object.defineProperty(RealFF.prototype, 'constructor', {
+                value: W, writable: true, enumerable: false, configurable: true,
+            });
+        } catch (e) {}
+        return W;
+    } catch (e) {
+        return null;
+    }
+})();
+"""
+
 _PATCH_TEMPLATE = r"""
 (function () {
     var D;
@@ -2390,6 +2514,8 @@ _PATCH_TEMPLATE = r"""
 __WC_SRC__
     // F-135：mediaCapabilities 收口（见模块级 _MC_SRC）
 __MC_SRC__
+    // F-163：FontFace 的 local() 源裁剪（见模块级 _FONT_FACE_SRC）
+__FF_SRC__
 
     // ---- 原生函数伪装：toString() 一律返回 [native code] 外观 ----
     var __maskNative = (function () {
@@ -9296,6 +9422,19 @@ __MC_SRC__
                 }
             }
         }
+
+        // ---- FontFace：裁掉宿主本地字体（F-163）----
+        // 放在最后：包装器复用原生原型对象，前面的成员差集/顺序重排都作用在
+        // 同一个原型上，先装后删/后装都不影响结果。
+        if (__ffWrap) {
+            try {
+                __maskNative(__ffWrap, 'FontFace', null, true);
+                Object.defineProperty(window, 'FontFace', {
+                    value: __ffWrap, writable: true,
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
     } catch (e) {}
 })();
 """
@@ -9345,12 +9484,15 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "av1": bool(spec.get("av1")),
         # F-142：MSE 真值表的运行期开关（见 _MSE_SUPPORT_SRC）
         "mseTypes": spec.get("mseTypes") or {},
+        # F-163：设备声明的字体表（FontFace 的 local() 白名单）
+        "fonts": list(spec.get("fonts") or []),
     }
     return (_PATCH_TEMPLATE
             .replace("__MSE_SRC__", _MSE_SUPPORT_SRC)
             .replace("__CPT_SRC__", _CPT_IOS_SRC)
             .replace("__WC_SRC__", _WEBCODECS_ICS_SRC)
             .replace("__MC_SRC__", _MC_SRC)
+            .replace("__FF_SRC__", _FONT_FACE_SRC)
             .replace("__SPEC__", json.dumps(payload, ensure_ascii=False)))
 
 
@@ -9367,6 +9509,10 @@ _WORKER_PATCH_TEMPLATE = r"""
 
     // F-142：MSE 独立真值表（源码见模块级 _MSE_SUPPORT_SRC）
     var __mseSupports = (__MSE_SRC__);
+
+    // F-163：FontFace 的 local() 源裁剪（见模块级 _FONT_FACE_SRC）
+    // 必须在顶层：末尾的安装点在顶层 try 块里，声明进嵌套作用域会读不到。
+__FF_SRC__
 
     // ---- 原生函数伪装（与页面补丁同一实现）----
     var __maskNative = (function () {
@@ -11633,6 +11779,17 @@ __MC_SRC__
             defineGet(GPUAdapterInfo.prototype, 'vendor', D.webgpu.vendor);
             defineGet(GPUAdapterInfo.prototype, 'architecture', D.webgpu.architecture);
         }
+
+        // ---- FontFace：裁掉宿主本地字体（F-163）----
+        if (__ffWrap) {
+            try {
+                __maskNative(__ffWrap, 'FontFace', null, true);
+                Object.defineProperty(self, 'FontFace', {
+                    value: __ffWrap, writable: true,
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
     } catch (e) {}
 })();
 """
@@ -11663,11 +11820,14 @@ def build_worker_patch(spec: Dict[str, Any]) -> str:
         # F-142：Worker 侧 MediaSource.isTypeSupported 与页面同表
         "av1": bool(spec.get("av1")),
         "mseTypes": spec.get("mseTypes") or {},
+        # F-163：Worker 全局同样暴露 FontFace，local() 源泄漏同一批宿主字体
+        "fonts": list(spec.get("fonts") or []),
     }
     return (_WORKER_PATCH_TEMPLATE
             .replace("__MSE_SRC__", _MSE_SUPPORT_SRC)
             .replace("__WC_SRC__", _WEBCODECS_ICS_SRC)
             .replace("__MC_SRC__", _MC_SRC)
+            .replace("__FF_SRC__", _FONT_FACE_SRC)
             .replace("__SPEC__", json.dumps(payload, ensure_ascii=False)))
 
 
@@ -11909,6 +12069,9 @@ class MobileEmulationSession:
                 "safeArea": None,
                 "dynamicRangeHigh": False,
                 "naturalLandscape": target_os != "ios",
+                # F-163：旧调用方式没有指纹，按平台给完整字体表（与
+                # _generate_mobile_font_subset(full=True) 同口径）
+                "fonts": _generate_mobile_font_subset(target_os, full=True),
             }
 
         self.spec = spec
