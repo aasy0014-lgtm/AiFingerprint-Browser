@@ -2978,6 +2978,25 @@ __FF_SRC__
                     }
                     return __nativeToString(target, self);
                 },
+                // F-167：Proxy 的 [[SetPrototypeOf]] 会转发给 target，而 V8 的
+                // 「新原型链里含有自己」环检测发生在**原生函数**上、看不见
+                // Proxy 这一层。creepjs 的 `failed at reflect set proto` 判据
+                // 正是 `Reflect.setPrototypeOf(fn, Object.create(fn))` 后
+                // `RAND in fn`：原生返回 false（V8 直接拒绝成环），Proxy 却
+                // 返回 true 并真的建出环，随后 `in` 遍历环抛 RangeError 而非
+                // TypeError → 记 lie。实测原生 Chromium/WebKit 该判据均为
+                // false，只有换成 Proxy 才变 true（/tmp/proxy_cycle_test.py）。
+                // 故这里手动做一次环检测，保持与原生函数一致。
+                setPrototypeOf: function (target, proto) {
+                    try {
+                        var p = proto;
+                        for (var i = 0; i < 100 && p; i++) {
+                            if (p === target || p === faked) { return false; }
+                            p = Object.getPrototypeOf(p);
+                        }
+                    } catch (e7) {}
+                    return Reflect.setPrototypeOf(target, proto);
+                },
             });
             var __nativeToString = function (target, self) {
                 var s = target.call(self);
@@ -3264,11 +3283,28 @@ __FF_SRC__
             // 只改 iOS：Android 真机 Chrome 是同一套 Blink 固定槽位，
             // 不随之改成空数组（那是把真机行为改错）。
             defineFn(N, 'getGamepads', function () { return []; });
-            // 真机 iOS（Safari / Chrome）普通页面没有 window.chrome；桌面内核
-            // 必然携带该对象且属性 configurable:false（删除/重定义均不可行）。
-            // 赋值 undefined 后 typeof/truthiness 检查通过；'chrome' in window
-            // 与 getOwnPropertyDescriptor 的残余暴露属内核层限制（已知边界）。
-            try { window.chrome = undefined; } catch (e) {}
+            // F-169：不抹 window.chrome——抹不掉，且抹了更糟。
+            // _IOS_REMOVE_GLOBALS 里列了 'chrome'（F-64，按「真机 iOS 无该对象」
+            // 的口径），但 Blink 的 window.chrome 是 own 且 configurable:false，
+            // `delete` 静默失败（非严格模式）→ `'chrome' in window` 恒为 true，
+            // 只能把值改成 undefined。这正是问题所在：creepjs 的
+            // hasBadChromeRuntime（creep.js:5503）是守卫式写法
+            //   `if (!('chrome' in window && 'runtime' in chrome)) return false;`
+            // 前半为 true、后半对 undefined 取 `in` 直接抛 TypeError——而它在
+            // 内层 try **之外**，于是整个 getHeadlessFeatures 的 try/catch 被击穿，
+            // headless 返回 undefined，Headless 块退化成五行 `blocked` 兜底。
+            // 原生桌面 Chromium 的 window.chrome 是 {loadTimes, csi, app}，本就
+            // 没有 runtime，该守卫第一支即 return false——留着原生对象才是与
+            // 真机一致的形态（实测：留原生 → `✔ headless passed`、Headless 块
+            // 正常渲染；改 undefined → `- headless failed`、五行 blocked）。
+            // `'chrome' in window` 这一条在 Blink 内核上无法消除（属性不可配置，
+            // 也没有关闭该对象的开关），属已知边界：creepjs 的 likeHeadless
+            // .noChrome 判据只在 IS_BLINK 下计数，而我们报告的引擎标识不是
+            // Blink，该判据不参与计分。
+            //
+            // 由此删除 _IOS_REMOVE_GLOBALS 里的 'chrome' 条目（见
+            // mobile_fingerprints.py），dropsG 循环对 chrome 的 own 属性本就有
+            // `!__hasOwnG(window, gn)` 守卫，不会给 Window.prototype 补假 getter。
 
             // ---- JavaScriptCore 引擎面 ----
             // 检测站对「声明 iOS 但引擎是 V8」有四条独立判据，逐条对齐 WebKit：
@@ -3379,6 +3415,93 @@ __FF_SRC__
                         enumerable: false, configurable: true,
                     });
                     // JSC 无 prepareStackTrace：内核上它本就缺席，此处不做定义。
+                }
+            } catch (e) {}
+            // ---- F-170：Number.prototype.toFixed 的 RangeError 文案 ----
+            // creepjs 的 getEngine()（creep.js:8-16）以
+            //   `(-1).toFixed(-1)` 的 err.message.length
+            // 加上 `[].constructor.toString().split('Array').join('').length`
+            // 组成引擎指纹：Chrome 80 / WebKit 77。两家的上限都是 100，差别
+            // 全在措辞：V8 是
+            //   "toFixed() digits argument must be between 0 and 100"（51 字符）
+            // JSC 是
+            //   "toFixed() argument must be between 0 and 100"（44 字符）
+            // 少一个 "digits "（7 字符）。实测（Playwright WebKit 27.2）：
+            // `(1).toFixed(101)` 与 `(-1).toFixed(-1)` 抛同一句 44 字符文案，
+            // `(-0.5)` 不抛。不抹这条，iOS 目标恒报 84：creepjs 的 JS_ENGINE
+            // 为 null，随后 Worker 侧 getWorkerData() 的 UA 引擎（iPhone →
+            // JavaScriptCore）与之不符，记 WorkerGlobalScope lie 并整块丢弃
+            // workerScope。实测 84→77 后 workerLied 清零、workerScope 全量
+            // 恢复，headless/stealth 各项评分逐字节不变
+            // （/tmp/ab84.json vs /tmp/ab77.json）。
+            // 原生函数面由 __maskNative 维持。
+            try {
+                if (D && D.ios && typeof Number === 'function'
+                        && Number.prototype && typeof Number.prototype.toFixed === 'function') {
+                    var __toFixed = Number.prototype.toFixed;
+                    var __toFixedImpl = function (digits) {
+                        try {
+                            return __toFixed.apply(this, arguments);
+                        } catch (e) {
+                            if (!(e && e.name === 'RangeError'
+                                    && /^toFixed\(\)/.test(String(e.message)))) {
+                                throw e;
+                            }
+                            var __te = new RangeError(
+                                'toFixed() argument must be between 0 and 100');
+                            // 真机 JSC 的 RangeError own 属性是
+                            // ["message","line","column","sourceURL","stack"]
+                            // （Playwright WebKit 27.2 实测），而 V8 引擎内部
+                            // 抛的错在 C++ 侧创建、不经 Error 全局的 Proxy，
+                            // 拿不到 line/column。这里显式走一遍
+                            // __jscAttach（与上面显式构造的 Error 同一路径）。
+                            try {
+                                if (typeof __jscAttach === 'function') {
+                                    __jscAttach(__te);
+                                }
+                            } catch (e2) {}
+                            // 栈要按真机 JSC 重排：
+                            //   toFixed@[native code]
+                            //   @<调用点>
+                            // 原生 V8 栈里首帧是本包装（`Number.toFixed@
+                            // <anonymous>:<补丁行号>`）——既不是 JSC 形态，
+                            // 又把注入脚本的行号直接交出去；而引擎内部抛的
+                            // 错本来就没有「包装」这一层。故丢弃所有指向
+                            // <anonymous> 的 toFixed 帧，再补上原生首帧。
+                            try {
+                                var __raw = String(__te.stack || '').split('\n');
+                                var __keep = [];
+                                for (var __i = 0; __i < __raw.length; __i++) {
+                                    var __ln = __raw[__i];
+                                    if (/toFixed@<anonymous>/.test(__ln)) { continue; }
+                                    if (__ln === 'RangeError: toFixed() argument must be between 0 and 100') { continue; }
+                                    if (__ln) { __keep.push(__ln); }
+                                }
+                                __keep.unshift('toFixed@[native code]');
+                                // own 属性顺序也对齐 JSC：message, line, column,
+                                // stack（V8 原生顺序是 message, stack，再追加
+                                // line/column 会露馅）。stack 可配置，先删后补。
+                                try { delete __te.stack; } catch (e5) {}
+                                Object.defineProperty(__te, 'line', {
+                                    value: __te.line, writable: true,
+                                    enumerable: false, configurable: true,
+                                });
+                                Object.defineProperty(__te, 'column', {
+                                    value: __te.column, writable: true,
+                                    enumerable: false, configurable: true,
+                                });
+                                Object.defineProperty(__te, 'stack', {
+                                    value: __keep.join('\n'), writable: true,
+                                    enumerable: false, configurable: true,
+                                });
+                            } catch (e4) {}
+                            throw __te;
+                        }
+                    };
+                    Object.defineProperty(Number.prototype, 'toFixed', {
+                        value: __maskNative(__toFixedImpl, 'toFixed'),
+                        writable: true, enumerable: false, configurable: true,
+                    });
                 }
             } catch (e) {}
 
@@ -8245,8 +8368,48 @@ __FF_SRC__
                     return val;
                 };
 
+                // F-168：CSS2 系统字体关键字（caption/icon/menu/message-box/
+                // small-caption/status-bar）在真机 WebKit 解析成系统族
+                // （caption/icon/message-box/small-caption → system-ui，
+                // menu → -apple-menu，status-bar → -apple-status-bar），
+                // 字号 13/11/10px；Blink 六个关键字一律解析成宿主默认族
+                // （macOS 上 Arial）16px。creepjs 的 getSystemFonts() 正是把
+                // `font: <kw> !important` 设到临时 div 上再读 computed
+                // fontFamily，于是 Headless 块报 `platform hints: Arial`，
+                // 真机报 `system-ui,-apple-menu,-apple-status-bar`
+                // （Playwright WebKit 27.2 实测 /tmp/wk_font_kw2.py）。
+                // 只认「作者用 font 简写写的就是关键字」这一种：此时
+                // `el.style.font` 回读恰为关键字本身，而作者另设
+                // font-family / font-size 时 `el.style.font` 为 ''
+                // （/tmp/font_shape_probe.py 实测），不会误改作者声明。
+                var __f168Kw = {
+                    'caption': ['system-ui', '13px'],
+                    'icon': ['system-ui', '13px'],
+                    'menu': ['-apple-menu', '13px'],
+                    'message-box': ['system-ui', '13px'],
+                    'small-caption': ['system-ui', '11px'],
+                    'status-bar': ['-apple-status-bar', '10px'],
+                };
+                var __f168Of = function (el) {
+                    if (!el || !el.style) { return null; }
+                    var f = String(el.style.font || '').trim().toLowerCase();
+                    return __f168Kw[f] || null;
+                };
+
                 var __f99Norm = function (t, name, val, el) {
                     if (typeof val !== 'string' || val === '') { return val; }
+                    if (name === 'font-family' || name === 'fontFamily'
+                            || name === 'font-size' || name === 'fontSize'
+                            || name === 'font') {
+                        var kw168 = __f168Of(el);
+                        if (kw168) {
+                            if (name === 'font') {
+                                return kw168[1] + ' ' + kw168[0];
+                            }
+                            return (name === 'font-size' || name === 'fontSize')
+                                ? kw168[1] : kw168[0];
+                        }
+                    }
                     var kind = __f99Kind[name];
                     if (kind === undefined) {
                         // F-100 的 cursor 不是长度，没有归档；仍要走 UA 归一。
@@ -11538,6 +11701,25 @@ __FF_SRC__
                     }
                     return __nativeToString(target, self);
                 },
+                // F-167：Proxy 的 [[SetPrototypeOf]] 会转发给 target，而 V8 的
+                // 「新原型链里含有自己」环检测发生在**原生函数**上、看不见
+                // Proxy 这一层。creepjs 的 `failed at reflect set proto` 判据
+                // 正是 `Reflect.setPrototypeOf(fn, Object.create(fn))` 后
+                // `RAND in fn`：原生返回 false（V8 直接拒绝成环），Proxy 却
+                // 返回 true 并真的建出环，随后 `in` 遍历环抛 RangeError 而非
+                // TypeError → 记 lie。实测原生 Chromium/WebKit 该判据均为
+                // false，只有换成 Proxy 才变 true（/tmp/proxy_cycle_test.py）。
+                // 故这里手动做一次环检测，保持与原生函数一致。
+                setPrototypeOf: function (target, proto) {
+                    try {
+                        var p = proto;
+                        for (var i = 0; i < 100 && p; i++) {
+                            if (p === target || p === faked) { return false; }
+                            p = Object.getPrototypeOf(p);
+                        }
+                    } catch (e7) {}
+                    return Reflect.setPrototypeOf(target, proto);
+                },
             });
             var __nativeToString = function (target, self) {
                 var s = target.call(self);
@@ -11603,6 +11785,81 @@ __FF_SRC__
             return function (fn) { return fn; };
         }
     })();
+    // F-170：Worker realm 的引擎标识。creepjs 的 `getEngine()`（creep.js:8-16）
+    // 在模块顶层执行，Worker 里加载 creep.js 时同样会跑一遍；虽然
+    // getWorkerData() 并不回传该值（页面侧的 JS_ENGINE 是主 realm 常量），
+    // 但任何直接探测 Worker 的检测都会读到它，两个 realm 必须同值。
+    // 文案与页面补丁同名处一致（JSC 44 字符口径）。
+    try {
+        if (D && D.ios && typeof Number === 'function'
+                && Number.prototype && typeof Number.prototype.toFixed === 'function') {
+            // 幂等：本脚本在「暂停态注入」与「beforeScriptExecution 断点」
+            // 两条链路上各执行一次，无条件包装会套两层，栈里露出两帧
+            // `Number.toFixed@<anonymous>`。用行为探测判断是否已装，
+            // 避免在全局留可见标记。
+            var __alreadyW = false;
+            try { (1).toFixed(101); }
+            catch (e0) {
+                __alreadyW = /^toFixed\(\) argument must be between 0 and 100$/
+                    .test(String(e0 && e0.message));
+            }
+            if (!__alreadyW) {
+                var __toFixedW = Number.prototype.toFixed;
+                var __toFixedImplW = function (digits) {
+                    try {
+                        return __toFixedW.apply(this, arguments);
+                    } catch (e) {
+                        if (e && e.name === 'RangeError'
+                                && /^toFixed\(\)/.test(String(e.message))) {
+                            var __tew = new RangeError(
+                                'toFixed() argument must be between 0 and 100');
+                            // Worker 没有页面侧那套 __jscAttach/Error Proxy，
+                            // 这里就地重排栈：丢掉包装帧与 V8 的 "Error: msg"
+                            // 头行，补上原生首帧，其余帧转成 JSC 的
+                            // `fn@url:line:col`。
+                            try {
+                                var __wraw = String(__tew.stack || '').split('\n');
+                                var __wkeep = [];
+                                for (var __wi = 0; __wi < __wraw.length; __wi++) {
+                                    var __wl = __wraw[__wi];
+                                    if (!/^\s*at\s+/.test(__wl)) { continue; }
+                                    if (/Number\.toFixed/.test(__wl)) { continue; }
+                                    var __wm = /^\s*at\s+(.*?)\s*\((.*)\)\s*$/.exec(__wl)
+                                        || /^\s*at\s+(.*)$/.exec(__wl);
+                                    var __wn = __wm ? __wm[1] : '';
+                                    var __wu = __wm && __wm[2] ? __wm[2] : '';
+                                    if (!__wu && /:\d+:\d+$/.test(__wn)) {
+                                        __wu = __wn; __wn = '';
+                                    }
+                                    __wkeep.push(__wn + '@' + __wu);
+                                }
+                                __wkeep.unshift('toFixed@[native code]');
+                                try { delete __tew.stack; } catch (e5) {}
+                                Object.defineProperty(__tew, 'line', {
+                                    value: 0, writable: true,
+                                    enumerable: false, configurable: true,
+                                });
+                                Object.defineProperty(__tew, 'column', {
+                                    value: 0, writable: true,
+                                    enumerable: false, configurable: true,
+                                });
+                                Object.defineProperty(__tew, 'stack', {
+                                    value: __wkeep.join('\n'), writable: true,
+                                    enumerable: false, configurable: true,
+                                });
+                            } catch (e4) {}
+                            throw __tew;
+                        }
+                        throw e;
+                    }
+                };
+                Object.defineProperty(Number.prototype, 'toFixed', {
+                    value: __maskNative(__toFixedImplW, 'toFixed'),
+                    writable: true, enumerable: false, configurable: true,
+                });
+            }
+        }
+    } catch (e) {}
     var __isProtoObj = function (x, proto) {
         if (x === proto) { return true; }
         try {
@@ -13912,6 +14169,25 @@ _WORKER_LATE_TEMPLATE = r"""
                     var v = registry.get(self);
                     if (v !== undefined) { return v; }
                     return __nativeToString(target, self);
+                },
+                // F-167：Proxy 的 [[SetPrototypeOf]] 会转发给 target，而 V8 的
+                // 「新原型链里含有自己」环检测发生在**原生函数**上、看不见
+                // Proxy 这一层。creepjs 的 `failed at reflect set proto` 判据
+                // 正是 `Reflect.setPrototypeOf(fn, Object.create(fn))` 后
+                // `RAND in fn`：原生返回 false（V8 直接拒绝成环），Proxy 却
+                // 返回 true 并真的建出环，随后 `in` 遍历环抛 RangeError 而非
+                // TypeError → 记 lie。实测原生 Chromium/WebKit 该判据均为
+                // false，只有换成 Proxy 才变 true（/tmp/proxy_cycle_test.py）。
+                // 故这里手动做一次环检测，保持与原生函数一致。
+                setPrototypeOf: function (target, proto) {
+                    try {
+                        var p = proto;
+                        for (var i = 0; i < 100 && p; i++) {
+                            if (p === target || p === faked) { return false; }
+                            p = Object.getPrototypeOf(p);
+                        }
+                    } catch (e7) {}
+                    return Reflect.setPrototypeOf(target, proto);
                 },
             });
             var __nativeToString = function (target, self) {

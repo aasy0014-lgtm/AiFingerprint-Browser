@@ -174,7 +174,17 @@ STATE_JS = """async () => {
         historyPatched: /invokeOnHost/.test(String(window.history.pushState)),
         printPatched: /invokeOnHost/.test(String(window.print)),
         scrollPatched: /setWebViewScrollViewIsDragging/.test(String(window.scrollTo)),
+        // F-169：window.chrome 在 Blink 上 own 且 configurable:false，delete 静默
+        // 失败；改成 undefined 会让 creepjs 的 hasBadChromeRuntime 守卫
+        // (`'chrome' in window && 'runtime' in chrome`) 对 undefined 取 `in`
+        // 抛 TypeError 并击穿 getHeadlessFeatures，Headless 块整体退化为
+        // blocked。故保留原生对象，判据改为「无 runtime」——这正是桌面
+        // Chromium 的形态，也是该守卫真正的检测目标。
         hasChromeObj: typeof window.chrome !== 'undefined',
+        chromeHasRuntime: (function () {
+            try { return typeof window.chrome === 'object' && window.chrome !== null
+                && 'runtime' in window.chrome; } catch (e) { return 'ERR'; }
+        })(),
         isCriOS: /CriOS\\/[\\d.]+/.test(nav.userAgent),
         paymentRequest: String(window.PaymentRequest || ''),
         pluginsLen: nav.plugins.length,
@@ -2550,6 +2560,11 @@ window.__probe = {
   hist: /invokeOnHost/.test(String(window.history.pushState)),
   scroll: /setWebViewScrollViewIsDragging/.test(String(window.scrollTo)),
   chromeType: typeof window.chrome,
+  // F-169：Blink 的 window.chrome 是 own + configurable:false，删不掉；
+  // 判据改看 runtime 面（真机 Safari 与桌面 Chromium 都无）。
+  chromeRuntime: (function () { try { return typeof window.chrome === 'object'
+    && window.chrome !== null && 'runtime' in window.chrome; }
+    catch (e) { return 'ERR'; } })(),
   webgl: (function () { try { var g = document.createElement('canvas').getContext('webgl');
     var e = g.getExtension('WEBGL_debug_renderer_info');
     return e ? g.getParameter(e.UNMASKED_RENDERER_WEBGL) : null; } catch (err) { return 'err'; } })(),
@@ -2727,6 +2742,11 @@ window.__early = {
   wk: !!(window.webkit && window.webkit.messageHandlers),
   hist: /invokeOnHost/.test(String(window.history.pushState)),
   chromeType: typeof window.chrome,
+  // F-169：Blink 的 window.chrome 是 own + configurable:false，删不掉；
+  // 判据改看 runtime 面（真机 Safari 与桌面 Chromium 都无）。
+  chromeRuntime: (function () { try { return typeof window.chrome === 'object'
+    && window.chrome !== null && 'runtime' in window.chrome; }
+    catch (e) { return 'ERR'; } })(),
   gl: 'ERR'
 };
 try {
@@ -2904,6 +2924,11 @@ FRAME_LIVE_JS = """(() => ({
   wk: !!(window.webkit && window.webkit.messageHandlers),
   hist: /invokeOnHost/.test(String(window.history.pushState)),
   chromeType: typeof window.chrome,
+  // F-169：Blink 的 window.chrome 是 own + configurable:false，删不掉；
+  // 判据改看 runtime 面（真机 Safari 与桌面 Chromium 都无）。
+  chromeRuntime: (function () { try { return typeof window.chrome === 'object'
+    && window.chrome !== null && 'runtime' in window.chrome; }
+    catch (e) { return 'ERR'; } })(),
 }))()"""
 
 # Accept-CH 高熵头回送探针：/accept-ch 的响应声明高熵提示，页面同源 fetch
@@ -5800,8 +5825,12 @@ async def main() -> int:
             "WebGPU：iOS 适配器 vendor == apple（真机一致）": (
                 (wg.get("hasGpu") is True and wg.get("vendor") == "apple")
                 if _ios_at_least(26) else wg.get("hasGpu") is False),
-            # ---- iOS 两口径通用：普通页面无 window.chrome（报告 §4.4 / B1-5）----
-            "window.chrome 为 undefined（iOS 普通页面无该对象）": state["hasChromeObj"] is False,
+            # ---- iOS 两口径通用：普通页面无 window.chrome.runtime（报告 §4.4 / B1-5）----
+            # F-169：对象本身在 Blink 上删不掉（own + configurable:false），
+            # 保留原生形态反而与真机一致；真机 Safari 与桌面 Chromium 都没有
+            # runtime，而该守卫正是检测站真正读的那一项。
+            "window.chrome 无 runtime（iOS 普通页面无该面）": (
+                state.get("chromeHasRuntime") is False),
             # ---- 平台 API 差集（Chromium 专有面收敛；BCD safari_ios=false）----
             # 通用传感器 API：WebKit 从未实现（真机一行判假面）
             "平台API：传感器家族整块缺席（WebKit 无通用传感器 API）": (
@@ -6410,16 +6439,16 @@ async def main() -> int:
                 "竞态：首文档 webkit.messageHandlers 已存在": probe.get("wk") is True,
                 "竞态：首文档 history 改写已生效": probe.get("hist") is True,
                 "竞态：首文档 scrollTo 改写已生效": probe.get("scroll") is True,
-                "竞态：首文档无 window.chrome": probe.get("chromeType") == "undefined",
+                "竞态：首文档无 window.chrome.runtime": probe.get("chromeRuntime") is False,
                 # 子帧（OOPIF）随 init 脚本同一份补丁：检测面不应只在顶层成立
                 "跨域 iframe：CriOS 检测面一致": (
                     fr.get("gcr") is True and fr.get("wk") is True
-                    and fr.get("hist") is True and fr.get("chromeType") == "undefined"),
+                    and fr.get("hist") is True and fr.get("chromeRuntime") is False),
                 # 二次客户端（Playwright 自建 OOPIF 会话）实时读取同一补丁
                 "跨域 iframe：二次客户端 CriOS 检测面一致": (
                     fr_live.get("gcr") is True and fr_live.get("wk") is True
                     and fr_live.get("hist") is True
-                    and fr_live.get("chromeType") == "undefined"),
+                    and fr_live.get("chromeRuntime") is False),
                 # ---- POST 重放面（B1-7）：只在 POST 文档出现 ----
                 # 真机源码：post_request.js 把 __crPostRequestWorkaround 定义为
                 # 命名空间对象（不是函数），两个回执通道由路由在重放期间临时注册。
@@ -6472,11 +6501,11 @@ async def main() -> int:
                     state["hasStandalone"] is True and state["standalone"] is False),
                 "跨域 iframe：无 CriOS 检测面（Safari 口径）": (
                     fr.get("gcr") is False and fr.get("wk") is False
-                    and fr.get("hist") is False and fr.get("chromeType") == "undefined"),
+                    and fr.get("hist") is False and fr.get("chromeRuntime") is False),
                 "跨域 iframe：二次客户端无 CriOS 检测面": (
                     fr_live.get("gcr") is False and fr_live.get("wk") is False
                     and fr_live.get("hist") is False
-                    and fr_live.get("chromeType") == "undefined"),
+                    and fr_live.get("chromeRuntime") is False),
             })
 
     # ---- 媒体查询面（全平台）：CDP 触控仿真的语义断言 ----

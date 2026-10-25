@@ -773,7 +773,15 @@ _IOS_REMOVE_GLOBALS = [
     "webkitRequestFileSystem", "webkitResolveLocalFileSystemURL",
     # ---- F-64 / F-65 / F-71：对象成员与 Document 原型面 ----
     # F-64：window.chrome 是 Chrome 的经典探测向量，iOS Safari 恒无。
-    "chrome",
+    # F-169：但**不能删**——Blink 的该属性 own 且 configurable:false，delete
+    # 静默失败，只能把值改成 undefined；而 creepjs 的 hasBadChromeRuntime
+    # （creep.js:5503）守卫是 `if (!('chrome' in window && 'runtime' in chrome))
+    # return false;`，对 undefined 取 `in` 抛 TypeError 且落在内层 try 之外，
+    # 会击穿 getHeadlessFeatures 的整块 try/catch，Headless 块退化成五行
+    # blocked。原生桌面 Chromium 的 window.chrome 是 {loadTimes, csi, app}、
+    # 同样没有 runtime，守卫第一支即 return false——留原生对象才与真机一致。
+    # 代价：`'chrome' in window` 在 Blink 上恒为 true（内核层不可消除），
+    # 属已知边界；注入器侧有对应说明（mobile_cdp_injector.py:3371）。
     # F-65：FLEDGE / Protected Audience 的 Navigator 方法面（类名在上）。
     # 拼写以 Blink 实际导出名为准（F-83 实测：真名是
     # deprecatedRun**AdAuction**EnforcesKAnonymity，此前误写成
