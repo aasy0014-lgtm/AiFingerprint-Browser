@@ -4559,6 +4559,13 @@ __FF_SRC__
                 // __csOwner 在模板顶层声明（CSSOM 补丁与 getComputedStyle
                 // 包装不在同一作用域）。
                 var __cssOrder = new WeakMap();
+                // F-184：声明 → { 规范名: 首次声明时内核里已有的长名序列 }。
+                // 真机按**源码声明序**序列化（StyleProperties.cpp:254 的
+                // asTextInternal 按 propertyAt 顺序遍历、就地折叠简写），
+                // 私有存储的项必须插回原来的位置，而不是一律排到最后。
+                // 锚点记「之前已经存在的内核长名」而不是下标：内核项被删除
+                // 后下标会整体前移，名字序列仍能定位。
+                var __cssAnc = new WeakMap();
                 var __wfInfo = function (name) {
                     if (typeof name !== 'string') { return null; }
                     var key = name.trim().toLowerCase();
@@ -4662,24 +4669,35 @@ __FF_SRC__
                 var __origCSLength = Object.getOwnPropertyDescriptor(
                     __csProto, 'length');
                 var __origCSItem = __csProto.item;
-                var __f98InBase = function (decl, name) {
-                    var base = __origCSLength
-                        ? __origCSLength.get.call(decl) : 0;
-                    for (var i = 0; i < base; i++) {
-                        if (__cssCanon(__origCSItem.call(decl, i)) === name) {
-                            return true;
-                        }
+                // F-184：私有项的位置 = 当前内核序里命中锚点的长名个数。
+                // 锚点记的是**写入当时已存在的内核长名**而不是下标：内核项
+                // 被删除后下标整体前移，名字比对仍能定位（/tmp/f184/
+                // order6.py `anchorRemoved`）。
+                var __f98Pos = function (anc, name, kn) {
+                    var a = (anc && anc[name]) || [];
+                    var pos = 0;
+                    for (var i = 0; i < kn.length; i++) {
+                        if (a.indexOf(kn[i]) !== -1) { pos++; }
                     }
-                    return false;
+                    return pos;
                 };
                 // F-166：真机一个属性一个槽，**位置是首次声明点**，与写入时
-                // 用的是前缀名还是无前缀名无关（/tmp/f582 `step4`：
-                // color、-webkit-backdrop-filter、margin-trim 之后写
-                // -webkit-hyphens，序列化成第四位的 hyphens；`pFirst` 与
-                // `uFirst4` 同序）。仿真侧别名写进内核的无前缀槽，位置就
-                // 落在内核序里，与私有项的相对次序丢失。故枚举统一走这里：
-                // 内核槽里**没被声明序接管**的项按内核序在前，接管的项按
-                // 声明序接在后面。
+                // 用的是前缀名还是无前缀名无关（/tmp/f582 `step4`）。
+                // F-184：真机按**源码声明序**保存声明表，asTextInternal
+                // （StyleProperties.cpp:254）顺序遍历、简写就地折叠，所以
+                // 私有项必须插回原位，而不是一律排到最后（六轮实测
+                // /tmp/f184/order*.py）。cssText 走锚点插入（见 getter）。
+                // 但 length/item/数字索引**不能**跟着交错：Blink 的原生索引
+                // 属性是实例自有、不可配置（/tmp/f184/idx3.py：数据属性与
+                // 访问器都抛「Index property setter is not supported」，
+                // delete 返回 false），`style[i]` 在 [0, 内核长度) 上恒命中
+                // 内核槽，挂在原型上的访问器接不到。若合并序在此交错，
+                // 尾部就会重复吐出一个已在槽里的名字（实测
+                // `[..., "margin-left", "margin-left"]`）。故枚举按「内核序 +
+                // 不在内核里的私有项」对齐：内容与长度正确，且保持
+                // item(i) === style[i] 这条真机不变量。真机本身 cssText 序
+                // 与索引序就不一致（/tmp/f184/order6.py `markerSplit`：
+                // cssText 里 --p0 在末尾、索引序里在第三位），故两者分开建模。
                 var __f98Merged = function (decl) {
                     var base = __origCSLength
                         ? __origCSLength.get.call(decl) : 0;
@@ -4689,15 +4707,14 @@ __FF_SRC__
                     var seen = Object.create(null);
                     for (var i = 0; i < base; i++) {
                         var nm = __cssCanon(__origCSItem.call(decl, i));
-                        if (o.indexOf(nm) !== -1 || seen[nm]) { continue; }
+                        if (seen[nm]) { continue; }
                         seen[nm] = 1;
                         out.push(nm);
                     }
                     for (var j = 0; j < o.length; j++) {
                         var n = o[j];
                         if (seen[n]) { continue; }
-                        if ((st && st[__f98Key(n)] !== undefined)
-                                || __f98InBase(decl, n)) {
+                        if (st && st[__f98Key(n)] !== undefined) {
                             seen[n] = 1;
                             out.push(n);
                         }
@@ -4766,10 +4783,30 @@ __FF_SRC__
                         }
                     } catch (e) {}
                 };
-                var __f98Track = function (decl, name) {
+                // F-184：首次声明时记下「此刻内核里已有的长名序列」当锚点。
+                // 重设同一个属性保位（/tmp/f184/order6.py `resetPriv`），
+                // 只有删掉再加才换锚点（`rmReadd`）。
+                var __f98Track = function (decl, name, anc) {
                     var o = __cssOrder.get(decl);
                     if (!o) { o = []; __cssOrder.set(decl, o); }
-                    if (o.indexOf(name) === -1) { o.push(name); }
+                    var a = __cssAnc.get(decl);
+                    if (!a) { a = Object.create(null); __cssAnc.set(decl, a); }
+                    if (o.indexOf(name) === -1) {
+                        o.push(name);
+                        if (anc === undefined) {
+                            var base = __origCSLength
+                                ? __origCSLength.get.call(decl) : 0;
+                            anc = [];
+                            for (var i = 0; i < base; i++) {
+                                anc.push(__cssCanon(
+                                    __origCSItem.call(decl, i)));
+                            }
+                        }
+                        a[name] = anc;
+                    } else if (anc !== undefined) {
+                        // cssText / style 属性整块重写：位置由源文本决定
+                        a[name] = anc;
+                    }
                     __f98IdxAttach(decl);
                 };
                 var __f98Untrack = function (decl, name) {
@@ -4777,6 +4814,8 @@ __FF_SRC__
                     if (!o) { return; }
                     var i = o.indexOf(name);
                     if (i !== -1) { o.splice(i, 1); }
+                    var a = __cssAnc.get(decl);
+                    if (a) { delete a[name]; }
                 };
 
                 var __origSetProperty = __csProto.setProperty;
@@ -4801,6 +4840,7 @@ __FF_SRC__
                     return (c && c[v] !== undefined) ? c[v] : v;
                 };
                 __csProto.setProperty = __maskNative(__matchLen(function (property, value, priority) {
+                    __attrDrop(this);
                     var hit = __wfInfo(property);
                     if (hit) {
                         if (__wfValueOk(hit.info, value)) {
@@ -4920,6 +4960,7 @@ __FF_SRC__
                     return __origGetPropertyValue.apply(this, arguments);
                 }, __origGetPropertyValue), 'getPropertyValue');
                 __csProto.removeProperty = __maskNative(__matchLen(function (property) {
+                    __attrDrop(this);
                     var hit = __wfInfo(property);
                     if (hit) {
                         var s = __cssStore.get(this);
@@ -5119,6 +5160,10 @@ __FF_SRC__
                 };
                 // 返回 { text, store }：text 交给内核，store 是本轮 cssText
                 // 覆盖后仍要保留的私有声明（真机整块替换，故先清后写）。
+                // F-184：store 每项带上锚点——源码里它前面已经出现的内核
+                // 长名（含前面几条声明的简写展开），真机按源码序序列化，
+                // 私有项要插回原位（/tmp/f184/order6.py `markerSplit`：
+                // `margin: …; --p0: 0` 的私有项在内核简写展开之后）。
                 // 按 ';' 切分必须跳过引号与括号内部——`url("a;b")` 会被切坏。
                 var __ctSplit = function (text) {
                     var out = [], cur = '', depth = 0, q = '';
@@ -5144,6 +5189,8 @@ __FF_SRC__
                     var parts = __ctSplit(String(text));
                     var out = [];
                     var store = [];
+                    // 源码里已经出现过的内核长名（按出现顺序）
+                    var seenK = [];
                     for (var __ai = 0; __ai < parts.length; __ai++) {
                         var p = parts[__ai];
                         if (!p.trim()) { continue; }
@@ -5161,13 +5208,21 @@ __FF_SRC__
                                     && !__cssGate[nm]
                                     && __cssLookup(nm, raw) === true) {
                                 store.push([nm, __cssValueCanon(nm, raw),
-                                            pm2 ? 'important' : '']);
+                                            pm2 ? 'important' : '',
+                                            seenK.slice()]);
                                 continue;
                             }
                         }
                         var d = __aliasCtDecl(p);
                         if (d === '') { continue; }
                         out.push(d);
+                        // 这条声明进内核后展开成的长名，供后续私有项定位
+                        var ex = __f98ExpNames(d + ';');
+                        for (var __xi = 0; __xi < ex.length; __xi++) {
+                            if (seenK.indexOf(ex[__xi]) === -1) {
+                                seenK.push(ex[__xi]);
+                            }
+                        }
                     }
                     return {
                         text: out.join(';') + (out.length ? ';' : ''),
@@ -5176,6 +5231,52 @@ __FF_SRC__
                 };
                 var __origCssText = Object.getOwnPropertyDescriptor(
                     __csProto, 'cssText');
+                // F-184：内核 cssText 里的每条声明展开成几条长名。真机
+                // asTextInternal 在**首个**长名的位置吐出整条简写，故私有项
+                // 的锚点要先换算成声明下标，才知道插在哪两条之间。
+                // 用一条脱离文档的临时声明让内核自己展开（不重复实现简写表）。
+                var __f98ExpEl = null;
+                var __f98ExpCache = Object.create(null);
+                var __f98ExpN = 0;
+                // 返回该条声明展开后的内核长名数组（真机/内核自己的简写表）。
+                var __f98ExpNames = function (declText) {
+                    var hit = __f98ExpCache[declText];
+                    if (hit !== undefined) { return hit; }
+                    var names = null;
+                    try {
+                        if (typeof document !== 'undefined'
+                                && document.createElement) {
+                            if (!__f98ExpEl) {
+                                __f98ExpEl = document.createElement('div');
+                            }
+                            var sc = __f98ExpEl.style;
+                            __origCssText.set.call(sc, '');
+                            __origCssText.set.call(sc, declText);
+                            var n2 = __origCSLength.get.call(sc) || 0;
+                            names = [];
+                            for (var i2 = 0; i2 < n2; i2++) {
+                                names.push(__cssCanon(
+                                    __origCSItem.call(sc, i2)));
+                            }
+                        }
+                    } catch (e) {}
+                    if (!names) { names = [__f98DeclName(declText)]; }
+                    if (__f98ExpN > 256) {
+                        __f98ExpCache = Object.create(null);
+                        __f98ExpN = 0;
+                    }
+                    __f98ExpCache[declText] = names;
+                    __f98ExpN++;
+                    return names;
+                };
+                var __f98ExpCount = function (declText) {
+                    return __f98ExpNames(declText).length || 1;
+                };
+                var __f98DeclName = function (txt) {
+                    var i = txt.indexOf(':');
+                    return __cssCanon((i === -1 ? txt : txt.slice(0, i))
+                        .trim().toLowerCase());
+                };
                 if (__origCssText && __origCssText.get && __origCssText.set) {
                     Object.defineProperty(__csProto, 'cssText', {
                         configurable: true,
@@ -5195,32 +5296,79 @@ __FF_SRC__
                             }
                             // F-162：私有存储里的声明（__wf 与 __cssAllow 表
                             // 命中项）不参与 Blink 的 cssText 序列化，真机会
-                            // 一并输出。按 length/item 的同一顺序追加。
+                            // 一并输出。
+                            // F-184：位置按源码声明序插回，而不是一律追加
+                            // （/tmp/f184/order6.py 六轮：简写就地折叠、
+                            // 私有项夹在简写前后都不影响折叠）。
                             var mine = __f98Stored(this);
                             if (!mine.length) { return t; }
                             var s = __cssStore.get(this);
                             if (!s) { return t; }
-                            var has = Object.create(null);
                             var base = __origCSLength
                                 ? __origCSLength.get.call(this) : 0;
+                            var has = Object.create(null);
                             for (var __ni = 0; __ni < base; __ni++) {
                                 has[__origCSItem.call(this, __ni)] = 1;
                             }
-                            var out = t;
+                            // 内核序（长名）→ 每条声明首长名的位置
+                            var kn = [];
+                            for (var __kj = 0; __kj < base; __kj++) {
+                                kn.push(__cssCanon(
+                                    __origCSItem.call(this, __kj)));
+                            }
+                            var anc = __cssAnc.get(this)
+                                || Object.create(null);
+                            var items = [];
                             for (var __mi = 0; __mi < mine.length; __mi++) {
                                 var n = mine[__mi];
-                                var sk = n === 'hyphens' ? '-webkit-hyphens' : n;
-                                if (has[n] || s[sk] === undefined) { continue; }
-                                if (out && out.charAt(out.length - 1) !== ';') {
-                                    out += ';';
+                                var sk = n === 'hyphens'
+                                    ? '-webkit-hyphens' : n;
+                                if (has[n] || s[sk] === undefined) {
+                                    continue;
                                 }
-                                out += (out ? ' ' : '') + n + ': ' + s[sk]
-                                    + (__cssPrioGet(this, sk)
-                                        ? ' !important' : '') + ';';
+                                items.push({
+                                    n: n, sk: sk,
+                                    pos: __f98Pos(anc, n, kn),
+                                    seq: __mi,
+                                });
                             }
-                            return out;                        }, 'get cssText'),
+                            if (!items.length) { return t; }
+                            items.sort(function (x, y) {
+                                return (x.pos - y.pos) || (x.seq - y.seq);
+                            });
+                            // 把内核 cssText 切成声明，累加长名数，
+                            // 在锚点处插入私有声明
+                            var decls = t ? t.split(/;\s*/) : [];
+                            var acc = 0;
+                            var out = '';
+                            var pi2 = 0;
+                            for (var __di = 0; __di < decls.length; __di++) {
+                                var dt = decls[__di];
+                                if (!dt.trim()) { continue; }
+                                // 真机在**该条声明首位长名之前**插入私有项
+                                while (pi2 < items.length
+                                        && items[pi2].pos <= acc) {
+                                    out += items[pi2].n + ': '
+                                        + s[items[pi2].sk]
+                                        + (__cssPrioGet(this, items[pi2].sk)
+                                            ? ' !important' : '') + '; ';
+                                    pi2++;
+                                }
+                                out += dt + '; ';
+                                acc += __f98ExpCount(dt + ';');
+                            }
+                            while (pi2 < items.length) {
+                                out += items[pi2].n + ': '
+                                    + s[items[pi2].sk]
+                                    + (__cssPrioGet(this, items[pi2].sk)
+                                        ? ' !important' : '') + '; ';
+                                pi2++;
+                            }
+                            return out.replace(/\s+$/, '');
+                        }, 'get cssText'),
                         set: __maskNative(function (v) {
                             var s = String(v);
+                            __attrDrop(this);
                             // 只有涉及别名或 WebKit 专有属性时才重写，其余
                             // 原样交给内核——按 ';' 切分会破坏 url()/字符串里
                             // 的分号。F-171：hanging-punctuation 也要进这条
@@ -5245,12 +5393,22 @@ __FF_SRC__
                             }
                             var ord = __cssOrder.get(this);
                             if (ord) { ord.length = 0; }
+                            var anc1 = __cssAnc.get(this);
+                            if (anc1) {
+                                for (var __ak in anc1) {
+                                    if (Object.prototype.hasOwnProperty.call(
+                                            anc1, __ak)) {
+                                        delete anc1[__ak];
+                                    }
+                                }
+                            }
                             for (var __si = 0; __si < r.store.length; __si++) {
                                 __cssStore_put(this, r.store[__si][0],
                                                r.store[__si][1]);
                                 __cssPrioSet(this, r.store[__si][0],
                                              r.store[__si][2]);
-                                __f98Track(this, __cssCanon(r.store[__si][0]));
+                                __f98Track(this, __cssCanon(r.store[__si][0]),
+                                           r.store[__si][3]);
                             }
                         }, 'set cssText'),
                     });
@@ -5276,23 +5434,89 @@ __FF_SRC__
                     }
                     var ord2 = __cssOrder.get(st);
                     if (ord2) { ord2.length = 0; }
+                    var anc2 = __cssAnc.get(st);
+                    if (anc2) {
+                        for (var __ak2 in anc2) {
+                            if (Object.prototype.hasOwnProperty.call(
+                                    anc2, __ak2)) {
+                                delete anc2[__ak2];
+                            }
+                        }
+                    }
                     for (var __s3 = 0; __s3 < r.store.length; __s3++) {
                         __cssStore_put(st, r.store[__s3][0], r.store[__s3][1]);
                         __cssPrioSet(st, r.store[__s3][0], r.store[__s3][2]);
-                        __f98Track(st, __cssCanon(r.store[__s3][0]));
+                        __f98Track(st, __cssCanon(r.store[__s3][0]),
+                                   r.store[__s3][3]);
                     }
                     return r.text;
                 };
                 var __elProto = Element.prototype;
+                // F-184：真机把 style **属性文本**原样保存，直到有 CSSOM
+                // 写入才按声明表重新序列化（/tmp/f184/attr1.py `raw2`：
+                // `"  color:red ;; margin-trim:block  "` 读回一字不差，而
+                // 内核 cssText 已是 `color: red; margin-trim: block;`；
+                // `after2` 一次 CSSOM 写入后属性文本随之重写，且此时**带**
+                // 结尾分号）。Blink 在解析属性时就重写了文本，故自己留一份
+                // 原文：元素 → 原文，任何 CSSOM 写入路径先失效它。
+                var __attrRaw = new WeakMap();
+                // 声明 → 所属元素。`__csOwner` 只登记 getComputedStyle 的
+                // 声明，普通 `el.style` 拿不到归属；索引属性不可改写
+                // （/tmp/f184/idx3.py），故在属性读写包装里顺手登记。
+                var __declEl = new WeakMap();
+                var __attrDrop = function (decl) {
+                    try {
+                        var el = __declEl.get(decl);
+                        if (el) { __attrRaw.delete(el); }
+                    } catch (e) {}
+                };
+                // 存原文时一并记下此刻的内核 cssText。原生具名属性写入
+                // （`el.style.color = 'blue'`）绕过本文件所有包装器，靠这份
+                // 快照比对发现「属性已被内核重写」（/tmp/f184/attr1.py
+                // `after2`/`after3`）。
+                var __attrSave = function (el, raw) {
+                    try {
+                        __attrRaw.set(el, {
+                            raw: raw,
+                            snap: __origCssText.get.call(el.style),
+                        });
+                    } catch (e) {}
+                };
+                var __attrLive = function (el) {
+                    var rec;
+                    try { rec = __attrRaw.get(el); } catch (e) {}
+                    if (!rec) { return undefined; }
+                    try {
+                        if (__origCssText.get.call(el.style) !== rec.snap) {
+                            __attrRaw.delete(el);
+                            return undefined;
+                        }
+                    } catch (e) { return undefined; }
+                    return rec.raw;
+                };
                 var __origSetAttr = __elProto.setAttribute;
                 __elProto.setAttribute = __maskNative(__matchLen(function (name, value) {
                     if (typeof name === 'string'
                             && name.toLowerCase() === 'style'
                             && arguments.length >= 2) {
-                        var txt = __styleAttrSplit(this, value);
-                        if (txt !== null) {
-                            return __origSetAttr.call(this, name, txt);
+                        // F-184：属性原文一字不动地保存（真机在 CSSOM 写入
+                        // 之前不重写属性文本）。快照在解析之后取，才反映
+                        // 解析后的内核状态。
+                        try { __declEl.set(this.style, this); } catch (e) {}
+                        var __ok = true;
+                        var __rc;
+                        try {
+                            var txt = __styleAttrSplit(this, value);
+                            __rc = txt !== null
+                                ? __origSetAttr.call(this, name, txt)
+                                : __origSetAttr.apply(this, arguments);
+                        } catch (e) {
+                            __ok = false;
+                            throw e;
+                        } finally {
+                            if (__ok) { __attrSave(this, String(value)); }
                         }
+                        return __rc;
                     }
                     return __origSetAttr.apply(this, arguments);
                 }, __origSetAttr), 'setAttribute');
@@ -5300,6 +5524,7 @@ __FF_SRC__
                 __elProto.removeAttribute = __maskNative(__matchLen(function (name) {
                     if (typeof name === 'string' && name.toLowerCase() === 'style') {
                         var st2 = this.style;
+                        try { __attrRaw.delete(this); } catch (e) {}
                         var o3 = __cssStore.get(st2);
                         if (o3) {
                             for (var __o4 in o3) {
@@ -5310,6 +5535,15 @@ __FF_SRC__
                         }
                         var od3 = __cssOrder.get(st2);
                         if (od3) { od3.length = 0; }
+                        var an3 = __cssAnc.get(st2);
+                        if (an3) {
+                            for (var __ak3 in an3) {
+                                if (Object.prototype.hasOwnProperty.call(
+                                        an3, __ak3)) {
+                                    delete an3[__ak3];
+                                }
+                            }
+                        }
                         var pr3 = __cssPrio.get(st2);
                         if (pr3) {
                             for (var __o5 in pr3) {
@@ -5325,12 +5559,22 @@ __FF_SRC__
                 // 属性文本里（/tmp/f565：无属性元素 setProperty 之后
                 // getAttribute('style') 给出该声明）。内核只序列化自己的槽，
                 // 故有私有声明时改用 cssText（已合并私有项）。
+                // F-184：属性文本的两种来源，规则不同（/tmp/f184/attr1.py、
+                // attr2.py）：
+                //   ① 原样保留期——未发生 CSSOM 写入时，真机原封不动地回读
+                //      设置时的字面文本（含异常空格、缺尾分号），由
+                //      __attrLive 给出；
+                //   ② 重生成期——任何 CSSOM 写入之后，真机用完整 cssText
+                //      覆写属性，**含尾分号**（`"color: blue; margin-trim: block;"`）。
                 var __origGetAttr = __elProto.getAttribute;
                 __elProto.getAttribute = __maskNative(__matchLen(function (name) {
                     var v = __origGetAttr.apply(this, arguments);
-                    if (typeof name === 'string' && name.toLowerCase() === 'style'
-                            && __f98Stored(this.style).length) {
-                        return this.style.cssText;
+                    if (typeof name === 'string' && name.toLowerCase() === 'style') {
+                        var raw = __attrLive(this);
+                        if (raw !== undefined && v !== null) { return raw; }
+                        if (__f98Stored(this.style).length) {
+                            return String(this.style.cssText);
+                        }
                     }
                     return v;
                 }, __origGetAttr), 'getAttribute');

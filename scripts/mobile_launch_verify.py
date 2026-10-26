@@ -895,6 +895,76 @@ STATE_JS = """async () => {
                 stick.remove();
                 return out;
             })(),
+            // F-184：私有存储项在 cssText 里按**源码声明序**插回原位
+            // （WebKit StyleProperties::asTextInternal 按 propertyAt 顺序遍历、
+            // 就地折叠简写），而不是一律排到末尾；style 属性文本在 CSSOM
+            // 写入之前原样保留、之后重生成（含尾分号）。
+            cssF184: (() => {
+                const names = (st) => {
+                    const a = [];
+                    for (let i = 0; i < st.length; i++) { a.push(st[i]); }
+                    return a;
+                };
+                const mk = (t) => {
+                    const e = document.createElement('div');
+                    e.style.cssText = t;
+                    return e.style;
+                };
+                const out = {};
+                // 源码序：私有项夹在简写中间
+                out.split = mk('margin-top: 1px; margin-trim: block; '
+                    + 'margin-right: 2px; margin-bottom: 3px; '
+                    + 'margin-left: 4px').cssText;
+                // 私有项在最前，后面是会被折叠回简写的四个长名
+                out.privLong4 = mk('margin-trim: block; margin-top: 1px; '
+                    + 'margin-right: 2px; margin-bottom: 3px; '
+                    + 'margin-left: 4px').cssText;
+                // 锚点：删掉私有项前面的内核声明后仍留在原位
+                let st = document.createElement('div').style;
+                st.setProperty('color', 'red');
+                st.setProperty('margin-trim', 'block');
+                st.removeProperty('color');
+                st.setProperty('background', 'blue');
+                out.anchorRemoved = st.cssText;
+                // 重设保位 / 删后重加换位
+                st = document.createElement('div').style;
+                st.setProperty('margin-trim', 'block');
+                st.setProperty('color', 'red');
+                st.setProperty('margin-trim', 'inline');
+                out.resetPriv = st.cssText;
+                st = document.createElement('div').style;
+                st.setProperty('margin-trim', 'block');
+                st.setProperty('color', 'red');
+                st.removeProperty('margin-trim');
+                st.setProperty('margin-trim', 'inline');
+                out.rmReadd = st.cssText;
+                // 属性文本：原文期 verbatim（异常空格、无尾分号），
+                // 重生成期给完整 cssText（含尾分号）
+                let e = document.createElement('div');
+                e.setAttribute('style', '  color:red ;; margin-trim:block  ');
+                out.rawSpacing = [e.getAttribute('style'),
+                                  e.style.cssText];
+                e = document.createElement('div');
+                e.setAttribute('style', 'color: red; margin-trim: block');
+                e.style.setProperty('color', 'blue');
+                out.rawThenCsom = [e.getAttribute('style'),
+                                   e.style.cssText];
+                e = document.createElement('div');
+                e.style.setProperty('margin-trim', 'block');
+                out.privOnly = [e.getAttribute('style'), e.style.cssText];
+                e = document.createElement('div');
+                e.setAttribute('style', '  color : red  ');
+                out.parsedRaw = e.getAttribute('style');
+                e = document.createElement('div');
+                e.setAttribute('style', 'margin: 1px; margin-trim: block');
+                out.attrShText = [e.getAttribute('style'),
+                                  e.style.cssText];
+                // 索引序是另一套模型：私有项排在末尾（内核索引槽不可删改）
+                out.splitNames = names(mk('margin-top: 1px; '
+                    + 'margin-trim: block; margin-right: 2px; '
+                    + 'margin-bottom: 3px; margin-left: 4px'));
+                return out;
+            })(),
             // F-99 / F-100：computed 值的序列化口径与 UA 默认值。真机口径
             // （Playwright WebKit 27.2 移动上下文实测，含 rtl / vertical-rl /
             // display:none 分支）：布局长度走 1/64px LayoutUnit（物理右侧外边距
@@ -4387,6 +4457,7 @@ async def main() -> int:
     tf = eng.get("touchFactory") or {}
     f98 = eng.get("cssF98") if isinstance(eng.get("cssF98"), dict) else {}
     f99 = eng.get("cssF99") if isinstance(eng.get("cssF99"), dict) else {}
+    f184 = eng.get("cssF184") if isinstance(eng.get("cssF184"), dict) else {}
     mms = state.get("mms") if isinstance(state.get("mms"), dict) else {}
     aig_mag = _sensor_magnitude(last_motion.get("aig"))
     lin_mag = _sensor_magnitude(last_motion.get("acc"))
@@ -6384,6 +6455,35 @@ async def main() -> int:
                 and f98.get("removed") == "blur(4px)"
                 and f98.get("lenAfter") == 4
                 and f98.get("emptyIn") is False),
+            # F-184：源码声明序插回 + 锚点 + 属性文本两期
+            "CSS：私有项在 cssText 里按源码声明序插回原位（F-184）": (
+                f184.get("split")
+                    == "margin: 1px 2px 3px 4px; margin-trim: block;"
+                and f184.get("privLong4")
+                    == "margin-trim: block; margin: 1px 2px 3px 4px;"
+                and f184.get("anchorRemoved")
+                    == "margin-trim: block; background: blue;"
+                and f184.get("resetPriv")
+                    == "margin-trim: inline; color: red;"
+                and f184.get("rmReadd")
+                    == "color: red; margin-trim: inline;"),
+            "CSS：style 属性文本两期——原文 verbatim / 重生成含尾分号（F-184）": (
+                f184.get("rawSpacing")
+                    == ["  color:red ;; margin-trim:block  ",
+                        "color: red; margin-trim: block;"]
+                and f184.get("rawThenCsom")
+                    == ["color: blue; margin-trim: block;",
+                        "color: blue; margin-trim: block;"]
+                and f184.get("privOnly")
+                    == ["margin-trim: block;", "margin-trim: block;"]
+                and f184.get("parsedRaw") == "  color : red  "
+                and f184.get("attrShText")
+                    == ["margin: 1px; margin-trim: block",
+                        "margin: 1px; margin-trim: block;"]
+                # 索引序是另一套模型：内核索引槽不可删改，私有项只能排在末尾
+                and f184.get("splitNames")
+                    == ["margin-top", "margin-right", "margin-bottom",
+                        "margin-left", "margin-trim"]),
             # F-99：computed 数值序列化（LayoutUnit 1/64 / float32 / 整数档）
             "CSS：computed 长度按 WebKit 三档口径序列化": (
                 f99.get("width") == "21.4375px"
