@@ -3152,6 +3152,35 @@ WEBGPU_JS = """(async () => {
     out.device = i.device;
     out.description = i.description;
     out.protoOk = Object.getPrototypeOf(i) === GPUAdapterInfo.prototype;
+    // ---- F-185：适配器层 limits/features 按 WebKit 源码常量；无效设备语义 ----
+    // 适配器 limits 表逐项入指纹（creepjs getWebGpu 的 limitsData hashMini），
+    // 三项 buffer 上限按 iOS 分支 = min(GB, maxBufferLength/3) → 1073741824。
+    out.lim = {};
+    for (const k of ['maxBindGroups', 'maxTextureDimension2D', 'maxUniformBufferBindingSize',
+                     'maxStorageBufferBindingSize', 'maxBufferSize',
+                     'minUniformBufferOffsetAlignment', 'maxVertexAttributes']) {
+      out.lim[k] = a.limits[k];
+    }
+    out.featSize = a.features.size;
+    out.featHas16 = a.features.has('shader-f16');
+    out.featDrop = a.features.has('dual-source-blending');
+    // ② 第二次 requestDevice 解析为**无效设备**（不是 reject），features 空集
+    const d1 = await a.requestDevice();
+    const d2 = await a.requestDevice({label: 'I'});
+    out.third = {
+      isDev: Object.getPrototypeOf(d2) === GPUDevice.prototype,
+      label: d2.label,
+      featSize: d2.features.size,
+      limBG: d2.limits.maxBindGroups,
+      lost: await Promise.race([d2.lost.then(x => ({reason: x.reason, msg: x.message})),
+                                new Promise(r => setTimeout(() => r('pending'), 500))]),
+      lostSame: d2.lost === d2.lost,
+    };
+    d2.destroy();
+    // ③ 有效设备 destroy 后的 lost 文案：WebKit 恒为 ""（GPUDevice.cpp:156）
+    d1.destroy();
+    out.validLost = await Promise.race([d1.lost.then(x => ({reason: x.reason, msg: x.message})),
+                                        new Promise(r => setTimeout(() => r('pending'), 500))]);
   } catch (e) { out.err = String(e); }
   return out;
 })()"""
@@ -6017,6 +6046,44 @@ async def main() -> int:
             "WebGPU：iOS 适配器 vendor == apple（真机一致）": (
                 (wg.get("hasGpu") is True and wg.get("vendor") == "apple")
                 if _ios_at_least(26) else wg.get("hasGpu") is False),
+            # ---- F-185：适配器 limits/features 取 WebKit 源码常量（iOS 26+ 才有 GPU）----
+            # HardwareCapabilities.mm：iPad Air 13" (M3) = defaultLimits() 与
+            # apple6/apple7 逐项 mergeLimits()（取更宽松者），35 项全是编译期常量；
+            # 三项 buffer 上限在 rawHardwareCapabilities 末尾统一按 maxBufferSize(device)
+            # 覆盖，iOS 分支 = multipleOf4(max(256MiB, min(GB, maxBufferLength/3)))
+            # → 1 GiB。宿主 Blink/Dawn 报的是保守默认值（maxBindGroups 4、
+            # alignment 256），creepjs 把整张表 hashMini 入指纹，可直接命中。
+            "WebGPU：适配器 limits 取 apple6/7 表（bg 11 / tex2D 16384 / attr 30 / align 32）": (
+                wg.get("lim") == {"maxBindGroups": 11, "maxTextureDimension2D": 16384,
+                                  "maxUniformBufferBindingSize": 1073741824,
+                                  "maxStorageBufferBindingSize": 1073741824,
+                                  "maxBufferSize": 1073741824,
+                                  "minUniformBufferOffsetAlignment": 32,
+                                  "maxVertexAttributes": 30}
+                if _ios_at_least(26) else True),
+            # apple6/7 固定追加 float16/float32-renderable；宿主 Dawn 独有的
+            # dual-source-blending / texture-component-swizzle 必须不在表里。
+            "WebGPU：适配器 features 含 float16-renderable、无 dual-source-blending": (
+                (wg.get("featHas16") is True and wg.get("featDrop") is False)
+                if _ios_at_least(26) else True),
+            # Adapter.cpp:85-89：m_deviceRequested 已置位时回调
+            # Device::createInvalid(*this) —— 设备**非空**，GPUAdapter.cpp:130-138
+            # 走 resolve 分支，页面拿到一台 features 空集、limits 为规范默认值、
+            # lost 恒 {unknown, ""} 的真 GPUDevice（不是 reject）。
+            "WebGPU：重复 requestDevice 解析为无效设备（features 空 / lost unknown）": (
+                (wg.get("third") or {}).get("isDev") is True
+                and (wg.get("third") or {}).get("featSize") == 0
+                and (wg.get("third") or {}).get("limBG") == 4
+                and (wg.get("third") or {}).get("lost") == {"reason": "unknown", "msg": ""}
+                and (wg.get("third") or {}).get("lostSame") is True
+                if _ios_at_least(26) else True),
+            # GPUDevice.cpp:156 是全仓唯一构造 DeviceLostInfo 的地方，message
+            # 硬编码 ""——用户 destroy 有效设备也报空文案，Blink 报
+            # "Device was destroyed."。
+            "WebGPU：有效设备 destroy 后 lost == {destroyed, \"\"}": (
+                (wg.get("validLost") or {}).get("reason") == "destroyed"
+                and (wg.get("validLost") or {}).get("msg") == ""
+                if _ios_at_least(26) else True),
             # ---- iOS 两口径通用：普通页面无 window.chrome.runtime（报告 §4.4 / B1-5）----
             # F-169：对象本身在 Blink 上删不掉（own + configurable:false），
             # 保留原生形态反而与真机一致；真机 Safari 与桌面 Chromium 都没有

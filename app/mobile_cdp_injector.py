@@ -7414,6 +7414,826 @@ __FF_SRC__
             } catch (e) {}
         }
 
+        // ---- WebGPU：适配器 limits / features 按 GPU 家族取源码常量（F-185）----
+        // 取证：WebKit safari-7625.1.29.11-branch
+        //   Source/WebGPU/WebGPU/HardwareCapabilities.mm
+        // 真机的 limits 不是 Metal 运行时读出来的，而是**编译期常量**：按
+        // supportsFamily(Apple4..7/Mac2) 逐档 mergeLimits()（mergeMaximum /
+        // mergeAlignment，即取更宽松者）。iPad Air 13" (M3) 支持 Apple4~7 且
+        // 不支持 Mac2，故其表 = defaultLimits() 与 apple6/apple7 的逐项最大值，
+        // 两者 35 项完全相同（仅空格差异）。宿主 Blink 走 SwiftShader/ANGLE，
+        // 适配器层报的是 Dawn 的保守默认值（maxBindGroups 4、alignment 256 等），
+        // 24/35 项与真机不符；creepjs 用 hashMini 把整张 limits 表入指纹
+        // （creep.js getWebGpu 的 limitsData），可直接命中。
+        // 设备层（requestDevice）两边都等于 WebGPU 规范默认值 defaultLimits()，
+        // 所以只改适配器实例，设备层保持原生——因此按实例区分（__gpuAdLim 弱集），
+        // 不动原型，GPUSupportedLimits.prototype 的原生身份与 getter 不变。
+        // 唯一仍随宿主走的是 texture-compression-bc：它由
+        // device.supportsBCTextureCompression（Metal 家族属性）决定，本机恰为
+        // true，与 iPad 一致；若换到不支持的宿主会缺这两项，留作已知边界。
+        if (D.ios && typeof GPUAdapter !== 'undefined' && typeof GPUSupportedLimits !== 'undefined'
+                && typeof GPUSupportedFeatures !== 'undefined') {
+            try {
+                // 适配器层：iPad Air 13" (M3) = apple4~7 逐档 mergeLimits()。
+                // apple4/apple5 用 defaultLimits()，apple6/apple7 用同值的放宽表，
+                // 故结果即 apple6 那张表；maxUniform/maxStorageBufferBindingSize
+                // 与 maxBufferSize 在 rawHardwareCapabilities 末尾统一覆盖为
+                // maxBufferSize(device)（HardwareCapabilities.mm:52-61：非 Mac 分支
+                // = multipleOf4(max(256MiB, min(GB, maxBufferLength/3)))，GB 是
+                // StdLibExtras.h:150 的 1GiB，故 iPad 上封顶 1073741824）。
+                // 注意本机 Playwright WebKit 走的是 PLATFORM(MAC) 分支
+                // （min(INT_MAX, maxBufferLength/3) → 2147483644），那个值不能
+                // 当作 iOS 口径。表值其余 32 项与真机逐项实测一致（/tmp/f187a.py）。
+                var __wkLim = {
+                    maxTextureDimension1D: 16384, maxTextureDimension2D: 16384,
+                    maxTextureDimension3D: 2048, maxTextureArrayLayers: 2048,
+                    maxBindGroups: 11, maxBindGroupsPlusVertexBuffers: 30,
+                    maxBindingsPerBindGroup: 65535,
+                    maxDynamicUniformBuffersPerPipelineLayout: 65535,
+                    maxDynamicStorageBuffersPerPipelineLayout: 65535,
+                    maxSampledTexturesPerShaderStage: 44,
+                    maxSamplersPerShaderStage: 22,
+                    maxStorageBuffersPerShaderStage: 44,
+                    maxStorageTexturesPerShaderStage: 44,
+                    maxUniformBuffersPerShaderStage: 44,
+                    maxUniformBufferBindingSize: 1073741824,
+                    maxStorageBufferBindingSize: 1073741824,
+                    minUniformBufferOffsetAlignment: 32,
+                    minStorageBufferOffsetAlignment: 32,
+                    maxVertexBuffers: 12, maxBufferSize: 1073741824,
+                    maxVertexAttributes: 30, maxVertexBufferArrayStride: 65532,
+                    maxInterStageShaderVariables: 31, maxColorAttachments: 8,
+                    maxColorAttachmentBytesPerSample: 64,
+                    maxComputeWorkgroupStorageSize: 32768,
+                    maxComputeInvocationsPerWorkgroup: 1024,
+                    maxComputeWorkgroupSizeX: 1024, maxComputeWorkgroupSizeY: 1024,
+                    maxComputeWorkgroupSizeZ: 1024,
+                    maxComputeWorkgroupsPerDimension: 65535,
+                    maxStorageBuffersInFragmentStage: 44,
+                    maxStorageTexturesInFragmentStage: 44,
+                    maxStorageBuffersInVertexStage: 44,
+                    maxStorageTexturesInVertexStage: 44,
+                };
+                // apple6/apple7 在 baseFeatures 之上固定追加的两项（宿主不报）
+                var __wkFeat = ['float16-renderable', 'float32-renderable'];
+                // 宿主 Dawn 独有、真机 WebKit 没有的两项：合法枚举名，但适配器不支持
+                var __dropFeat = ['dual-source-blending', 'texture-component-swizzle'];
+                // 真机枚举序（WGPUFeatureName 枚举序，Adapter 用 std::ranges::sort
+                // 排序后输出）；/tmp/f187g.py 实测 22 项顺序即此。
+                var __gpuFeatOrder = [
+                    'depth-clip-control', 'depth32float-stencil8', 'timestamp-query',
+                    'texture-compression-bc', 'texture-compression-bc-sliced-3d',
+                    'texture-compression-etc2', 'texture-compression-astc',
+                    'texture-compression-astc-sliced-3d', 'indirect-first-instance',
+                    'shader-f16', 'rg11b10ufloat-renderable', 'bgra8unorm-storage',
+                    'float32-filterable', 'float32-blendable', 'clip-distances',
+                    'primitive-index', 'float16-renderable', 'float32-renderable',
+                    'core-features-and-limits', 'texture-formats-tier1',
+                    'texture-formats-tier2', 'subgroups',
+                ];
+
+                // 设备层默认值 = 规范 defaultLimits()（HardwareCapabilities.mm:704-742）。
+                // requestDevice 的 requiredLimits 是在这张表上「取更宽松者」回填，
+                // 而不是像 Blink 那样原样回显请求值（/tmp/f187p.py 实测 bg0：
+                // 真机 4、Blink 0）。
+                var __wkDefaultLim = {
+                    maxTextureDimension1D: 8192, maxTextureDimension2D: 8192,
+                    maxTextureDimension3D: 2048, maxTextureArrayLayers: 256,
+                    maxBindGroups: 4, maxBindGroupsPlusVertexBuffers: 24,
+                    maxBindingsPerBindGroup: 1000,
+                    maxDynamicUniformBuffersPerPipelineLayout: 8,
+                    maxDynamicStorageBuffersPerPipelineLayout: 4,
+                    maxSampledTexturesPerShaderStage: 16,
+                    maxSamplersPerShaderStage: 16,
+                    maxStorageBuffersPerShaderStage: 8,
+                    maxStorageTexturesPerShaderStage: 4,
+                    maxUniformBuffersPerShaderStage: 12,
+                    maxUniformBufferBindingSize: 65536,
+                    maxStorageBufferBindingSize: 134217728,
+                    minUniformBufferOffsetAlignment: 256,
+                    minStorageBufferOffsetAlignment: 256,
+                    maxVertexBuffers: 8, maxBufferSize: 268435456,
+                    maxVertexAttributes: 16, maxVertexBufferArrayStride: 2048,
+                    maxInterStageShaderVariables: 16, maxColorAttachments: 8,
+                    maxColorAttachmentBytesPerSample: 32,
+                    maxComputeWorkgroupStorageSize: 16384,
+                    maxComputeInvocationsPerWorkgroup: 256,
+                    maxComputeWorkgroupSizeX: 256, maxComputeWorkgroupSizeY: 256,
+                    maxComputeWorkgroupSizeZ: 64,
+                    maxComputeWorkgroupsPerDimension: 65535,
+                    maxStorageBuffersInFragmentStage: 8,
+                    maxStorageTexturesInFragmentStage: 4,
+                    maxStorageBuffersInVertexStage: 8,
+                    maxStorageTexturesInVertexStage: 4,
+                };
+
+                var __limOv = typeof WeakMap === 'function' ? new WeakMap() : null;
+                var __featOv = typeof WeakMap === 'function' ? new WeakMap() : null;
+                // 已成功建过设备的适配器（见下方 ④）
+                var __adUsed = typeof WeakMap === 'function' ? new WeakMap() : null;
+                // 无效设备的 lost info 覆写表（info 实例 → {reason, message}）
+                var __lostOv = typeof WeakMap === 'function' ? new WeakMap() : null;
+                // 无效设备实例 → {seen, ov}（见下方 ④：ov 是它 lost info 的
+                // {reason, message}，seen 表示「lost 已被读过、理由已冻结」）
+                var __invDev = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+                // GPUDeviceLostInfo：WebKit 的无效设备由
+                // Device::setDeviceLostCallback → `!m_adapter->isValid()` →
+                // loseTheDevice(Undefined) 解析，reason 是 'unknown'、message 是 ""
+                // （Device.mm:636-645、DeviceLostInfo::create(reason, ""_s)）。
+                // 宿主 Blink 只有 destroy 一条路，恒为 'destroyed' /
+                // "Device was destroyed."，故按实例覆写两个 getter；非覆写实例
+                // 仍走原生 getter（品牌校验保留，伪造对象照样 Illegal invocation）。
+                //
+                // message 对**所有**设备恒为空串：WebKit 只在 GPUDevice.cpp:156
+                // 一处创建 DeviceLostInfo，参数写死 `""_s`（/tmp/f188s.py 实测
+                // 有效设备 destroy 后 msg 也是 ""），故不做实例判定。
+                if (__lostOv && typeof GPUDeviceLostInfo !== 'undefined'
+                        && GPUDeviceLostInfo.prototype) {
+                    var __liProto = GPUDeviceLostInfo.prototype;
+                    var __wrapLostProp = function (name, always) {
+                        var d = Object.getOwnPropertyDescriptor(__liProto, name);
+                        if (!d || typeof d.get !== 'function' || !d.configurable) { return; }
+                        var nativeGet = d.get;
+                        try {
+                            Object.defineProperty(__liProto, name, {
+                                get: __maskNative(function () {
+                                    var ov = __lostOv.get(this);
+                                    if (ov) { return ov[name]; }
+                                    // 先走原生 getter 完成品牌校验，再按需替换返回值
+                                    var v = nativeGet.call(this);
+                                    return always !== undefined ? always : v;
+                                }, 'get ' + name),
+                                enumerable: true,
+                                configurable: true,
+                            });
+                        } catch (e) {}
+                    };
+                    __wrapLostProp('reason');
+                    __wrapLostProp('message', '');
+                    // JSC 按 IDL 声明序（constructor, reason, message），V8 把
+                    // constructor 排尾；与 F-47 的 protoOrder 同一手法。
+                    try {
+                        var __liOrder = ['constructor', 'reason', 'message'];
+                        var __liDescs = {};
+                        var __liNames = Object.getOwnPropertyNames(__liProto);
+                        for (var __ln = 0; __ln < __liNames.length; __ln++) {
+                            var __ld = Object.getOwnPropertyDescriptor(__liProto, __liNames[__ln]);
+                            if (!__ld || !__ld.configurable) { continue; }
+                            __liDescs[__liNames[__ln]] = __ld;
+                            delete __liProto[__liNames[__ln]];
+                        }
+                        for (var __lo = 0; __lo < __liOrder.length; __lo++) {
+                            var __lx = __liDescs[__liOrder[__lo]];
+                            if (__lx) { Object.defineProperty(__liProto, __liOrder[__lo], __lx); }
+                        }
+                    } catch (e) {}
+                }
+
+                var __limProto = GPUSupportedLimits.prototype;
+                for (var __lk in __wkLim) {
+                    if (!Object.prototype.hasOwnProperty.call(__wkLim, __lk)) { continue; }
+                    (function (name, value) {
+                        var d = Object.getOwnPropertyDescriptor(__limProto, name);
+                        if (!d || typeof d.get !== 'function' || !d.configurable) { return; }
+                        var nativeGet = d.get;
+                        try {
+                            Object.defineProperty(__limProto, name, {
+                                get: __maskNative(function () {
+                                    var ov = __limOv ? __limOv.get(this) : null;
+                                    if (ov && Object.prototype.hasOwnProperty.call(ov, name)) {
+                                        return ov[name];
+                                    }
+                                    return nativeGet.call(this);
+                                }, 'get ' + name),
+                                enumerable: true,
+                                configurable: true,
+                            });
+                        } catch (e) {}
+                    })(__lk, __wkLim[__lk]);
+                }
+
+                var __featProto = GPUSupportedFeatures.prototype;
+                var __origFeatValues = __featProto.values;
+                // 宿主原生 feature 集合 → 真机口径的适配器表（枚举序、剔除宿主独有项、
+                // 补上 WebKit apple6/7 固定追加项）。
+                var __featMask = function (nativeObj) {
+                    // setlike 的 values() 返回迭代器而非数组，必须先展开
+                    var nativeVals = Array.from(__origFeatValues.call(nativeObj));
+                    var out = [];
+                    for (var j = 0; j < __gpuFeatOrder.length; j++) {
+                        var want = __gpuFeatOrder[j];
+                        if (__dropFeat.indexOf(want) >= 0) { continue; }
+                        // 真机序表里的项：宿主报了就保留；float16/float32-renderable
+                        // 是 WebKit apple6/7 档固定追加（宿主不报），照样补上。
+                        var found = __wkFeat.indexOf(want) >= 0;
+                        for (var i = 0; i < nativeVals.length && !found; i++) {
+                            if (nativeVals[i] === want) { found = true; }
+                        }
+                        if (found) { out.push(want); }
+                    }
+                    // 真机序表之外、宿主独有的项（新特性）接在尾部，不丢
+                    for (var k = 0; k < nativeVals.length; k++) {
+                        var v = nativeVals[k];
+                        if (__gpuFeatOrder.indexOf(v) < 0 && __dropFeat.indexOf(v) < 0) { out.push(v); }
+                    }
+                    return out;
+                };
+                // requestDevice 的 requiredFeatures 回显（Impl_Adapter.cpp:186-197）：
+                // 按请求序去重 → 补隐含项 tier2→tier1→rg11b10ufloat-renderable →
+                // 末位追加 core-features-and-limits。
+                var __devFeatEcho = function (req) {
+                    var out = [];
+                    for (var i = 0; i < req.length; i++) {
+                        if (out.indexOf(req[i]) < 0) { out.push(req[i]); }
+                    }
+                    if (out.indexOf('texture-formats-tier2') >= 0
+                            && out.indexOf('texture-formats-tier1') < 0) {
+                        out.push('texture-formats-tier1');
+                    }
+                    if (out.indexOf('texture-formats-tier1') >= 0
+                            && out.indexOf('rg11b10ufloat-renderable') < 0) {
+                        out.push('rg11b10ufloat-renderable');
+                    }
+                    if (out.indexOf('core-features-and-limits') < 0) {
+                        out.push('core-features-and-limits');
+                    }
+                    return out;
+                };
+                var __featOf = function (self) { return __featOv ? __featOv.get(self) : null; };
+                // requestDevice 的 requiredLimits 回填（Impl_Adapter.cpp:198-259）：
+                // 从 wgpuDefaultLimits() 起逐键 setMaxIntegerValue（取更大）/
+                // setAlignmentIntegerValue（取更小）。对齐值不可能被调大——256 是
+                // 规范下限，请求 512 时 `512 < 256` 为假，结果仍是 256。
+                var __devLimEcho = function (limVals) {
+                    var ov = {};
+                    for (var ek in limVals) {
+                        if (!Object.prototype.hasOwnProperty.call(limVals, ek)) { continue; }
+                        var base = __wkDefaultLim[ek];
+                        if (typeof base !== 'number') { continue; }
+                        ov[ek] = __isAlignLim(ek)
+                            ? Math.min(base, limVals[ek])
+                            : Math.max(base, limVals[ek]);
+                    }
+                    return ov;
+                };
+
+                // ---- 无效设备的 lost / destroy ----
+                // WebKit 的 DeviceLostInfo 理由只有两种来路（Device.mm:636-645）：
+                //   · destroy() 先发生（m_isLost 已置位）→ loseTheDevice(Destroyed)
+                //   · 否则适配器已失效（m_adapter->isValid() 为假）→ Undefined（'unknown'）
+                // 且**第一次**读 lost 才登记回调，此后理由冻结（/tmp/f188s.py：
+                // invalidLostThenDestroy 的 same:true、destroy 后仍 unknown）。
+                // 宿主对已 destroy 的设备只会给 'destroyed'，故按实例改写。
+                var __mkInvalid = null;
+                if (__invDev && typeof GPUDevice !== 'undefined' && GPUDevice.prototype) {
+                    var __devProto = GPUDevice.prototype;
+                    var __lostDesc = Object.getOwnPropertyDescriptor(__devProto, 'lost');
+                    var __destroyDesc = Object.getOwnPropertyDescriptor(__devProto, 'destroy');
+                    var __nativeLostGet = (__lostDesc && typeof __lostDesc.get === 'function')
+                        ? __lostDesc.get : null;
+                    var __nativeDestroy = (__destroyDesc && typeof __destroyDesc.value === 'function')
+                        ? __destroyDesc.value : null;
+
+                    if (__nativeLostGet && __lostDesc.configurable) {
+                        try {
+                            Object.defineProperty(__devProto, 'lost', {
+                                get: __maskNative(function () {
+                                    var st = __invDev.get(this);
+                                    if (!st) { return __nativeLostGet.call(this); }
+                                    if (!st.promise) {
+                                        var reason = st.destroyed ? 'destroyed' : 'unknown';
+                                        st.promise = __nativeLostGet.call(this).then(function (info) {
+                                            if (info && typeof info === 'object') {
+                                                try {
+                                                    __lostOv.set(info, {
+                                                        reason: reason, message: '',
+                                                    });
+                                                } catch (e) {}
+                                            }
+                                            return info;
+                                        });
+                                    }
+                                    return st.promise;
+                                }, 'get lost'),
+                                enumerable: __lostDesc.enumerable,
+                                configurable: true,
+                            });
+                        } catch (e) {}
+                    }
+
+                    if (__nativeDestroy && __destroyDesc.configurable) {
+                        try {
+                            Object.defineProperty(__devProto, 'destroy', {
+                                value: __maskNative(function () {
+                                    var st = __invDev.get(this);
+                                    if (st && !st.promise) { st.destroyed = true; }
+                                    return __nativeDestroy.apply(this, arguments);
+                                }, 'destroy'),
+                                writable: true,
+                                enumerable: __destroyDesc.enumerable,
+                                configurable: true,
+                            });
+                        } catch (e) {}
+                    }
+
+                    // 造一台「无效设备」：真设备对象 + 立即 destroy，brand/方法/GC 全真，
+                    // 只有 features（空集，Impl_Adapter.cpp:301 的
+                    // SupportedFeatures::create({})）与 lost 理由被改写。
+                    // 每次调用都新造一台——WebKit 的 Device::createInvalid 也是新实例。
+                    __mkInvalid = function (desc) {
+                        var gpu = navigator.gpu;
+                        return gpu.requestAdapter().then(function (a) {
+                            return a ? a.requestDevice() : null;
+                        }).then(function (dev) {
+                            if (!dev || typeof dev !== 'object') { return null; }
+                            try { dev.destroy(); } catch (e) {}
+                            __invDev.set(dev, { destroyed: false, promise: null });
+                            __featOv.set(dev.features, []);
+                            // label / defaultQueue.label 由 GPUAdapter.cpp:135 逐字透传
+                            // （WebKit 的 Device::setLabel 虽是空实现，WebCore 层仍存值）
+                            if (desc && typeof desc === 'object') {
+                                try {
+                                    if (desc.label !== undefined && desc.label !== null) {
+                                        dev.label = String(desc.label);
+                                    }
+                                } catch (e) {}
+                                try {
+                                    var dq = desc.defaultQueue;
+                                    if (dq && typeof dq === 'object'
+                                            && dq.label !== undefined && dq.label !== null) {
+                                        dev.queue.label = String(dq.label);
+                                    }
+                                } catch (e) {}
+                            }
+                            return dev;
+                        });
+                    };
+                }
+                var __origFeatSize = Object.getOwnPropertyDescriptor(__featProto, 'size');
+
+                try {
+                    Object.defineProperty(__featProto, 'size', {
+                        get: __maskNative(function () {
+                            var ov = __featOf(this);
+                            if (!ov) { return __origFeatSize.get.call(this); }
+                            return ov.length;
+                        }, 'get size'),
+                        enumerable: true,
+                        configurable: true,
+                    });
+                } catch (e) {}
+
+                var __wrapFeatMethod = function (name, impl) {
+                    var d = Object.getOwnPropertyDescriptor(__featProto, name);
+                    if (!d || typeof d.value !== 'function' || !d.configurable) { return; }
+                    var nativeFn = d.value;
+                    try {
+                        Object.defineProperty(__featProto, name, {
+                            value: __maskNative(function () {
+                                var ov = __featOf(this);
+                                if (!ov) { return nativeFn.apply(this, arguments); }
+                                return impl(this, nativeFn, ov, arguments);
+                            }, name),
+                            writable: true,
+                            enumerable: d.enumerable,
+                            configurable: true,
+                        });
+                    } catch (e) {}
+                };
+                __wrapFeatMethod('has', function (self, nativeFn, ov, args) {
+                    return ov.indexOf(args[0]) >= 0;
+                });
+                __wrapFeatMethod('values', function (self, nativeFn, ov) { return ov.slice(); });
+                __wrapFeatMethod('keys', function (self, nativeFn, ov) { return ov.slice(); });
+                // setlike 的 entries() 产出 [值, 值]（不是 [下标, 值]）
+                __wrapFeatMethod('entries', function (self, nativeFn, ov) {
+                    var out = [];
+                    for (var i = 0; i < ov.length; i++) { out.push([ov[i], ov[i]]); }
+                    return out;
+                });
+                __wrapFeatMethod('forEach', function (self, nativeFn, ov, args) {
+                    var cb = args[0], thisArg = args[1];
+                    for (var i = 0; i < ov.length; i++) { cb.call(thisArg, ov[i], ov[i], self); }
+                });
+                // Symbol.iterator 走原生 iterator，需同样按覆写表口径改写
+                var __iterSym = typeof Symbol === 'function' ? Symbol.iterator : null;
+                if (__iterSym) {
+                    var dIt = Object.getOwnPropertyDescriptor(__featProto, __iterSym);
+                    if (dIt && typeof dIt.value === 'function' && dIt.configurable) {
+                        var nativeIt = dIt.value;
+                        try {
+                            Object.defineProperty(__featProto, __iterSym, {
+                                value: __maskNative(function () {
+                                    var ov = __featOf(this);
+                                    if (!ov) { return nativeIt.call(this); }
+                                    var idx = 0;
+                                    var iter = {};
+                                    iter.next = function () {
+                                        return idx < ov.length
+                                            ? { value: ov[idx++], done: false }
+                                            : { value: undefined, done: true };
+                                    };
+                                    return iter;
+                                }, '[Symbol.iterator]'),
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                            });
+                        } catch (e) {}
+                    }
+                }
+
+                // ---- 适配器实例：登记覆写表 ----
+                var __rawAdLimGet = null, __rawAdFeatGet = null;
+                if (__limOv && __featOv && GPUAdapter.prototype) {
+                    var __adDesc = Object.getOwnPropertyDescriptor(GPUAdapter.prototype, 'limits');
+                    var __afDesc = Object.getOwnPropertyDescriptor(GPUAdapter.prototype, 'features');
+                    if (__adDesc && typeof __adDesc.get === 'function' && __adDesc.configurable) {
+                        __rawAdLimGet = __adDesc.get;
+                        try {
+                            Object.defineProperty(GPUAdapter.prototype, 'limits', {
+                                get: __maskNative(function () {
+                                    var v = __rawAdLimGet.call(this);
+                                    if (v && typeof v === 'object' && !__limOv.has(v)) {
+                                        __limOv.set(v, __wkLim);
+                                    }
+                                    return v;
+                                }, 'get limits'),
+                                enumerable: true,
+                                configurable: true,
+                            });
+                        } catch (e) {}
+                    }
+                    if (__afDesc && typeof __afDesc.get === 'function' && __afDesc.configurable) {
+                        __rawAdFeatGet = __afDesc.get;
+                        try {
+                            Object.defineProperty(GPUAdapter.prototype, 'features', {
+                                get: __maskNative(function () {
+                                    var v = __rawAdFeatGet.call(this);
+                                    if (v && typeof v === 'object' && !__featOv.has(v)) {
+                                        __featOv.set(v, __featMask(v));
+                                    }
+                                    return v;
+                                }, 'get features'),
+                                enumerable: true,
+                                configurable: true,
+                            });
+                        } catch (e) {}
+                    }
+                }
+
+                // ---- requestDevice：适配器层改写后必须同时接管，否则自相矛盾 ----
+                // 真机（WebKit）三层语义，逐条实测于 /tmp/f187l.py、f187m.py、f187p.py：
+                //   ① WebIDL 字典转换失败（requiredFeatures 非序列、元素不是合法枚举名、
+                //      limit 不是数字/超出 EnforceRange）→ **同步抛** TypeError；
+                //   ② WebCore GPUAdapter.cpp:125-128 `isSubset(requiredFeatures,
+                //      adapter.features)` 失败（合法枚举名但适配器不支持，如
+                //      dual-source-blending）→ **异步 reject** TypeError("Type error")；
+                //   ③ WebGPU Adapter.cpp:99-107 逐键校验 requiredLimits：isValid 要求两个
+                //      对齐值为 2 的幂、anyLimitIsBetterThan 逐项与适配器真值比较
+                //      （对齐值越小越好、其余越大越好）→ **异步 reject**
+                //      OperationError("The operation failed for an operation-specific reason.")。
+                //   通过后 Impl_Adapter.cpp:200-262 从 wgpuDefaultLimits() 起按
+                //   setMaxIntegerValue（取更大）/ setAlignmentIntegerValue（取更小且须
+                //   ≥ 适配器对齐值且为其整数倍）回填 → 设备层 limits 见 __wkDefaultLim。
+                var __opErr = function () {
+                    return new DOMException(
+                        'The operation failed for an operation-specific reason.',
+                        'OperationError');
+                };
+                var __typeErr = function (msg) { return new TypeError(msg); };
+                var __isAlignLim = function (k) {
+                    return k === 'minUniformBufferOffsetAlignment'
+                        || k === 'minStorageBufferOffsetAlignment';
+                };
+                // 合法枚举名全集 = 真机序表 + 宿主独有两项（它们合法但适配器不支持，
+                // 落到 ② 异步 TypeError，而非 ① 同步 TypeError）。
+                var __enumNames = __gpuFeatOrder.concat(__dropFeat);
+
+                var __rdDesc = Object.getOwnPropertyDescriptor(GPUAdapter.prototype, 'requestDevice');
+                if (__rdDesc && typeof __rdDesc.value === 'function' && __rdDesc.configurable) {
+                    var __nativeRd = __rdDesc.value;
+                    try {
+                        Object.defineProperty(GPUAdapter.prototype, 'requestDevice', {
+                            value: __maskNative(function (descriptor) {
+                                var self = this;
+                                var desc = descriptor;
+                                // WebKit 的 requestDevice 返回 Promise：WebIDL 字典转换失败也走
+                                // reject 而不是同步抛（/tmp/f188f.py 实测全部 isPromise=true，
+                                // 与 Blink 同步抛不同）。
+                                if (desc !== undefined && desc !== null && typeof desc !== 'object') {
+                                    return Promise.reject(__typeErr('Type error'));
+                                }
+
+                                // ---- ① WebIDL 字典转换（按 IDL 成员声明序：requiredFeatures
+                                // 先于 requiredLimits，/tmp/f188f.py orderConvFeatVsLim 实测）----
+                                var featArr = null;
+                                if (desc) {
+                                    var rawFeat = desc.requiredFeatures;
+                                    if (rawFeat !== undefined) {
+                                        // 序列转换：原始值（含 null/字符串）报「Value is not a
+                                        // sequence」；对象但没有 @@iterator 报「Type error」
+                                        if (rawFeat === null || typeof rawFeat !== 'object') {
+                                            return Promise.reject(__typeErr('Value is not a sequence'));
+                                        }
+                                        var itf = __iterSym ? rawFeat[__iterSym] : null;
+                                        if (typeof itf !== 'function') {
+                                            return Promise.reject(__typeErr('Type error'));
+                                        }
+                                        var featItems = Array.from(rawFeat);
+                                        featArr = [];
+                                        for (var fi = 0; fi < featItems.length; fi++) {
+                                            // 枚举转换先 ToString（Symbol 在此报错），再查枚举名
+                                            var fn;
+                                            try { fn = String(featItems[fi]); }
+                                            catch (e) {
+                                                return Promise.reject(
+                                                    __typeErr('Cannot convert a symbol to a string'));
+                                            }
+                                            if (__enumNames.indexOf(fn) < 0) {
+                                                return Promise.reject(__typeErr('Type error'));
+                                            }
+                                            featArr.push(fn);
+                                        }
+                                    }
+                                }
+                                var limVals = null;
+                                if (desc) {
+                                    var rawLim = desc.requiredLimits;
+                                    // record<DOMString, GPUSize64>：null/undefined 视为空记录
+                                    if (rawLim !== undefined && rawLim !== null) {
+                                        if (typeof rawLim !== 'object') {
+                                            return Promise.reject(__typeErr('Type error'));
+                                        }
+                                        limVals = {};
+                                        for (var lk in rawLim) {
+                                            if (!Object.prototype.hasOwnProperty.call(rawLim, lk)) { continue; }
+                                            var lv = rawLim[lk];
+                                            if (typeof lv === 'symbol') {
+                                                return Promise.reject(
+                                                    __typeErr('Cannot convert a symbol to a number'));
+                                            }
+                                            if (typeof lv === 'bigint') {
+                                                return Promise.reject(__typeErr(
+                                                    "Conversion from 'BigInt' to 'number' is not allowed."));
+                                            }
+                                            // [EnforceRange] unsigned long long：WebKit 的上界是
+                                            // 2^53-1（实测），越界报带原值的范围错误
+                                            var num = Number(lv);
+                                            var t = num < 0 ? -Math.floor(-num) : Math.floor(num);
+                                            if (!(t >= 0 && t <= 9007199254740991)) {
+                                                return Promise.reject(__typeErr(
+                                                    'Value ' + String(t)
+                                                    + ' is outside the range [0, 9007199254740991]'));
+                                            }
+                                            limVals[lk] = t;
+                                        }
+                                    }
+                                }
+
+                                // ---- ② requiredFeatures ⊆ 适配器真机口径 ----
+                                if (featArr && featArr.length && __rawAdFeatGet) {
+                                    var adFeat = null;
+                                    try { adFeat = __featMask(__rawAdFeatGet.call(self)); } catch (e) {}
+                                    if (adFeat) {
+                                        for (var si = 0; si < featArr.length; si++) {
+                                            if (adFeat.indexOf(featArr[si]) < 0) {
+                                                return Promise.reject(__typeErr('Type error'));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // ---- ③ requiredLimits 逐键校验 ----
+                                if (limVals) {
+                                    for (var vk in limVals) {
+                                        if (!Object.prototype.hasOwnProperty.call(limVals, vk)) { continue; }
+                                        var sup = __wkLim[vk];
+                                        if (typeof sup !== 'number') { return Promise.reject(__opErr()); }
+                                        var want = limVals[vk];
+                                        if (__isAlignLim(vk)) {
+                                            // isPowerOfTwo + 须 ≥ 适配器对齐值且为其整数倍
+                                            if (want < sup || want % sup !== 0
+                                                    || (want & (want - 1)) !== 0) {
+                                                return Promise.reject(__opErr());
+                                            }
+                                        } else if (want > sup) {
+                                            return Promise.reject(__opErr());
+                                        }
+                                    }
+                                }
+
+                                // ---- 交给宿主原生：剔除它不认的 feature 名与超真值的 limit ----
+                                // 同时把已按 WebKit 语义归一化的值回填（requiredLimits: null
+                                // 在 WebKit 是空记录、在 Blink 是 TypeError，必须换成 {} 或删键）。
+                                var keepFeat = null, stripLim = false;
+                                if (featArr) {
+                                    keepFeat = [];
+                                    for (var ki = 0; ki < featArr.length; ki++) {
+                                        if (__wkFeat.indexOf(featArr[ki]) < 0) { keepFeat.push(featArr[ki]); }
+                                    }
+                                }
+                                if (limVals && __rawAdLimGet) {
+                                    var blinkSup = null;
+                                    try { blinkSup = __rawAdLimGet.call(self); } catch (e) {}
+                                    if (blinkSup) {
+                                        for (var bk in limVals) {
+                                            if (!Object.prototype.hasOwnProperty.call(limVals, bk)) { continue; }
+                                            var bs = blinkSup[bk];
+                                            var bv = limVals[bk];
+                                            if (typeof bs !== 'number'
+                                                    || (__isAlignLim(bk) ? (bv < bs || bv % bs !== 0) : bv > bs)) {
+                                                stripLim = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                var cleanDesc = desc;
+                                if (desc && typeof desc === 'object') {
+                                    cleanDesc = {
+                                        label: desc.label,
+                                        defaultQueue: desc.defaultQueue,
+                                    };
+                                    if (featArr) { cleanDesc.requiredFeatures = keepFeat; }
+                                    if (limVals && !stripLim) { cleanDesc.requiredLimits = limVals; }
+                                }
+
+                                var settle = function (dev, invalid) {
+                                    if (!dev || typeof dev !== 'object') { return dev; }
+                                    try {
+                                        // 无效设备的 features 恒为空集（Impl_Adapter.cpp:301
+                                        // 传 SupportedFeatures::create({})），不能回显请求项。
+                                        if (!invalid && featArr && featArr.length) {
+                                            __featOv.set(dev.features, __devFeatEcho(featArr));
+                                        }
+                                        if (limVals) {
+                                            __limOv.set(dev.limits, __devLimEcho(limVals));
+                                        }
+                                        // 只有真正建成设备才消耗适配器：WebKit 在
+                                        // Adapter.cpp:133 的成功分支才置 m_deviceRequested。
+                                        if (!invalid && __adUsed) { __adUsed.set(self, true); }
+                                    } catch (e) {}
+                                    return dev;
+                                };
+                                // ---- ④ 重复 requestDevice：返回「无效设备」而不是 reject ----
+                                // Adapter.cpp:85-89：m_deviceRequested 已置位时回调
+                                // Device::createInvalid(*this) 并 makeInvalid() —— 设备
+                                // **非空**，所以 GPUAdapter.cpp:130-138 走 resolve 分支，
+                                // 页面拿到一个真 GPUDevice（/tmp/f188s.py 实测）。
+                                // 之后适配器 m_device 已 nil，每次调用都重走同一分支。
+                                // 无效设备的本体仍要一个真设备对象：从新适配器取一个再
+                                // destroy()，这样 Brand 检查、方法调用、GC 语义全是真的；
+                                // 只覆写 features（空集）/limits（回显）/lost（unknown）。
+                                if (__adUsed && __adUsed.get(self) && __mkInvalid) {
+                                    return Promise.resolve(null)
+                                        .then(function () { return __mkInvalid(desc); })
+                                        .then(function (dev) {
+                                            if (!dev || typeof dev !== 'object') {
+                                                return Promise.reject(__opErr());
+                                            }
+                                            return settle(dev, true);
+                                        });
+                                }
+                                return __nativeRd.call(self, cleanDesc).then(settle);
+                            }, 'requestDevice'),
+                            writable: true,
+                            enumerable: __rdDesc.enumerable,
+                            configurable: true,
+                        });
+                    } catch (e) {}
+                }
+
+                // GPUAdapter.prototype 的成员枚举序：JSC 按 IDL 声明序
+                // （constructor,features,limits,info,isFallbackAdapter,requestDevice），
+                // V8 按字典序且 constructor 排最后。上面新增的 isFallbackAdapter 与
+                // requestDevice 都排在尾部，需整体重排；做法与 F-47 的 protoOrder 相同
+                // （删光可配置成员 → 按目标序 defineProperty，描述符原样复用）。
+                try {
+                    var __adOrder = ['constructor', 'features', 'limits', 'info',
+                                     'isFallbackAdapter', 'requestDevice'];
+                    var __adDescs = {};
+                    var __adNames = Object.getOwnPropertyNames(GPUAdapter.prototype);
+                    for (var __an = 0; __an < __adNames.length; __an++) {
+                        var __adp = Object.getOwnPropertyDescriptor(
+                            GPUAdapter.prototype, __adNames[__an]);
+                        if (!__adp || !__adp.configurable) { continue; }
+                        __adDescs[__adNames[__an]] = __adp;
+                        delete GPUAdapter.prototype[__adNames[__an]];
+                    }
+                    for (var __ao = 0; __ao < __adOrder.length; __ao++) {
+                        var __add = __adDescs[__adOrder[__ao]];
+                        if (__add) {
+                            Object.defineProperty(GPUAdapter.prototype, __adOrder[__ao], __add);
+                        }
+                    }
+                } catch (e) {}
+
+                // 其余 GPU 接口的成员枚举序：JSC 按 IDL 声明序（constructor 在前），
+                // V8 按字典序（constructor 在后）。21 个接口除排序规则外完全一致，
+                // 只有 3 个宿主独有成员要一并去掉（WebKit 的 IDL 里没有）：
+                // GPUTexture.textureBindingViewDimension、GPUComputePassEncoder.
+                // writeTimestamp、GPURenderPassEncoder.writeTimestamp。
+                // 目标序取自 safari-7625.1.29.11-branch 的 23 个 IDL 文件，与
+                // /tmp/f188q.py 实测的 WebKit 输出逐项比对（/tmp/f188_orders.txt）。
+                // 做法同上面的 GPUAdapter：删光可配置成员 → 按目标序 defineProperty。
+                // 缺失项（宿主没有、真机有）无法凭空补，故只重排已有项。
+                try {
+                    var __gpuOrders = {
+                        GPUAdapterInfo: ['constructor', 'vendor', 'architecture', 'device',
+                            'description', 'isFallbackAdapter', 'subgroupMinSize', 'subgroupMaxSize'],
+                        GPUDevice: ['constructor', 'features', 'limits', 'adapterInfo', 'queue',
+                            'onuncapturederror', 'lost', 'label', 'destroy', 'createBuffer',
+                            'createTexture', 'createSampler', 'importExternalTexture',
+                            'createBindGroupLayout', 'createPipelineLayout', 'createBindGroup',
+                            'createShaderModule', 'createComputePipeline', 'createRenderPipeline',
+                            'createComputePipelineAsync', 'createRenderPipelineAsync',
+                            'createCommandEncoder', 'createRenderBundleEncoder', 'createQuerySet',
+                            'pushErrorScope', 'popErrorScope'],
+                        GPUSupportedLimits: ['constructor', 'maxTextureDimension1D',
+                            'maxTextureDimension2D', 'maxTextureDimension3D',
+                            'maxTextureArrayLayers', 'maxBindGroups',
+                            'maxBindGroupsPlusVertexBuffers', 'maxBindingsPerBindGroup',
+                            'maxDynamicUniformBuffersPerPipelineLayout',
+                            'maxDynamicStorageBuffersPerPipelineLayout',
+                            'maxSampledTexturesPerShaderStage', 'maxSamplersPerShaderStage',
+                            'maxStorageBuffersPerShaderStage', 'maxStorageTexturesPerShaderStage',
+                            'maxUniformBuffersPerShaderStage', 'maxUniformBufferBindingSize',
+                            'maxStorageBufferBindingSize', 'minUniformBufferOffsetAlignment',
+                            'minStorageBufferOffsetAlignment', 'maxVertexBuffers',
+                            'maxBufferSize', 'maxVertexAttributes', 'maxVertexBufferArrayStride',
+                            'maxInterStageShaderVariables', 'maxColorAttachments',
+                            'maxColorAttachmentBytesPerSample', 'maxComputeWorkgroupStorageSize',
+                            'maxComputeInvocationsPerWorkgroup', 'maxComputeWorkgroupSizeX',
+                            'maxComputeWorkgroupSizeY', 'maxComputeWorkgroupSizeZ',
+                            'maxComputeWorkgroupsPerDimension',
+                            'maxStorageBuffersInFragmentStage',
+                            'maxStorageTexturesInFragmentStage',
+                            'maxStorageBuffersInVertexStage',
+                            'maxStorageTexturesInVertexStage'],
+                        GPUSupportedFeatures: ['constructor', 'size', 'has', 'entries', 'keys',
+                            'values', 'forEach'],
+                        GPUQueue: ['constructor', 'label', 'submit', 'onSubmittedWorkDone',
+                            'writeBuffer', 'writeTexture', 'copyExternalImageToTexture'],
+                        GPUBuffer: ['constructor', 'size', 'usage', 'mapState', 'label',
+                            'mapAsync', 'getMappedRange', 'unmap', 'destroy'],
+                        GPUTexture: ['constructor', 'width', 'height', 'depthOrArrayLayers',
+                            'mipLevelCount', 'sampleCount', 'dimension', 'format', 'usage',
+                            'label', 'createView', 'destroy'],
+                        GPUShaderModule: ['constructor', 'label', 'getCompilationInfo'],
+                        GPUCommandEncoder: ['constructor', 'label', 'beginRenderPass',
+                            'beginComputePass', 'copyBufferToBuffer', 'copyBufferToTexture',
+                            'copyTextureToBuffer', 'copyTextureToTexture', 'clearBuffer',
+                            'resolveQuerySet', 'finish', 'pushDebugGroup', 'popDebugGroup',
+                            'insertDebugMarker'],
+                        GPUComputePassEncoder: ['constructor', 'label', 'setPipeline',
+                            'dispatchWorkgroups', 'dispatchWorkgroupsIndirect', 'end',
+                            'pushDebugGroup', 'popDebugGroup', 'insertDebugMarker',
+                            'setBindGroup'],
+                        GPURenderPassEncoder: ['constructor', 'label', 'setViewport',
+                            'setScissorRect', 'setBlendConstant', 'setStencilReference',
+                            'beginOcclusionQuery', 'endOcclusionQuery', 'executeBundles', 'end',
+                            'pushDebugGroup', 'popDebugGroup', 'insertDebugMarker',
+                            'setBindGroup', 'setPipeline', 'setIndexBuffer', 'setVertexBuffer',
+                            'draw', 'drawIndexed', 'drawIndirect', 'drawIndexedIndirect'],
+                        GPUBindGroup: ['constructor', 'label'],
+                        GPUBindGroupLayout: ['constructor', 'label'],
+                        GPUPipelineLayout: ['constructor', 'label'],
+                        GPUSampler: ['constructor', 'label'],
+                        GPUComputePipeline: ['constructor', 'label', 'getBindGroupLayout'],
+                        GPURenderPipeline: ['constructor', 'label', 'getBindGroupLayout'],
+                        GPUCommandBuffer: ['constructor', 'label'],
+                        GPUQuerySet: ['constructor', 'type', 'count', 'label', 'destroy'],
+                        GPU: ['constructor', 'wgslLanguageFeatures', 'requestAdapter',
+                            'getPreferredCanvasFormat'],
+                        GPUCanvasContext: ['constructor', 'canvas', 'configure', 'unconfigure',
+                            'getConfiguration', 'getCurrentTexture'],
+                    };
+                    for (var __gn in __gpuOrders) {
+                        if (!Object.prototype.hasOwnProperty.call(__gpuOrders, __gn)) { continue; }
+                        var __gc = window[__gn];
+                        var __gp = __gc && __gc.prototype;
+                        if (!__gp) { continue; }
+                        var __gOrder = __gpuOrders[__gn];
+                        var __gDescs = {};
+                        var __gNames = Object.getOwnPropertyNames(__gp);
+                        for (var __gi = 0; __gi < __gNames.length; __gi++) {
+                            var __gd = Object.getOwnPropertyDescriptor(__gp, __gNames[__gi]);
+                            if (!__gd || !__gd.configurable) { continue; }
+                            __gDescs[__gNames[__gi]] = __gd;
+                            try { delete __gp[__gNames[__gi]]; } catch (e) {}
+                        }
+                        for (var __gj = 0; __gj < __gOrder.length; __gj++) {
+                            var __gd2 = __gDescs[__gOrder[__gj]];
+                            if (!__gd2) { continue; }
+                            try { Object.defineProperty(__gp, __gOrder[__gj], __gd2); } catch (e) {}
+                        }
+                    }
+                } catch (e) {}
+            } catch (e) {}
+        }
+
         // ---- AudioContext.state：移动端首访恒 suspended（F-17 / F-54）----
         // iOS 自动播放策略：AudioContext 构造后停在 suspended，必须在用户手势
         // 内 resume() 才转 running；桌面 Chromium（尤其 headless）直接 running。
