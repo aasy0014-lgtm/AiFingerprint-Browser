@@ -802,6 +802,56 @@ STATE_JS = """async () => {
                 '(text-autospace: ideograph-alpha) or (color: red)'),
             cssComboHyphens: CSS.supports(
                 '(color: red) and (-webkit-hyphens: auto)'),
+            // ---- F-171：CSS 面三处引擎标识（全部按 WebKit 目标分支源码取证）----
+            // font-variant-emoji 在真机挂 cssFontVariantEmojiEnabled，
+            // UnifiedWebPreferences.yaml 里 Cocoa 默认 false（Blink 已默认实现）；
+            // hanging-punctuation 无 settings flag（真机有、Blink 无）；
+            // CSS.x 是 Blink 独有的 `x` 分辨率单位工厂（WebKit 的
+            // DOMCSSNamespace+CSSNumericFactory.idl 里没有）。
+            cssDenyFontVariantEmoji: CSS.supports('font-variant-emoji', 'emoji'),
+            cssDenyFontVariantEmojiCond: CSS.supports('(font-variant-emoji: emoji)'),
+            cssDenyFontVariantEmojiCombo: CSS.supports(
+                '(font-variant-emoji: emoji) and (color: red)'),
+            cssAllowHanging: CSS.supports('hanging-punctuation', 'first'),
+            cssAllowHangingCond: CSS.supports('(hanging-punctuation: last first)'),
+            cssAllowHangingCombo: CSS.supports(
+                '(color: red) and (hanging-punctuation: force-end)'),
+            cssHangingTriple: CSS.supports('hanging-punctuation',
+                                           'first force-end last'),
+            cssHangingReordered: CSS.supports('hanging-punctuation',
+                                              'last first force-end'),
+            cssBadHangingExclusive: CSS.supports('hanging-punctuation',
+                                                 'force-end allow-end'),
+            cssBadHangingDup: CSS.supports('hanging-punctuation', 'first first'),
+            cssBadHangingNone: CSS.supports('hanging-punctuation', 'none first'),
+            cssBadHangingValue: CSS.supports('hanging-punctuation', 'bogus'),
+            cssHangingCamel: 'hangingPunctuation' in document.createElement('div').style,
+            cssHangingKebabIn: 'hanging-punctuation' in document.createElement('div').style,
+            cssXAbsent: 'x' in CSS,
+            // 私有存储/CSSOM 三条写入路径的 hanging-punctuation 覆盖
+            cssHangingCssom: (() => {
+                const st = document.createElement('div').style;
+                st.setProperty('hanging-punctuation', 'LAST  First');
+                const ser = st.getPropertyValue('hanging-punctuation');
+                const text = st.cssText;
+                const len = st.length;
+                const camel = st.hangingPunctuation;
+                st.setProperty('hanging-punctuation', 'first', 'important');
+                const prio = st.getPropertyPriority('hanging-punctuation');
+                st.removeProperty('hanging-punctuation');
+                const el2 = document.createElement('div');
+                el2.style.cssText = 'hanging-punctuation: first last; color: red';
+                const viaText = el2.style.getPropertyValue('hanging-punctuation');
+                const textLen = el2.style.length;
+                const el3 = document.createElement('div');
+                el3.setAttribute('style', 'hanging-punctuation: last first');
+                return {
+                    ser: ser, text: text, len: len, prio: prio,
+                    camel: camel,
+                    viaText: viaText, textLen: textLen,
+                    viaAttr: el3.style.getPropertyValue('hanging-punctuation'),
+                };
+            })(),
             // F-98：WebKit 专有属性在 inline 声明里的读写 / 枚举 / computed
             // 回读。真机口径（Playwright WebKit 27.2 移动上下文实测）：
             // -webkit-hyphens 的规范名是 hyphens；-apple-pay-button-style 有
@@ -6285,6 +6335,37 @@ async def main() -> int:
                 and eng.get("cssComboMarginTrimBad") is False
                 and eng.get("cssComboTextAutospace") is True
                 and eng.get("cssComboHyphens") is True),
+            # F-171：font-variant-emoji 真机为预览期关闭（三态一律 false）
+            "CSS：font-variant-emoji 两参/单参/复合条件一律 false（F-171）": (
+                eng.get("cssDenyFontVariantEmoji") is False
+                and eng.get("cssDenyFontVariantEmojiCond") is False
+                and eng.get("cssDenyFontVariantEmojiCombo") is False),
+            # F-171：hanging-punctuation 真机有、Blink 无
+            "CSS：hanging-punctuation 两参/单参/复合条件均 true（F-171）": (
+                eng.get("cssAllowHanging") is True
+                and eng.get("cssAllowHangingCond") is True
+                and eng.get("cssAllowHangingCombo") is True),
+            "CSS：hanging-punctuation 的 || 语法（三项任意序 true；force-end|allow-end 互斥、重复、与 none 混用、非法值一律 false）": (
+                eng.get("cssHangingTriple") is True
+                and eng.get("cssHangingReordered") is True
+                and eng.get("cssBadHangingExclusive") is False
+                and eng.get("cssBadHangingDup") is False
+                and eng.get("cssBadHangingNone") is False
+                and eng.get("cssBadHangingValue") is False),
+            "CSS：hanging-punctuation 的 `in` 面（kebab 与驼峰均为 true）与 CSS.x 缺席": (
+                eng.get("cssHangingKebabIn") is True
+                and eng.get("cssHangingCamel") is True
+                and eng.get("cssXAbsent") is False),
+            "CSS：hanging-punctuation 三条写入路径（setProperty/cssText/style 属性）+ 序列化 + 优先级（F-171）": (
+                eng.get("cssHangingCssom", {}).get("ser") == "last first"
+                and eng.get("cssHangingCssom", {}).get("text")
+                    == "hanging-punctuation: last first;"
+                and eng.get("cssHangingCssom", {}).get("len") == 1
+                and eng.get("cssHangingCssom", {}).get("prio") == "important"
+                and eng.get("cssHangingCssom", {}).get("camel") == "last first"
+                and eng.get("cssHangingCssom", {}).get("viaText") == "first last"
+                and eng.get("cssHangingCssom", {}).get("textLen") == 2
+                and eng.get("cssHangingCssom", {}).get("viaAttr") == "last first"),
             # F-98：inline 存储 + 枚举 + computed 回读
             "CSS：WebKit 专有属性的 inline 读写 / 索引枚举 / computed 回读": (
                 f98.get("len") == 5

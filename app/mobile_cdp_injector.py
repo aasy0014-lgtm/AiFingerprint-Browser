@@ -3517,7 +3517,13 @@ __FF_SRC__
             if ('memory' in performance) {
                 defineGet(Performance.prototype, 'memory', undefined);
             }
-            // 3) iOS WebKit 专有手势事件家族：GestureEvent + ongesturestart 面。
+            // 3) CSS 的数值工厂静态成员：真机只暴露
+            //    DOMCSSNamespace+CSSNumericFactory.idl 里那张表（number/
+            //    percent/各长度角度时间频率分辨率与 fr），Blink 另多一个 `x`
+            //    （CSS Values 5 新增的 `x` 分辨率单位）。`'x' in CSS` 一行
+            //    即判假，且该属性可配置、删得掉（/tmp/f183/symd.py）。
+            try { delete CSS.x; } catch (e) {}
+            // 4) iOS WebKit 专有手势事件家族：GestureEvent + ongesturestart 面。
             //    MDN BCD：chrome/chrome_android=false、safari_ios=2 —— 这是
             //    「Chromium 内核装 iOS」在事件层最直接的证据之一。按真机形态
             //    补最小完备面：构造器为 UIEvent 子类（原型链/instanceof 成立），
@@ -4535,6 +4541,10 @@ __FF_SRC__
                     '-webkit-nbsp-mode': 'webkitNbspMode',
                     'margin-trim': 'marginTrim',
                     'text-autospace': 'textAutospace',
+                    // F-171：hanging-punctuation 真机有驼峰访问器
+                    // （`hangingPunctuation` 读写与 getPropertyValue 同源，
+                    // /tmp/f183/hpser.py），Blink 没有。
+                    'hanging-punctuation': 'hangingPunctuation',
                     // F-166：-webkit-hyphens 已退出 __cssAlias（见上），驼峰
                     // 名不再由别名循环补齐，在此登记。
                     '-webkit-hyphens': 'webkitHyphens',
@@ -5039,6 +5049,9 @@ __FF_SRC__
                     '-webkit-text-decoration-skip', '-webkit-hyphens',
                     '-webkit-nbsp-mode', 'margin-trim',
                     '-apple-pay-button-style', '-webkit-backdrop-filter',
+                    // F-171：真机 `'hanging-punctuation' in el.style` 为 true
+                    // （/tmp/f183/hpcaps.py），Blink 为 false。
+                    'hanging-punctuation',
                 ];
                 for (var __ki = 0; __ki < __cssKebabIn.length; __ki++) {
                     __aliasCamel(__cssKebabIn[__ki], __cssKebabIn[__ki]);
@@ -5210,8 +5223,10 @@ __FF_SRC__
                             var s = String(v);
                             // 只有涉及别名或 WebKit 专有属性时才重写，其余
                             // 原样交给内核——按 ';' 切分会破坏 url()/字符串里
-                            // 的分号。
-                            if (!/text-orientation|text-underline-position|text-decoration-skip|hyphens|-webkit-|margin-trim|text-autospace|apple-pay-button-style/i
+                            // 的分号。F-171：hanging-punctuation 也要进这条
+                            // 路径（真机 style 属性与 cssText 都能设，Blink
+                            // 一律丢弃）。
+                            if (!/text-orientation|text-underline-position|text-decoration-skip|hyphens|-webkit-|margin-trim|text-autospace|apple-pay-button-style|hanging-punctuation/i
                                     .test(s)) {
                                 return __origCssText.set.call(this, v);
                             }
@@ -5247,7 +5262,7 @@ __FF_SRC__
                 // 文本先按 cssText 的同一套规则改写，私有表命中的声明另存。
                 var __styleAttrSplit = function (el, text) {
                     var s = String(text);
-                    if (!/text-orientation|text-underline-position|text-decoration-skip|hyphens|-webkit-|margin-trim|text-autospace|apple-pay-button-style/i
+                    if (!/text-orientation|text-underline-position|text-decoration-skip|hyphens|-webkit-|margin-trim|text-autospace|apple-pay-button-style|hanging-punctuation/i
                             .test(s)) { return null; }
                     var r = __aliasCt(s);
                     var st = el.style;
@@ -5340,6 +5355,12 @@ __FF_SRC__
                 __cssDeny['overflow-clip-margin'] = null;
                 __cssDeny['corner-shape'] = null;
                 __cssDeny['reading-flow'] = null;
+                // F-171：font-variant-emoji 在真机是**预览期关闭**的实验属性
+                // （WebKit CSSProperties.json 挂 cssFontVariantEmojiEnabled；
+                // UnifiedWebPreferences.yaml 里该 flag 的 WebCore/WebKit 默认
+                // 都是 false，只有 GTK/WPE 开），Blink 则已默认实现——两参与
+                // 单参条件文本都答 true，一行 CSS.supports 即判假。
+                __cssDeny['font-variant-emoji'] = null;
                 // F-88：WebKit 专有属性必须按值域校验——`vals === null` 的
                 // 「任意值都支持」语义与真机不符（真机两参形态要求属性名与
                 // 值同时合法）。值域取证：WebKit Source/WebCore/css/
@@ -5368,6 +5389,17 @@ __FF_SRC__
                                                 'ideograph-numeric', 'insert'];
                 // hyphens（-webkit- 为 CSSProperties.json 里的别名）：none|manual|auto
                 __cssAllow['-webkit-hyphens'] = ['none', 'manual', 'auto'];
+                // F-171：hanging-punctuation。WebKit CSSProperties.json 的
+                // parser-grammar 是
+                //   none | [ first || [ force-end | allow-end ] || last ]
+                //   @(preserve-order no-single-item-opt)
+                // ——`preserve-order` 意味着**不重排**（`last first` 回读仍是
+                // `last first`，/tmp/f183/hpser.py），`||` 意味着三项顺序任意、
+                // 各自至多一次，`force-end | allow-end` 是二选一。Blink 完全
+                // 没有该属性（CSS.supports 两参与单参条件文本全 false，且
+                // setProperty 静默丢弃），故整条走私有存储。
+                __cssAllow['hanging-punctuation'] = ['none', 'first', 'last',
+                                                    'force-end', 'allow-end'];
                 // -apple-pay-button-style：white | white-outline | black
                 __cssAllow['-apple-pay-button-style'] = ['white', 'white-outline',
                                                          'black'];
@@ -5445,6 +5477,9 @@ __FF_SRC__
                 __cssInit['-apple-pay-button-style'] = 'black';
                 __cssInit['-webkit-backdrop-filter'] = 'none';
                 __cssInit['text-orientation'] = 'mixed';
+                // F-171：真机 computed 未设过时回读 "none"
+                // （/tmp/f183/hpser.py `csInit`）。
+                __cssInit['hanging-punctuation'] = 'none';
                 __cssInit['-webkit-nbsp-mode'] = 'normal';
                 __cssInit['-webkit-text-underline-position'] = 'auto';
                 __cssInit['-webkit-text-decoration-skip'] = 'auto';
@@ -5534,6 +5569,27 @@ __FF_SRC__
                                 ['normal', 'auto', 'no-autospace'],
                                 ['ideograph-alpha', 'ideograph-numeric', 'insert']);
                         }
+                        if (key === 'hanging-punctuation') {
+                            // F-171：`none` 只能独占；其余是三项 `||`
+                            // （first / force-end|allow-end / last），顺序
+                            // 任意、各自至多一次，且 force-end 与 allow-end
+                            // 互斥（语法里是 `|` 不是 `||`）。
+                            if (v === 'none') { return true; }
+                            var hparts = v.split(' ');
+                            if (hparts.length > 3) { return false; }
+                            var hseen = Object.create(null);
+                            for (var __h1 = 0; __h1 < hparts.length; __h1++) {
+                                var __hp = hparts[__h1];
+                                if (__hp !== 'first' && __hp !== 'last'
+                                        && __hp !== 'force-end'
+                                        && __hp !== 'allow-end') {
+                                    return false;
+                                }
+                                if (hseen[__hp]) { return false; }
+                                hseen[__hp] = 1;
+                            }
+                            return !(hseen['force-end'] && hseen['allow-end']);
+                        }
                         return vals.indexOf(v) !== -1;
                     }
                     var alias = __cssAllowValue(prop, value);
@@ -5562,6 +5618,7 @@ __FF_SRC__
                     // 条件里就落回原生 Blink（单参形态却正确），同一属性两种
                     // 答案。position 是 -webkit-sticky 的改写入口，照旧保留。
                     var __wkPropNames = Object.keys(__cssAllow)
+                        .concat(Object.keys(__cssDeny))
                         .concat(['position']);
                     var __wkPropAlt = __wkPropNames.map(function (k) {
                         return k.replace(/[-]/g, '\\-');
