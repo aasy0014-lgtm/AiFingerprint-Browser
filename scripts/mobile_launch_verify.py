@@ -5432,7 +5432,13 @@ async def main() -> int:
                     == [0, 1, 2, 3]
                 and (state.get("addMembers") or {}).get("range", {}).get("protoConst") == 0),
             "补成员：TextMetrics em* / FontFace.width / CSSStyleDeclaration legacy": (
-                (state.get("addMembers") or {}).get("metrics", {}).get("asc") is not None
+                # F-92：默认 2d 上下文的 font 是 10px sans-serif，真机
+                # emHeight 是 9.7001953125 / 2.2998046875（未归一化，和 ≈ 1.2em），
+                # 不是 0、也不是 undefined。
+                abs((state.get("addMembers") or {}).get("metrics", {}).get("asc", 0)
+                    - 9.7001953125) < 1e-6
+                and abs((state.get("addMembers") or {}).get("metrics", {}).get("desc", 0)
+                        - 2.2998046875) < 1e-6
                 and (state.get("addMembers") or {}).get("fontFace") == {
                     "inn": True, "val": "normal"}
                 and all((state.get("addMembers") or {}).get("cssDecl", {}).get(k, {}).get("inn")

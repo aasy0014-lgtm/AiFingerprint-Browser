@@ -225,6 +225,85 @@ _MOBILE_FONTS = {
 }
 
 
+# ------------------------------------------------------------------ 文本度量
+# F-92：TextMetrics.emHeightAscent / emHeightDescent 的字体度量表。
+# 键是**解析后**的字体族名（小写、去引号、取首个可用族），值是
+# (ascent, descent) 相对 em 的比值——即字体 hhea 表的 ascender/descender
+# 除以 unitsPerEm（WebKit 在 FontCoreText.cpp 的 platformInit 里换算）。
+#
+# 关键细节（实测 iOS 27.0.1 / Safari 27.0 系统 WebKit，660 行矩阵）：
+#   * 修正项按**解析后的族**取：只有 (ascent, descent) 落在
+#     _WK_EM_ADJ 三个元组里的族才加 `lround(size * 0.15)` 到 ascent，与族名
+#     无关。表里所有 (0.9, 0.25) 项其实都是 Times 回退，按 0.75/0.25 参与。
+#   * 其余族无修正，比值恒定；整数位 lround(ascent/descent) 在 660 行上零误差。
+#   * 表里 0.9 / 0.25 的项是 macOS WebKit 侧「族名解析不到、回退到 Times」
+#     的实测值——它们要么在 iOS 上确实存在（如 Palatino、Didot），要么就是
+#     回退口径，两者取值一致，无需区分。
+#   * hiragino sans 的 descent 有 3px 下限，只在 6 ≤ size < 25 生效。
+#   * 乘积以 float32 存储（WebKit 内部是 float），故注入器用 Math.fround。
+_WK_EM_RATIO: Dict[str, tuple] = {
+    "sans-serif": (0.77001953125, 0.22998046875),
+    "serif": (0.75, 0.25),
+    "monospace": (0.75390625, 0.24609375),
+    "cursive": (1.11767578125, 0.46484375),
+    "fantasy": (0.93994140625, 0.60302734375),
+    "system-ui": (0.966796875, 0.2109375),
+    "ui-sans-serif": (0.966796875, 0.2109375),
+    "ui-serif": (0.9521484375, 0.2412109375),
+    "ui-monospace": (0.966796875, 0.2109375),
+    "-apple-system": (0.966796875, 0.2109375),
+    "blinkmacsystemfont": (0.75, 0.25),
+    "helvetica": (0.77001953125, 0.22998046875),
+    "helvetica neue": (0.951995849609375, 0.2129974365234375),
+    "helveticaneue": (0.9519958496, 0.2129974365),
+    "times": (0.75, 0.25),
+    "times new roman": (0.89111328125, 0.21630859375),
+    "courier": (0.75390625, 0.24609375),
+    "courier new": (0.83251953125, 0.30029296875),
+    "arial": (0.9052734375, 0.2119140625),
+    "arial mt": (0.9, 0.25),
+    "georgia": (0.9169921875, 0.21923828125),
+    "georgia mt": (0.9, 0.25),
+    "verdana": (1.00537109375, 0.2099609375),
+    "tahoma": (1.0004882812, 0.2065429688),
+    "menlo": (0.92822265625, 0.23583984375),
+    "monaco": (1.0, 0.25),
+    "lucida grande": (0.966796875, 0.2109375),
+    "lucida console": (0.75, 0.25),
+    "geneva": (1.0, 0.25),
+    "palatino": (0.82275390625, 0.27734375),
+    "didot": (0.9409942626953125, 0.2989959716796875),
+    "baskerville": (0.89794921875, 0.24609375),
+    "futura": (1.03857421875, 0.259765625),
+    "optima": (0.91900634765625, 0.26800537109375),
+    "avenir": (1.0, 0.365997314453125),
+    "avenir next": (1.0, 0.365997314453125),
+    "impact": (1.0087890625, 0.2109375),
+    "trebuchet ms": (0.93896484375, 0.22216796875),
+    "comic sans ms": (1.10205078125, 0.29150390625),
+    "american typewriter": (0.9040069580078125, 0.25),
+    "chalkboard": (0.9801177979, 0.2828674316),
+    "chalkboard se": (1.1314849853515625, 0.282867431640625),
+    "pingfang sc": (1.06000214771948, 0.3400006890296936),
+    "pingfang hk": (1.06000214771948, 0.3400006890296936),
+    "hiragino sans": (0.8800017881393433, 0.12000024504959583),
+    "sf pro text": (0.75, 0.25),
+    "sf pro icons": (0.75, 0.25),
+    "system font": (0.966796875, 0.2109375),
+    "garamond": (0.75, 0.25),
+    "bookman": (0.75, 0.25),
+    "century gothic": (0.75, 0.25),
+    "itc avant garde gothic": (0.9, 0.25),
+    "sand": (0.9, 0.25),
+}
+# 需要 lround(size * 0.15) 修正的 (ascent, descent) 元组——按解析结果匹配，
+# 不按族名（表里名字不同但解析到同一字体的族取值完全一致，例如所有
+# (0.9, 0.25) 项都是 Times 回退，走 0.75/0.25 的修正）。
+_WK_EM_ADJ = ((0.77001953125, 0.22998046875),
+              (0.75, 0.25),
+              (0.75390625, 0.24609375))
+
+
 def _generate_mobile_font_subset(target_os: str, *, full: bool = False) -> List[str]:
     """移动端字体子集：preset 用完整集合（固定），generate 随机子集。"""
     table = _MOBILE_FONTS.get(target_os, _MOBILE_FONTS["android"])
@@ -1696,18 +1775,27 @@ def _drop_proto_members(target_os: str,
 # SpeechRecognitionAlternative/Result 在 macOS WebKit 亦缺，故不补）。
 #
 # protos 的 kind：fn = 方法（固定返回值），get = 只读属性，rw = 可写属性，
-# elementRef = ARIA 元素反射（内部元素列表 + 属性文本两条来源，见下方 F-141 项）。
+# elementRef = ARIA 元素反射（内部元素列表 + 属性文本两条来源，见下方 F-141 项），
+# emHeight = 按 ctx.font / textBaseline 逐实例计算的 TextMetrics 字体度量，
+# fontStretch = CSS `font-stretch` 语义的可写属性（值按 CSS 语法校验后归一化）。
 # interfaces 的 members：'!m' 前缀为方法，其余为属性 getter。
 _IOS_ADD_SPEC: Dict[str, Any] = {
     # 复杂语义的成员（Canvas 状态改写、媒体轨道对象、事件访问器）在注入器里
     # 逐条实现，这里只放「固定返回值」的简单成员。
     "protos": [
         {"ctor": "Range", "name": "compareNode", "kind": "fn"},
-        {"ctor": "TextMetrics", "name": "emHeightAscent", "kind": "get",
-         "value": 0},
-        {"ctor": "TextMetrics", "name": "emHeightDescent", "kind": "get",
-         "value": 0},
-        {"ctor": "FontFace", "name": "width", "kind": "get", "value": "normal"},
+        # F-92：TextMetrics 的 emHeight 两名不是固定值——真机按 ctx.font 解析出
+        # 的字体度量与字号逐实例算出（**未归一化**，ascent+descent ≈ 1.13em；
+        # WebKit main 分支的 1em 归一化没进 27.0.1 发布版）。取值与 _WK_EM_RATIO
+        # 表由注入器实现，这里只登记「需要按实例计算」的标记。
+        {"ctor": "TextMetrics", "name": "emHeightAscent", "kind": "emHeight"},
+        {"ctor": "TextMetrics", "name": "emHeightDescent", "kind": "emHeight"},
+        # FontFace.width 是**可写**属性（WebKit 实测 get+set 齐全，初值
+        # "normal"）；赋非法串抛 DOMException SyntaxError，赋合法值后归一化
+        # 回写（"1e2%" → "100%"）。Chromium 侧完全没有该成员，赋值只落成
+        # 普通自有属性，必须整条补上。
+        {"ctor": "FontFace", "name": "width", "kind": "fontStretch",
+         "value": "normal"},
         {"ctor": "CSSStyleDeclaration", "name": "cssRules", "kind": "get",
          "value": None},
         {"ctor": "CSSStyleDeclaration", "name": "getPropertyCSSValue",
@@ -2242,6 +2330,9 @@ def _add_members(target_os: str, os_version: Any = None) -> Dict[str, Any]:
     version = _parse_os_version(os_version)
     return {
         "protos": [dict(r) for r in _IOS_ADD_SPEC["protos"]],
+        # F-92：TextMetrics.emHeight 的字体度量表（注入器按 ctx.font 逐实例求值）
+        "emRatio": {k: list(v) for k, v in _WK_EM_RATIO.items()},
+        "emAdjust": [list(t) for t in _WK_EM_ADJ],
         "statics": [dict(r) for r in _IOS_ADD_SPEC["statics"]],
         "constants": [dict(r) for r in _IOS_ADD_SPEC["constants"]],
         "handlers": _ios_handlers(version),

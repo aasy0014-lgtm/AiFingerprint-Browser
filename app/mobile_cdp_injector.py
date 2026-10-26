@@ -8840,6 +8840,236 @@ __FF_SRC__
                         enumerable: true, configurable: true,
                     });
                 }
+                // F-92：TextMetrics 的字体度量。真机 WebKit 从 CoreText 的
+                // ascent/descent 算出全部 em/baseline 指标；Blink 自己那套
+                // （SkFontMetrics）在 44 族 × 15 字号的 660 行矩阵里只有
+                // 570/660 命中整数位，且小字号吐浮点，不能沿用。
+                //
+                // 实测模型（iOS 27.0.1 / Safari 27.0 系统 WebKit，660 行 +
+                // 5 族 × 2 字号 × 6 baseline 全命中）：
+                //   rawA = size * a0 + (lround(size * 0.15) 若 (a0,d0) ∈ ADJ)
+                //   rawD = size * d0（Hiragino Sans 另有 3px 下限）
+                //   IA = lround(rawA), ID = lround(rawD)
+                //   offY 由 textBaseline 定：alphabetic/hanging 0、top +IA、
+                //     bottom/ideographic −ID、middle floor((IA+ID)/2) − ID
+                //   emHeightAscent = rawA − offY，emHeightDescent = rawD + offY
+                //   hangingBaseline = rawA − offY（浮点），
+                //     ideographicBaseline = −rawD − offY（浮点），
+                //     alphabeticBaseline = −offY（alphabetic 下是真 −0），
+                //   fontBoundingBox* 走整数 IA/ID。
+                // 发布版**没有** main 分支那套「归一化到恰好 1em」，故
+                // emHeightAscent + emHeightDescent ≈ 1.13em 才是真机值。
+                var __wkEmAdj = (__add.emAdjust || []);
+                var __wkEmTable = (__add.emRatio || {});
+                var __wkEmCache = Object.create(null);
+                var __wkEmState = Object.create(null);
+                // 指标按 TextMetrics 实例存：measureText 算好后挂上去，getter
+                // 再读回来。用 WeakMap 是为了让实例保持零自有属性（真机
+                // Object.keys(measureText('')) 是 []）。
+                var __wkEmVals = new WeakMap();
+                var __wkEmProto = null;
+                var __wkEmBase = function (fam) {
+                    var k = fam.toLowerCase();
+                    var c = __wkEmCache[k];
+                    if (c !== undefined) { return c; }
+                    var v = __wkEmTable[k];
+                    if (!v) { v = __wkEmTable['serif'] || [0.75, 0.25]; }
+                    var a0 = v[0], d0 = v[1];
+                    // 表里所有 (0.9, 0.25) 项都是 Times 回退。
+                    if (a0 === 0.9 && d0 === 0.25) { a0 = 0.75; d0 = 0.25; }
+                    var bump = false;
+                    for (var i = 0; i < __wkEmAdj.length; i++) {
+                        var t = __wkEmAdj[i];
+                        if (Math.abs(t[0] - a0) < 1e-7 && Math.abs(t[1] - d0) < 1e-7) {
+                            bump = true;
+                            break;
+                        }
+                    }
+                    c = [a0, d0, bump, k === 'hiragino sans'];
+                    __wkEmCache[k] = c;
+                    return c;
+                };
+                // lround：C++ 的 lround 是「四舍五入、.5 远离零」，不是 JS 的
+                // Math.round（后者对负 .5 向 +∞ 取整）。
+                var __wkEmRound = function (x) {
+                    return x < 0 ? -Math.round(-x) : Math.round(x);
+                };
+                // 取 ctx.font 里**第一个**族名。ctx.font 是 CSS font 简写，
+                // 族列表可能带引号/逗号，字号单位由 CSS 归一化成 px。
+                var __wkEmParse = function (font) {
+                    var size = 10, fam = 'serif';
+                    if (typeof font !== 'string' || !font) { return [size, fam]; }
+                    var m = /(?:^|\s)(\d*\.?\d+)px\s+([\s\S]*)$/.exec(font);
+                    if (m) {
+                        var n = parseFloat(m[1]);
+                        if (isFinite(n) && n > 0) { size = n; }
+                        var rest = m[2];
+                        var comma = rest.indexOf(',');
+                        if (comma >= 0) { rest = rest.slice(0, comma); }
+                        rest = rest.trim().replace(/^["']|["']$/g, '').trim();
+                        if (rest) { fam = rest; }
+                    }
+                    return [size, fam];
+                };
+                // 一个 ctx 的 (font, textBaseline) → 指标。缓存键把两者拼起来，
+                // 避免每个 measureText 都重算。
+                var __wkEmFor = function (ctx) {
+                    var font = ctx.font, base = ctx.textBaseline;
+                    var key = font + '\u0000' + base;
+                    var hit = __wkEmState[key];
+                    if (hit !== undefined) { return hit; }
+                    var p = __wkEmParse(font);
+                    var size = p[0], fam = p[1];
+                    var b = __wkEmBase(fam);
+                    // WebKit 内部按 float 存度量，乘积要落成 float32。
+                    var fround = Math.fround || function (x) { return x; };
+                    var rawA = size * b[0];
+                    if (b[2]) { rawA += __wkEmRound(size * 0.15); }
+                    rawA = fround(rawA);
+                    var rawD = size * b[1];
+                    // Hiragino Sans 的 descent 有 3px 下限，只在 6 ≤ size < 25
+                    // 生效（实测：5.9 取自然值、25 恰好 3.000006、26 起自然）。
+                    if (b[3] && size >= 6 && size < 25) { rawD = 3; }
+                    else { rawD = fround(rawD); }
+                    var IA = __wkEmRound(rawA), ID = __wkEmRound(rawD);
+                    var offY = 0;
+                    if (base === 'top' || base === 'hanging') { offY = IA; }
+                    else if (base === 'bottom' || base === 'ideographic') { offY = -ID; }
+                    else if (base === 'middle') { offY = ((IA + ID) >> 1) - ID; }
+                    var v = {
+                        emHeightAscent: fround(rawA - offY),
+                        emHeightDescent: fround(rawD + offY),
+                        hangingBaseline: fround(rawA - offY),
+                        alphabeticBaseline: -offY,
+                        ideographicBaseline: fround(-rawD - offY),
+                        fontBoundingBoxAscent: IA - offY,
+                        fontBoundingBoxDescent: ID + offY,
+                    };
+                    __wkEmState[key] = v;
+                    return v;
+                };
+                // 原生 getter 改写成「读实例槽里的缓存值」。品牌校验必须自己
+                // 保留——真机在原型/裸对象上照样抛
+                // `The TextMetrics.x getter can only be used on instances of TextMetrics`。
+                // 只装一次：两个 Canvas 接口共享同一个 TextMetrics 接口。
+                var __wkEmInstall = function () {
+                    if (__wkEmProto) { return; }
+                    var proto = window.TextMetrics && window.TextMetrics.prototype;
+                    if (!proto) { return; }
+                    __wkEmProto = proto;
+                    ['emHeightAscent', 'emHeightDescent', 'hangingBaseline',
+                     'alphabeticBaseline', 'ideographicBaseline',
+                     'fontBoundingBoxAscent', 'fontBoundingBoxDescent'
+                    ].forEach(function (n) {
+                        var d = Object.getOwnPropertyDescriptor(proto, n);
+                        var native = d && d.get ? d.get : null;
+                        Object.defineProperty(proto, n, {
+                            get: __maskNative(function () {
+                                if (!__slotHas(proto, this)) {
+                                    throw __wkBrandErr('TextMetrics', n, 'getter');
+                                }
+                                var s = __wkEmVals.get(this);
+                                if (s !== undefined && n in s) { return s[n]; }
+                                // 没经过我们的 measureText 时退回原生值；
+                                // emHeight 两名 Blink 根本没有，退回 undefined。
+                                return native ? native.call(this) : undefined;
+                            }, 'get ' + n),
+                            enumerable: true, configurable: true,
+                        });
+                    });
+                };
+                // measureText：先做 WebKit 口径的接收者/缺参校验，再调原生
+                // （保留参数强转），最后按当前 font/baseline 算指标挂到返回值
+                // 上。两个 Canvas 接口的 measureText 是**不同**函数对象，各自
+                // 装一份。
+                var __wkMtDone = new WeakSet();
+                var __wkMeasureText = function (proto) {
+                    if (!proto) { return; }
+                    var native = proto.measureText;
+                    if (typeof native !== 'function' || __wkMtDone.has(native)) { return; }
+                    __wkMtDone.add(native);
+                    var iface = __ifaceName(proto);
+                    var fn = __maskNative(function (text) {
+                        // Blink 的接收者校验文案是 Illegal invocation、缺参是
+                        // `Failed to execute … 1 argument required`，都与真机
+                        // 不同；真机先校验接收者，再校验参数个数。
+                        if (iface && !__slotHas(proto, this)) {
+                            throw __brandErr(proto, 'measureText', 'method');
+                        }
+                        if (!arguments.length) {
+                            throw new TypeError('Not enough arguments');
+                        }
+                        var m = native.apply(this, arguments);
+                        try {
+                            __wkEmVals.set(m, __wkEmFor(this));
+                        } catch (e) {}
+                        return m;
+                    }, 'measureText');
+                    try {
+                        Object.defineProperty(fn, 'length', {
+                            value: 1, configurable: true,
+                        });
+                    } catch (e) {}
+                    Object.defineProperty(proto, 'measureText', {
+                        value: fn, writable: true, enumerable: true,
+                        configurable: true,
+                    });
+                    __wkEmInstall();
+                };
+                if (D.addMembers && D.ios) {
+                    __wkMeasureText(typeof CanvasRenderingContext2D !== 'undefined'
+                                    ? CanvasRenderingContext2D.prototype : null);
+                    __wkMeasureText(
+                        typeof OffscreenCanvasRenderingContext2D !== 'undefined'
+                        ? OffscreenCanvasRenderingContext2D.prototype : null);
+                }
+
+                // F-92：FontFace.width —— WebKit 的 `width` 描述符与 `stretch`
+                // **取值完全相同**（同一内部值，两个独立的访问器函数对象）。
+                // Chromium 没有 width，直接转交给原生 stretch 即可拿到同一套
+                // CSS font-stretch 解析（23 项实测取值全一致：`1e2%`→`100%`、
+                // `calc(50% + 25%)`→`calc(75%)`、`.5%`→`0.5%`、大小写/空白归一、
+                // 7 项非法串保留旧值）。只有报错文案不同，翻成真机口径。
+                if (D.addMembers && D.ios && typeof FontFace !== 'undefined') {
+                    var __ffp = FontFace.prototype;
+                    var __ffs = Object.getOwnPropertyDescriptor(__ffp, 'stretch');
+                    if (__ffs && __ffs.get && __ffs.set) {
+                        var __ffG = __ffs.get, __ffS = __ffs.set;
+                        var __ffBad = function () {
+                            try {
+                                return new DOMException(
+                                    'The string did not match the expected pattern.',
+                                    'SyntaxError');
+                            } catch (e) {
+                                return new Error('The string did not match the expected pattern.');
+                            }
+                        };
+                        Object.defineProperty(__ffp, 'width', {
+                            get: __maskNative(function () {
+                                if (!__slotHas(__ffp, this)) {
+                                    throw __wkBrandErr('FontFace', 'width', 'getter');
+                                }
+                                return __ffG.call(this);
+                            }, 'get width'),
+                            set: __maskNative(function (v) {
+                                if (!__slotHas(__ffp, this)) {
+                                    throw __wkBrandErr('FontFace', 'width', 'setter');
+                                }
+                                try {
+                                    __ffS.call(this, v);
+                                } catch (e) {
+                                    // 原生文案带
+                                    // `Failed to set the 'stretch' property on 'FontFace': `
+                                    // 前缀，真机一律是裸的 SyntaxError；旧值保持不变
+                                    // 由原生 setter 自己保证。
+                                    throw __ffBad();
+                                }
+                            }, 'set width'),
+                            enumerable: true, configurable: true,
+                        });
+                    }
+                }
+
                 // 媒体面：WebKit 的 AudioTrackList / VideoTrackList 面。实例
                 // 形态与成员口径见下方 F-154 块（__wkList）。
                 if (typeof HTMLMediaElement !== 'undefined') {
@@ -9589,6 +9819,9 @@ __FF_SRC__
                     // F-159：force 用于「原生已有但口径不同」的成员——Blink
                     // 的实现能跑，但可见性/身份/文案与真机背离，必须整条换掉。
                     if (r.name in C.prototype && !r.force) { return; }
+                    // F-92：这两类由上面的 measureText / FontFace 块按实例口径
+                    // 实现，这里不能再装一遍固定值桩（会把 getter 盖成 undefined）。
+                    if (r.kind === 'emHeight' || r.kind === 'fontStretch') { return; }
                     try {
                         if (r.singleton) {
                             var S = window[r.singleton];
