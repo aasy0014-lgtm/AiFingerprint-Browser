@@ -2611,6 +2611,23 @@ try {
     + ' , wkAdd: (function () { var ns = ["FontFaceSet","CSSUnitValue","CSSMathSum","CSSTransformValue","CSSStyleValue","AudioDecoder","VideoDecoder","AudioEncoder","VideoEncoder","ManagedMediaSource","MediaStreamTrack","NavigationPreloadManager","Report","StylePropertyMapReadOnly","BufferedChangeEvent","VideoTrackGenerator","CSSSkewX","CSSTransformComponent","ServiceWorker","ServiceWorkerContainer","ServiceWorkerRegistration"];'
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
     + ' , wkNav: (function () { try { return Object.getOwnPropertyNames(WorkerNavigator.prototype); } catch (e) { return "ERR"; } })()'
+    // F-92：Worker 作用域的量。真机 32px sans-serif 的 emHeight 与页面逐值
+    // 相同（29.640625 / 7.359375），Chromium 侧两名缺席、hangingBaseline 取
+    // 整数 intAscent、且接收者/缺参文案是 Blink 口径。
+    + ' , wkEm: (function () { try {'
+    + ' if (typeof OffscreenCanvas === "undefined") { return "NO_OC"; }'
+    + ' var c = new OffscreenCanvas(8, 8).getContext("2d");'
+    + ' c.font = "32px sans-serif"; c.textBaseline = "alphabetic";'
+    + ' var m = c.measureText("Hg");'
+    + ' var bad = ""; try { OffscreenCanvasRenderingContext2D.prototype.measureText.call({}); bad = "no-throw"; }'
+    + ' catch (e) { bad = e.name + ": " + e.message; }'
+    + ' var na = ""; try { c.measureText(); na = "no-throw"; } catch (e) { na = e.name + ": " + e.message; }'
+    + ' var ff = null; try { var f = new FontFace("A", "local(Helvetica)"); ff = [f.width, (function(){ f.width = "75%"; return f.width; })()]; } catch (e) { ff = "ERR"; }'
+    + ' return {asc: m.emHeightAscent, desc: m.emHeightDescent,'
+    + ' hang: m.hangingBaseline, ideo: m.ideographicBaseline,'
+    + ' fba: m.fontBoundingBoxAscent, fbd: m.fontBoundingBoxDescent,'
+    + ' own: Object.getOwnPropertyNames(m), proto: Object.getOwnPropertyNames(TextMetrics.prototype),'
+    + ' bad: bad, na: na, ff: ff}; } catch (e) { return "ERR:" + e.message; } })()'
     // F-77 D3：真机 Worker 的 navigator.serviceWorker 是 WorkerNavigator
     // 原型上的只读 getter，每次读同一个 ServiceWorkerContainer 实例；
     // GPC 在 Worker 侧不存在（页面侧才有，见 pageGpc）。
@@ -2782,6 +2799,23 @@ try {
     + ' , wkAdd: (function () { var ns = ["FontFaceSet","CSSUnitValue","CSSMathSum","CSSTransformValue","CSSStyleValue","AudioDecoder","VideoDecoder","AudioEncoder","VideoEncoder","ManagedMediaSource","MediaStreamTrack","NavigationPreloadManager","Report","StylePropertyMapReadOnly","BufferedChangeEvent","VideoTrackGenerator","CSSSkewX","CSSTransformComponent","ServiceWorker","ServiceWorkerContainer","ServiceWorkerRegistration"];'
     + ' var o = {}; for (var i = 0; i < ns.length; i++) { try { o[ns[i]] = typeof self[ns[i]]; } catch (e) { o[ns[i]] = "ERR"; } } return o; })()'
     + ' , wkNav: (function () { try { return Object.getOwnPropertyNames(WorkerNavigator.prototype); } catch (e) { return "ERR"; } })()'
+    // F-92：Worker 作用域的量。真机 32px sans-serif 的 emHeight 与页面逐值
+    // 相同（29.640625 / 7.359375），Chromium 侧两名缺席、hangingBaseline 取
+    // 整数 intAscent、且接收者/缺参文案是 Blink 口径。
+    + ' , wkEm: (function () { try {'
+    + ' if (typeof OffscreenCanvas === "undefined") { return "NO_OC"; }'
+    + ' var c = new OffscreenCanvas(8, 8).getContext("2d");'
+    + ' c.font = "32px sans-serif"; c.textBaseline = "alphabetic";'
+    + ' var m = c.measureText("Hg");'
+    + ' var bad = ""; try { OffscreenCanvasRenderingContext2D.prototype.measureText.call({}); bad = "no-throw"; }'
+    + ' catch (e) { bad = e.name + ": " + e.message; }'
+    + ' var na = ""; try { c.measureText(); na = "no-throw"; } catch (e) { na = e.name + ": " + e.message; }'
+    + ' var ff = null; try { var f = new FontFace("A", "local(Helvetica)"); ff = [f.width, (function(){ f.width = "75%"; return f.width; })()]; } catch (e) { ff = "ERR"; }'
+    + ' return {asc: m.emHeightAscent, desc: m.emHeightDescent,'
+    + ' hang: m.hangingBaseline, ideo: m.ideographicBaseline,'
+    + ' fba: m.fontBoundingBoxAscent, fbd: m.fontBoundingBoxDescent,'
+    + ' own: Object.getOwnPropertyNames(m), proto: Object.getOwnPropertyNames(TextMetrics.prototype),'
+    + ' bad: bad, na: na, ff: ff}; } catch (e) { return "ERR:" + e.message; } })()'
     // F-77 D3：真机 Worker 的 navigator.serviceWorker 是 WorkerNavigator
     // 原型上的只读 getter，每次读同一个 ServiceWorkerContainer 实例；
     // GPC 在 Worker 侧不存在（页面侧才有，见 pageGpc）。
@@ -4759,6 +4793,37 @@ async def main() -> int:
                 and (wk_main.get("wkSw") or {}).get("d") == [True, True, "function", "undefined", 0]),
             "Worker：CSS Typed OM 字符串化/iterator/原生外观与真机一致": (
                 wk_main.get("wkCss") == ["5px", 1, "calc(5px + 2px)", True, True]),
+            # F-92：Worker 作用域 TextMetrics 度量与页面同口径（真机 32px
+            # sans-serif：29.640625 / 7.359375；hanging 同 emA、ideographic 为负）。
+            "Worker：TextMetrics em/baseline 与真机逐值一致": (
+                isinstance(wk_main.get("wkEm"), dict)
+                and abs(wk_main["wkEm"].get("asc", 0) - 29.640625) < 1e-9
+                and abs(wk_main["wkEm"].get("desc", 0) - 7.359375) < 1e-9
+                and abs(wk_main["wkEm"].get("hang", 0) - 29.640625) < 1e-9
+                and abs(wk_main["wkEm"].get("ideo", 0) + 7.359375) < 1e-9
+                and wk_main["wkEm"].get("fba") == 30
+                and wk_main["wkEm"].get("fbd") == 7
+                and wk_main["wkEm"].get("own") == []),
+            # F-92：真机原型上 constructor 在首位、emHeight 两名紧跟
+            # actualBoundingBoxDescent；Chromium 的顺序与此不同。
+            "Worker：TextMetrics 原型成员顺序与真机一致": (
+                (wk_main.get("wkEm") or {}).get("proto") == [
+                    "constructor", "width", "actualBoundingBoxLeft",
+                    "actualBoundingBoxRight", "fontBoundingBoxAscent",
+                    "fontBoundingBoxDescent", "actualBoundingBoxAscent",
+                    "actualBoundingBoxDescent", "emHeightAscent",
+                    "emHeightDescent", "hangingBaseline", "alphabeticBaseline",
+                    "ideographicBaseline"]),
+            # F-92：measureText 的接收者/缺参文案翻成 WebKit 口径；
+            # FontFace.width 可写且取值同 stretch。
+            "Worker：measureText 品牌/缺参文案为 WebKit 口径": (
+                (wk_main.get("wkEm") or {}).get("bad")
+                == "TypeError: Can only call OffscreenCanvasRenderingContext2D"
+                   ".measureText on instances of OffscreenCanvasRenderingContext2D"
+                and (wk_main.get("wkEm") or {}).get("na")
+                == "TypeError: Not enough arguments"),
+            "Worker：FontFace.width 可写（初值 normal，赋值归一化）": (
+                (wk_main.get("wkEm") or {}).get("ff") == ["normal", "75%"]),
             "Worker：品牌校验为 WebKit 文案": (
                 wk_main.get("wkBrand")
                 == "TypeError:The CSSMathSum.values getter can only be used on"

@@ -8857,8 +8857,10 @@ __FF_SRC__
                 //     ideographicBaseline = −rawD − offY（浮点），
                 //     alphabeticBaseline = −offY（alphabetic 下是真 −0），
                 //   fontBoundingBox* 走整数 IA/ID。
-                // 发布版**没有** main 分支那套「归一化到恰好 1em」，故
-                // emHeightAscent + emHeightDescent ≈ 1.13em 才是真机值。
+                // 发布版**没有** main 分支那套「归一化到恰好 1em」（该改动
+                // 2026-09-28 才进 main，见 b8b5a6a183；发布目标是
+                // safari-7625.1.29.11 分支，仍是裸 ascent()/descent()），故
+                // emHeightAscent + emHeightDescent ≈ 1.16em 才是真机值。
                 var __wkEmAdj = (__add.emAdjust || []);
                 var __wkEmTable = (__add.emRatio || {});
                 var __wkEmCache = Object.create(null);
@@ -13905,6 +13907,254 @@ __MC_SRC__
             // CSSMathValue.operator 由 init 直接给（sum / product / min / max /
             // negate / invert / clamp），无需覆盖。
         }
+        // ---- F-92：Worker 作用域的 TextMetrics 字体度量 ----
+        // 页面那套走 D.addMembers 的 emRatio 表，Worker 是独立全局拿不到，
+        // 这里单独下发同一张表并重装一遍。真机 Worker 的度量与页面逐值相同
+        // （32px sans-serif：emA 29.640625 / emD 7.359375 / hanging 同 emA /
+        // ideographic −7.359375），Chromium 侧则是 emHeight 两名缺席、
+        // hangingBaseline 取整数 intAscent（24）、ideographic 取 −intDescent（−7），
+        // 且接收者/缺参文案是 Blink 口径——检测方在 Worker 里量一次即可判假。
+        (function () {
+            var add = __wkWA.addMembers || {};
+            var table = add.emRatio || {};
+            var adj = add.emAdjust || [];
+            if (!table || typeof OffscreenCanvasRenderingContext2D === 'undefined') { return; }
+            var proto = null;
+            try { proto = OffscreenCanvasRenderingContext2D.prototype; } catch (e) { return; }
+            if (!proto || typeof proto.measureText !== 'function') { return; }
+            var cache = Object.create(null);
+            var state = Object.create(null);
+            var vals = new WeakMap();
+            var base = function (fam) {
+                var k = fam.toLowerCase();
+                var c = cache[k];
+                if (c !== undefined) { return c; }
+                var v = table[k];
+                if (!v) { v = table['serif'] || [0.75, 0.25]; }
+                var a0 = v[0], d0 = v[1];
+                // 表里所有 (0.9, 0.25) 项都是 Times 回退。
+                if (a0 === 0.9 && d0 === 0.25) { a0 = 0.75; d0 = 0.25; }
+                var bump = false;
+                for (var i = 0; i < adj.length; i++) {
+                    var t = adj[i];
+                    if (Math.abs(t[0] - a0) < 1e-7 && Math.abs(t[1] - d0) < 1e-7) {
+                        bump = true;
+                        break;
+                    }
+                }
+                c = [a0, d0, bump, k === 'hiragino sans'];
+                cache[k] = c;
+                return c;
+            };
+            // C++ 的 lround 是「.5 远离零」，不是 JS 的 Math.round。
+            var lround = function (x) { return x < 0 ? -Math.round(-x) : Math.round(x); };
+            var parse = function (font) {
+                var size = 10, fam = 'serif';
+                if (typeof font !== 'string' || !font) { return [size, fam]; }
+                var m = /(?:^|\s)(\d*\.?\d+)px\s+([\s\S]*)$/.exec(font);
+                if (m) {
+                    var n = parseFloat(m[1]);
+                    if (isFinite(n) && n > 0) { size = n; }
+                    var rest = m[2];
+                    var comma = rest.indexOf(',');
+                    if (comma >= 0) { rest = rest.slice(0, comma); }
+                    rest = rest.trim().replace(/^["']|["']$/g, '').trim();
+                    if (rest) { fam = rest; }
+                }
+                return [size, fam];
+            };
+            var fround = Math.fround || function (x) { return x; };
+            // 接收者校验走原型链，不能用 __wkHasW——那张 WeakMap 只登记补建
+            // 接口时合成的实例，真正的 OffscreenCanvas 上下文不在其中（真机
+            // 对任何原型链上有该接口的对象都放行）。
+            var hasCtx = function (recv) {
+                if (recv === null || recv === undefined) { return false; }
+                var t = typeof recv;
+                if (t !== 'object' && t !== 'function') { return false; }
+                var x = recv;
+                for (var i = 0; i < 8; i++) {
+                    try { x = Object.getPrototypeOf(x); } catch (e) { return false; }
+                    if (x === proto) { return true; }
+                    if (x === null || x === undefined) { return false; }
+                    var isProto = false;
+                    try {
+                        var c = x.constructor;
+                        if (typeof c === 'function' && c.prototype === x) { isProto = true; }
+                    } catch (e) {}
+                    if (!isProto) { return false; }
+                }
+                return false;
+            };
+            var forCtx = function (ctx) {
+                var key = ctx.font + '\u0000' + ctx.textBaseline;
+                var hit = state[key];
+                if (hit !== undefined) { return hit; }
+                var p = parse(ctx.font);
+                var size = p[0];
+                var b = base(p[1]);
+                var rawA = fround(size * b[0] + (b[2] ? lround(size * 0.15) : 0));
+                var rawD = size * b[1];
+                // Hiragino Sans 的 descent 有 3px 下限，只在 6 ≤ size < 25 生效。
+                if (b[3] && size >= 6 && size < 25) { rawD = 3; }
+                else { rawD = fround(rawD); }
+                var IA = lround(rawA), ID = lround(rawD);
+                var offY = 0;
+                var tb = ctx.textBaseline;
+                if (tb === 'top' || tb === 'hanging') { offY = IA; }
+                else if (tb === 'bottom' || tb === 'ideographic') { offY = -ID; }
+                else if (tb === 'middle') { offY = ((IA + ID) >> 1) - ID; }
+                var v = {
+                    emHeightAscent: fround(rawA - offY),
+                    emHeightDescent: fround(rawD + offY),
+                    hangingBaseline: fround(rawA - offY),
+                    alphabeticBaseline: -offY,
+                    ideographicBaseline: fround(-rawD - offY),
+                    fontBoundingBoxAscent: IA - offY,
+                    fontBoundingBoxDescent: ID + offY,
+                };
+                state[key] = v;
+                return v;
+            };
+            // 原型 getter：读实例槽里的缓存值，品牌校验自己保留（真机在
+            // 原型/裸对象上照样抛 `The TextMetrics.x getter can only be used
+            // on instances of TextMetrics`）。Worker 侧 __wkBrandErrW 可用。
+            var TM = null;
+            try { TM = self.TextMetrics; } catch (e) {}
+            var hasTm = function (recv) {
+                if (recv === null || recv === undefined) { return false; }
+                var t = typeof recv;
+                if (t !== 'object' && t !== 'function') { return false; }
+                var x = recv;
+                for (var i = 0; i < 8; i++) {
+                    try { x = Object.getPrototypeOf(x); } catch (e) { return false; }
+                    if (x === TM.prototype) { return true; }
+                    if (x === null || x === undefined) { return false; }
+                    var isProto = false;
+                    try {
+                        var c = x.constructor;
+                        if (typeof c === 'function' && c.prototype === x) { isProto = true; }
+                    } catch (e) {}
+                    if (!isProto) { return false; }
+                }
+                return false;
+            };
+            if (TM && TM.prototype) {
+                ['emHeightAscent', 'emHeightDescent', 'hangingBaseline',
+                 'alphabeticBaseline', 'ideographicBaseline',
+                 'fontBoundingBoxAscent', 'fontBoundingBoxDescent'
+                ].forEach(function (n) {
+                    var d = Object.getOwnPropertyDescriptor(TM.prototype, n);
+                    var native = d && d.get ? d.get : null;
+                    try {
+                        Object.defineProperty(TM.prototype, n, {
+                            get: __maskNative(function () {
+                                if (!hasTm(this)) {
+                                    throw __wkBrandErrW('TextMetrics', n, 'getter');
+                                }
+                                var s = vals.get(this);
+                                if (s !== undefined && n in s) { return s[n]; }
+                                return native ? native.call(this) : undefined;
+                            }, 'get ' + n),
+                            enumerable: true, configurable: true,
+                        });
+                    } catch (e) {}
+                });
+                // 真机原型上 constructor 永远是第一个自有属性，且 emHeight
+                // 两名紧跟 actualBoundingBoxDescent；Blink 的 TextMetrics 把
+                // constructor 排在末尾，新装的两名又追加到最后，两处都要重排。
+                try { __wkCtorFirst(TM.prototype); } catch (e) {}
+                try {
+                    var order = [];
+                    Object.getOwnPropertyNames(TM.prototype).forEach(function (k) {
+                        if (k === 'emHeightAscent' || k === 'emHeightDescent') { return; }
+                        order.push(k);
+                        if (k === 'actualBoundingBoxDescent') {
+                            order.push('emHeightAscent', 'emHeightDescent');
+                        }
+                    });
+                    order.forEach(function (k) {
+                        var d = Object.getOwnPropertyDescriptor(TM.prototype, k);
+                        if (!d || !d.configurable) { return; }
+                        delete TM.prototype[k];
+                        Object.defineProperty(TM.prototype, k, d);
+                    });
+                } catch (e) {}
+            }
+            // measureText：先做 WebKit 口径的接收者/缺参校验，再调原生，最后
+            // 按当前 font/baseline 算指标挂到返回值上。
+            var native = proto.measureText;
+            var fn = __maskNative(function (text) {
+                if (!hasCtx(this)) {
+                    throw __wkBrandErrW('OffscreenCanvasRenderingContext2D',
+                                        'measureText', 'method');
+                }
+                if (!arguments.length) { throw new TypeError('Not enough arguments'); }
+                var m = native.apply(this, arguments);
+                try { vals.set(m, forCtx(this)); } catch (e) {}
+                return m;
+            }, 'measureText');
+            try { Object.defineProperty(fn, 'length', { value: 1, configurable: true }); } catch (e) {}
+            try {
+                Object.defineProperty(proto, 'measureText', {
+                    value: fn, writable: true, enumerable: true, configurable: true,
+                });
+            } catch (e) {}
+            // FontFace.width：与 stretch 同一内部值，只差报错文案。
+            var FF = null;
+            try { FF = self.FontFace; } catch (e) {}
+            if (FF && FF.prototype) {
+                var sd = Object.getOwnPropertyDescriptor(FF.prototype, 'stretch');
+                if (sd && sd.get && sd.set) {
+                    var ffG = sd.get, ffS = sd.set;
+                    var ffBad = function () {
+                        try {
+                            return new DOMException(
+                                'The string did not match the expected pattern.',
+                                'SyntaxError');
+                        } catch (e) {
+                            return new Error('The string did not match the expected pattern.');
+                        }
+                    };
+                    // 真正的 FontFace 实例是内核原生对象，同样不在 __wkStateW
+                    // 里，校验走原型链。
+                    var hasFf = function (recv) {
+                        if (recv === null || recv === undefined) { return false; }
+                        var t = typeof recv;
+                        if (t !== 'object' && t !== 'function') { return false; }
+                        var x = recv;
+                        for (var i = 0; i < 8; i++) {
+                            try { x = Object.getPrototypeOf(x); } catch (e) { return false; }
+                            if (x === FF.prototype) { return true; }
+                            if (x === null || x === undefined) { return false; }
+                            var isProto = false;
+                            try {
+                                var c = x.constructor;
+                                if (typeof c === 'function' && c.prototype === x) { isProto = true; }
+                            } catch (e) {}
+                            if (!isProto) { return false; }
+                        }
+                        return false;
+                    };
+                    try {
+                        Object.defineProperty(FF.prototype, 'width', {
+                            get: __maskNative(function () {
+                                if (!hasFf(this)) {
+                                    throw __wkBrandErrW('FontFace', 'width', 'getter');
+                                }
+                                return ffG.call(this);
+                            }, 'get width'),
+                            set: __maskNative(function (v) {
+                                if (!hasFf(this)) {
+                                    throw __wkBrandErrW('FontFace', 'width', 'setter');
+                                }
+                                try { ffS.call(this, v); } catch (e) { throw ffBad(); }
+                            }, 'set width'),
+                            enumerable: true, configurable: true,
+                        });
+                    } catch (e) {}
+                }
+            }
+        })();
         // ---- Worker 独有的全局成员（F-77 D3）----
         // 真机 WebKit 的 WorkerNavigator.prototype.serviceWorker 是只读 getter
         // （enumerable true、无 setter、get.length 0），每次读取返回同一个

@@ -2293,6 +2293,13 @@ def _worker_add_members(target_os: str) -> Dict[str, Any]:
         # serviceWorker 成员），必须在这里补建，否则 navProto 里的
         # serviceWorker getter 读不到容器对象。
         "globals": dict(_IOS_WORKER_ADD_GLOBALS),
+        # F-92：Worker 侧 TextMetrics 的字体度量表。Worker 是独立全局，页面
+        # addMembers 到不了，故与页面同源再下发一份（注入器在 Worker 模板里
+        # 重装 measureText / TextMetrics getter）。
+        "addMembers": {
+            "emRatio": {k: list(v) for k, v in _WK_EM_RATIO.items()},
+            "emAdjust": [list(t) for t in _WK_EM_ADJ],
+        },
     }
 
 
