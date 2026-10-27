@@ -5935,13 +5935,34 @@ __FF_SRC__
                 }
             } catch (e) {}
 
-            // 14) (dynamic-range: high)：iPhone 的 HDR 屏口径（F-12）。
-            //     CDP 的 setEmulatedMedia 不支持该特性（实测仍 false，而同
+            // 14) matchMedia 的 iOS 口径修正（F-12 / F-199）。
+            //     两项都是 Blink 不实现的媒体特性，真机 WebKit 有确定取值：
+            //       (dynamic-range: high)   iPhone HDR 屏为 true（F-12）
+            //       (inverted-colors: none) 恒 true（F-199，系统智能反转默认关）
+            //     CDP 的 setEmulatedMedia 对两者都不生效（实测仍 false，而同
             //     路径的 prefers-color-scheme 生效），只能改 matchMedia。
             //     实现放在 MediaQueryList.prototype 的 matches 访问器上（原生
             //     位置）：实例上不留 own property，media 仍是原查询串，
             //     非法接收者仍由原生 media getter 抛 Illegal invocation。
-            if (D.dynamicRangeHigh && typeof window.matchMedia === 'function'
+            //
+            //     求值方式：把待改特性**改写成 Blink 认识的字面量**，再交给原生
+            //     matchMedia 解析。不能只对整串做正则命中——组合查询
+            //     `(inverted-colors: none) and (pointer: fine)` 真机为 false，
+            //     整串命中会错报 true（实测 f199a）。改写成恒真/恒假特性后，
+            //     and/or/not 的语义由原生解析器自己算：
+            //       恒真 → (min-width: 0px)
+            //       恒假 → (min-width: 999999px)
+            //     改写后的串已不含待改特性，原生求值时不会再次进入本访问器。
+            //
+            //     inverted-colors 的 @media 路径修不了：Blink 解析器根本不认
+            //     这个特性名（BCD chrome=false），CSSOM 改写要等到
+            //     MutationObserver 微任务，晚于页面的同步 getComputedStyle。
+            //     creepjs 两条路径分别入哈希、不做交叉比对，故只修 matchMedia
+            //     仍是净收益（一项从缺失变为正确，另一项保持原样）。
+            var __mmNeedHdr = !!D.dynamicRangeHigh;
+            var __mmNeedInv = !!D.ios;
+            if ((__mmNeedHdr || __mmNeedInv)
+                    && typeof window.matchMedia === 'function'
                     && typeof MediaQueryList !== 'undefined') {
                 try {
                     var __mmProto = MediaQueryList.prototype;
@@ -5951,14 +5972,37 @@ __FF_SRC__
                             && __mmMediaDesc && typeof __mmMediaDesc.get === 'function') {
                         var __mmOrigMatches = __mmDesc.get;
                         var __mmOrigMedia = __mmMediaDesc.get;
-                        var __mmHdrRe = /\(\s*dynamic-range\s*:\s*high\s*\)/i;
+                        var __mmNative = window.matchMedia;
+                        var __mmTrue = '(min-width: 0px)';
+                        var __mmFalse = '(min-width: 999999px)';
+                        // dynamic-range 的两个值**不是互斥**的：真机 HDR 屏上
+                        // `high` 与 `standard` 同时为 true（standard 意为「至少
+                        // 标准动态范围」，实测 WebKit `high and standard` = true，
+                        // `not high` = false）。所以只改写 high 一项，standard
+                        // 交回原生求值（SDR 屏上原生即为 true）。
+                        var __mmHdrRe = /\(\s*dynamic-range\s*:\s*high\s*\)/gi;
+                        // inverted-colors 的三个值互斥：none / inverted /
+                        // grayscale。真机非反转态下只有 none 匹配。
+                        var __mmInvNoneRe = /\(\s*inverted-colors\s*:\s*none\s*\)/gi;
+                        var __mmInvOtherRe = /\(\s*inverted-colors\s*:\s*(?:inverted|grayscale)\s*\)/gi;
+                        var __mmAnyRe = /inverted-colors|dynamic-range/i;
                         Object.defineProperty(__mmProto, 'matches', {
                             configurable: true,
                             enumerable: __mmDesc.enumerable,
                             get: __maskNative(function () {
                                 var q = __mmOrigMedia.call(this);
-                                if (typeof q === 'string' && __mmHdrRe.test(q)) {
-                                    return true;
+                                if (typeof q === 'string' && __mmAnyRe.test(q)) {
+                                    var rw = q;
+                                    if (__mmNeedHdr) {
+                                        rw = rw.replace(__mmHdrRe, __mmTrue);
+                                    }
+                                    if (__mmNeedInv) {
+                                        rw = rw.replace(__mmInvNoneRe, __mmTrue)
+                                               .replace(__mmInvOtherRe, __mmFalse);
+                                    }
+                                    if (rw !== q) {
+                                        return __mmNative.call(window, rw).matches;
+                                    }
                                 }
                                 return __mmOrigMatches.call(this);
                             }, 'get matches'),
