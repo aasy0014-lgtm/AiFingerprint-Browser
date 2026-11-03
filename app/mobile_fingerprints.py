@@ -2477,6 +2477,73 @@ _IOS_ADD_SPEC: Dict[str, Any] = {
                     "members": ["identifier", "listStyle", "separator"]},
         "SVGPathSeg": {"construct": "illegal", "length": 0,
                        "members": ["pathSegType", "pathSegTypeAsLetter"]},
+        # F-25：SVGPathSeg 的 19 个具体子类。全部 `extends: "SVGPathSeg"`、
+        # length 0、Illegal constructor，只差坐标 getter 集合——真机形态实测
+        # Playwright WebKit 26.5（逐个逐描述符；全部 getter 为
+        # enumerable:true / configurable:true，无 setter）。
+        # Blink 自 Chromium 76 起整族移除，`'SVGPathSegMovetoAbs' in window`
+        # 一行即判假。
+        "SVGPathSegMovetoAbs": {"construct": "illegal", "length": 0,
+                                "extends": "SVGPathSeg",
+                                "members": ["x", "y"]},
+        "SVGPathSegMovetoRel": {"construct": "illegal", "length": 0,
+                                "extends": "SVGPathSeg",
+                                "members": ["x", "y"]},
+        "SVGPathSegLinetoAbs": {"construct": "illegal", "length": 0,
+                                "extends": "SVGPathSeg",
+                                "members": ["x", "y"]},
+        "SVGPathSegLinetoRel": {"construct": "illegal", "length": 0,
+                                "extends": "SVGPathSeg",
+                                "members": ["x", "y"]},
+        "SVGPathSegCurvetoCubicAbs": {"construct": "illegal", "length": 0,
+                                      "extends": "SVGPathSeg",
+                                      "members": ["x", "y", "x1", "y1",
+                                                  "x2", "y2"]},
+        "SVGPathSegCurvetoCubicRel": {"construct": "illegal", "length": 0,
+                                      "extends": "SVGPathSeg",
+                                      "members": ["x", "y", "x1", "y1",
+                                                  "x2", "y2"]},
+        "SVGPathSegCurvetoQuadraticAbs": {
+            "construct": "illegal", "length": 0, "extends": "SVGPathSeg",
+            "members": ["x", "y", "x1", "y1"]},
+        "SVGPathSegCurvetoQuadraticRel": {
+            "construct": "illegal", "length": 0, "extends": "SVGPathSeg",
+            "members": ["x", "y", "x1", "y1"]},
+        "SVGPathSegArcAbs": {"construct": "illegal", "length": 0,
+                             "extends": "SVGPathSeg",
+                             "members": ["x", "y", "r1", "r2", "angle",
+                                         "largeArcFlag", "sweepFlag"]},
+        "SVGPathSegArcRel": {"construct": "illegal", "length": 0,
+                             "extends": "SVGPathSeg",
+                             "members": ["x", "y", "r1", "r2", "angle",
+                                         "largeArcFlag", "sweepFlag"]},
+        "SVGPathSegLinetoHorizontalAbs": {"construct": "illegal", "length": 0,
+                                          "extends": "SVGPathSeg",
+                                          "members": ["x"]},
+        "SVGPathSegLinetoHorizontalRel": {"construct": "illegal", "length": 0,
+                                          "extends": "SVGPathSeg",
+                                          "members": ["x"]},
+        "SVGPathSegLinetoVerticalAbs": {"construct": "illegal", "length": 0,
+                                        "extends": "SVGPathSeg",
+                                        "members": ["y"]},
+        "SVGPathSegLinetoVerticalRel": {"construct": "illegal", "length": 0,
+                                        "extends": "SVGPathSeg",
+                                        "members": ["y"]},
+        "SVGPathSegCurvetoCubicSmoothAbs": {
+            "construct": "illegal", "length": 0, "extends": "SVGPathSeg",
+            "members": ["x", "y", "x2", "y2"]},
+        "SVGPathSegCurvetoCubicSmoothRel": {
+            "construct": "illegal", "length": 0, "extends": "SVGPathSeg",
+            "members": ["x", "y", "x2", "y2"]},
+        "SVGPathSegCurvetoQuadraticSmoothAbs": {
+            "construct": "illegal", "length": 0, "extends": "SVGPathSeg",
+            "members": ["x", "y"]},
+        "SVGPathSegCurvetoQuadraticSmoothRel": {
+            "construct": "illegal", "length": 0, "extends": "SVGPathSeg",
+            "members": ["x", "y"]},
+        # 唯一无坐标成员的子类（真机原型只有 constructor）。
+        "SVGPathSegClosePath": {"construct": "illegal", "length": 0,
+                                "extends": "SVGPathSeg", "members": []},
         # F-25：WebKit 的 SVGPathSegList 是 legacy 列表接口（getItem 0 基、
         # numberOfItems 与 length 同值）。Blink 从 Chromium 76 起整族移除
         # （`'SVGPathSegList' in window === false`，一行判假）。真机形态实测
