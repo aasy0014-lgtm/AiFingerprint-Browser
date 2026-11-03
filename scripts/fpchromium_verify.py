@@ -7,11 +7,16 @@
 """
 import asyncio
 import json
+from pathlib import Path
 import sys
 import time
 
 import httpx
 import websockets
+
+# Allow running this script directly from the repository root or any cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from app.kernels.fp_chromium_kernel import chrome_version
 
 BASE = "http://127.0.0.1:18080/api/v1"
 CLIENT = httpx.Client(base_url=BASE, timeout=300)
@@ -68,7 +73,17 @@ def main() -> int:
         ver = httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=10).json()
         print(f"      Browser: {ver['Browser']}")
         print(f"      UA: {ver['User-Agent'][:80]}")
-        assert "Chrome/148" in ver["Browser"], ver["Browser"]
+        # Do not pin the regression probe to the previous 148 build.  The
+        # runtime UA/UA-CH must follow the installed fp-chromium engine (152
+        # at the time of writing); only the major version is stable enough for
+        # this smoke check because patch metadata can differ between the
+        # executable and the DevTools product string.
+        expected_major = (chrome_version() or "").split(".", 1)[0]
+        browser_product = str(ver.get("Browser") or "")
+        assert expected_major and (
+            f"Chrome/{expected_major}." in browser_product
+            or f"Chromium/{expected_major}." in browser_product
+        ), {"expected_major": expected_major, "Browser": browser_product}
         assert "HeadlessChrome" not in ver["User-Agent"], "UA 暴露 Headless 特征!"
 
         print("[4] 页面内指纹采样（第 1 次）...")

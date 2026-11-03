@@ -59,6 +59,10 @@ tools/fp-chromium/
 > 经符号链接启动时 dyld 会按链接路径解析框架导致启动失败，
 > 内核已直接支持发现 `Chromium.app` 内的真实二进制。
 
+> 安装脚本会把旧版本备份为 `*.disabled`，而不是 `*.app`。这是有意的：
+> LaunchServices 会扫描同目录的应用包，多个同 Bundle ID 的 Chromium 包可能
+> 让 `open` 选到旧包并报 `kLSNoExecutableErr`。
+
 ### 步骤 4: 环境变量（可选）
 
 内核按以下顺序自动查找：`FPWB_FPCHROMIUM` 环境变量 → `tools/fp-chromium/` 目录
@@ -89,6 +93,15 @@ $env:FPWB_FPCHROMIUM="D:\AiFingerprint-Browser\tools\fp-chromium\chrome.exe"
 ```bash
 # macOS / Linux（Windows 用户请在 Git Bash 中运行）
 cd /Users/admin/Documents/AiFingerprint-Browser
+bash scripts/install_fpchromium.sh
+
+# 可选：指定带 macOS ARM 资产的版本
+FPWB_FPCHROMIUM_VERSION=148.0.7778.215 bash scripts/install_fpchromium.sh
+
+# 社区 ARM 构建（非官方 adryfish 发布；请先核对 SHA-256）
+FPWB_FPCHROMIUM_REPO=pocchian/fingerprint-chromium-arm-mac \\
+FPWB_FPCHROMIUM_VERSION=v1.0.0 \\
+FPWB_FPCHROMIUM_SHA256=f3160f6fa74848aa79ef6e6d56e5b41fea1f9f6fddb9230f3ca2164d53c767a6 \\
 bash scripts/install_fpchromium.sh
 
 # 或先检查脚本会做什么
@@ -168,9 +181,16 @@ sudo xattr -rd com.apple.quarantine /path/to/tools/fp-chromium/chrome
 - 使用最新的 stable release
 - 如果遇到兼容性问题，尝试指定版本下载
 
-```
+```text
 https://github.com/adryfish/fingerprint-chromium/releases/tag/v148.0.0
 ```
+
+### Q5: API 启动仍报 `_RegisterApplication` / `SIGABRT`
+
+可见桌面环境（`headless=false`）由 LaunchServices 打开应用包；请从登录的
+Terminal.app/Finder 启动管理端。自动化、CI 或验证脚本应使用 `headless=true`，
+工作台会直接启动内核进程，不依赖 WindowServer。桌面确需绕过 LaunchServices
+时可设置 `FPWB_FPCHROMIUM_DIRECT=1`，但同样要求当前会话具备图形权限。
 
 ---
 
