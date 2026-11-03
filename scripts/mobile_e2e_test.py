@@ -16,8 +16,10 @@
     .venv/bin/python scripts/mobile_e2e_test.py android    # 只跑 Android
     .venv/bin/python scripts/mobile_e2e_test.py ios        # iOS Safari
     .venv/bin/python scripts/mobile_e2e_test.py ios chrome_ios
+    .venv/bin/python scripts/mobile_e2e_test.py --management-url http://127.0.0.1:18080
 """
 import asyncio
+import argparse
 import json
 import os
 import sys
@@ -138,7 +140,8 @@ def _start_page_server() -> int:
     return srv.server_address[1]
 
 
-async def run_one(target_os: str, browser: str | None) -> None:
+async def run_one(target_os: str, browser: str | None,
+                  management_url: str | None = None) -> None:
     from httpx import ASGITransport, AsyncClient
     from playwright.async_api import async_playwright
 
@@ -164,8 +167,18 @@ async def run_one(target_os: str, browser: str | None) -> None:
                    "start_url": "about:blank"},
     }
 
-    async with AsyncClient(transport=ASGITransport(app=fastapi_app),
-                           base_url="http://test") as client:
+    if management_url:
+        # This script keeps the explicit ``/api/v1/...`` paths used by the
+        # in-process ASGI client, so the remote base must remain the server
+        # root (unlike login_chain_verify/rpa_fpchromium_test).
+        api_root = management_url.rstrip("/")
+        client_cm = AsyncClient(base_url=api_root, timeout=90,
+                                trust_env=False)
+    else:
+        client_cm = AsyncClient(transport=ASGITransport(app=fastapi_app),
+                                base_url="http://test")
+
+    async with client_cm as client:
         # ---- 1. 建环境（走真实 API 与数据库）----
         resp = await client.post("/api/v1/profiles", json=payload)
         check("API 建环境成功（201/200）", resp.status_code < 400, resp.text[:200])
@@ -189,6 +202,9 @@ async def run_one(target_os: str, browser: str | None) -> None:
                                  json={"profile_id": pid, "headless": True})
         check("启动成功", resp.status_code < 400, resp.text[:200])
         if resp.status_code >= 400:
+            # 启动失败时尚未进入下面的 finally；显式清理临时环境，避免
+            # 管理端回归留下不可复用的 profile 记录。
+            await client.delete(f"/api/v1/profiles/{pid}")
             return
         info = resp.json()["data"]
         ws_endpoint = info["ws_endpoint"]
@@ -308,21 +324,33 @@ async def run_one(target_os: str, browser: str | None) -> None:
 
 
 async def main() -> int:
-    ok, msg = is_available()
-    if not ok:
-        print("❌ fp-chromium 内核未安装：", msg)
-        print("   安装：bash scripts/install_fpchromium.sh")
-        return 1
-
-    target = (sys.argv[1] if len(sys.argv) > 1 else "").lower()
-    browser_arg = (sys.argv[2] if len(sys.argv) > 2 else "").lower() or None
+    parser = argparse.ArgumentParser()
+    parser.add_argument("target", nargs="?", default="")
+    parser.add_argument("browser", nargs="?")
+    parser.add_argument(
+        "--management-url",
+        default=os.environ.get("FPWB_MANAGEMENT_URL"),
+        help=("通过已运行的管理端执行整机链路（macOS 受限终端推荐）；"
+              "例如 http://127.0.0.1:18080"),
+    )
+    args = parser.parse_args()
+    # 管理端模式由已运行服务负责选择/验证内核；调用脚本的受限终端不必
+    # 额外具备本地 GUI 内核路径。
+    if not args.management_url:
+        ok, msg = is_available()
+        if not ok:
+            print("❌ fp-chromium 内核未安装：", msg)
+            print("   安装：bash scripts/install_fpchromium.sh")
+            return 1
+    target = args.target.lower()
+    browser_arg = (args.browser or "").lower() or None
     cases = ([("android", None)] if target == "android"
              else [("ios", "chrome_ios")] if target == "ios" and browser_arg == "chrome_ios"
              else [("ios", "safari")] if target == "ios"
              else [("android", None), ("ios", "safari"), ("ios", "chrome_ios")])
 
     for target_os, browser in cases:
-        await run_one(target_os, browser)
+        await run_one(target_os, browser, args.management_url)
 
     print("\n" + "=" * 70)
     print(f"结果：{_PASS} 通过 / {_FAIL} 失败")

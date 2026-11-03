@@ -174,13 +174,11 @@ STATE_JS = """async () => {
         historyPatched: /invokeOnHost/.test(String(window.history.pushState)),
         printPatched: /invokeOnHost/.test(String(window.print)),
         scrollPatched: /setWebViewScrollViewIsDragging/.test(String(window.scrollTo)),
-        // F-169：window.chrome 在 Blink 上 own 且 configurable:false，delete 静默
-        // 失败；改成 undefined 会让 creepjs 的 hasBadChromeRuntime 守卫
-        // (`'chrome' in window && 'runtime' in chrome`) 对 undefined 取 `in`
-        // 抛 TypeError 并击穿 getHeadlessFeatures，Headless 块整体退化为
-        // blocked。故保留原生对象，判据改为「无 runtime」——这正是桌面
-        // Chromium 的形态，也是该守卫真正的检测目标。
-        hasChromeObj: typeof window.chrome !== 'undefined',
+        // 内核 152 起 window.chrome 是 own + configurable:true，文档起点整条
+        // `delete` 即 `'chrome' in window === false`（真机 Safari 形态）。删干净
+        // 后 creepjs 的 hasBadChromeRuntime 守卫在第一支短路，不会像「值改成
+        // undefined」那样对 undefined 取 `in` 抛 TypeError 击穿 getHeadlessFeatures。
+        hasChromeObj: 'chrome' in window,
         chromeHasRuntime: (function () {
             try { return typeof window.chrome === 'object' && window.chrome !== null
                 && 'runtime' in window.chrome; } catch (e) { return 'ERR'; }
@@ -276,7 +274,8 @@ STATE_JS = """async () => {
         gDigitalCredential: typeof window.DigitalCredential,
         gDevicePostureCtor: typeof window.DevicePosture,
         // WebAuthn 平台认证器：内核无生物识别硬件时 uvpaa 恒 false，真机
-        // Android（有屏幕锁）恒 true。由 CDP 虚拟平台认证器补齐（注入层
+        // Android（有屏幕锁）恒 true。Google 注册页读它判「能否同设备验证」，
+        // false 会直接要求跨设备验证。由 CDP 虚拟平台认证器补齐（注入层
         // WebAuthn.addVirtualAuthenticator）。同步采样点只能读同步值，两个
         // Promise 结果在外部 probe 里 await 后回填。
         uvpaaFn: typeof (window.PublicKeyCredential
@@ -318,7 +317,8 @@ STATE_JS = """async () => {
             return n;
         })(),
         // F-85 余量族（WebTransport / Trusted Types / Navigation / WebCodecs
-        // 音频侧 / CSS Position-Try / Streams BYOB / 单丁）——全部 BCD 26.x。
+        // 音频侧 / CSS Position-Try / Streams BYOB / CSS descriptor globals /
+        // 单丁）——全部 BCD 26.x。
         gated26: (function () {
             var ns = ["WebTransport", "WebTransportBidirectionalStream",
                 "WebTransportDatagramDuplexStream", "WebTransportError",
@@ -333,7 +333,9 @@ STATE_JS = """async () => {
                 "ReadableStreamBYOBRequest", "CaretPosition", "CommandEvent",
                 "EventCounts", "FileSystemWritableFileStream",
                 "LargestContentfulPaint", "Origin", "PerformanceEventTiming",
-                "ScrollTimeline", "URLPattern", "ViewTimeline"];
+                "ScrollTimeline", "URLPattern", "ViewTimeline",
+                "CSSFontFaceDescriptors", "CSSPageDescriptors",
+                "CSSStyleProperties"];
             var out = {};
             for (var i = 0; i < ns.length; i++) {
                 out[ns[i]] = typeof window[ns[i]];
@@ -558,7 +560,7 @@ STATE_JS = """async () => {
                 return ok && nav.connection.ontypechange === null;
             } catch (e) { return false; }
         })(),
-        // ---- 媒体编解码能力表（P1-3）：真机 iOS 无 ogg/webm，HEVC 走 hvc1 ----
+        // ---- 媒体编解码能力表（P1-3）：ogg/webm 按 iOS 版本门控，HEVC 走 hvc1 ----
         canPlay: (function () {
             var a = document.createElement('audio');
             var v = document.createElement('video');
@@ -615,6 +617,7 @@ STATE_JS = """async () => {
                 webm: probe('video/webm'),
                 webmVp9: probe('video/webm; codecs="vp9"'),
                 audioWebm: probe('audio/webm'),
+                // Ogg 走 AVFoundation 动态项（大小写敏感）：iOS 18.4 起才进表
                 ogg: probe('audio/ogg'),
                 mkv: probe('video/x-matroska'),
                 upper: probe('VIDEO/MP4'),
@@ -1817,6 +1820,13 @@ STATE_JS = """async () => {
         })(),
         orientAngle: screen.orientation ? screen.orientation.angle : null,
         orientType: screen.orientation ? screen.orientation.type : null,
+        // ScreenOrientation.lock()/unlock() are Chromium-only.  iOS Safari's
+        // orientation object is read-only; keeping these values in the runtime
+        // probe catches a regression in the prototype drop table.
+        orientLock: screen.orientation ? typeof screen.orientation.lock : null,
+        orientUnlock: screen.orientation ? typeof screen.orientation.unlock : null,
+        orientLockIn: screen.orientation ? ('lock' in screen.orientation) : null,
+        orientUnlockIn: screen.orientation ? ('unlock' in screen.orientation) : null,
         // F-90：iOS 普通浏览上下文里 Notification 整体缺席（Android 侧存在，
         // 故保留 permission 读值供 Android 断言）。
         notifPerm: typeof Notification === 'function' ? Notification.permission : null,
@@ -2697,8 +2707,8 @@ window.__probe = {
   hist: /invokeOnHost/.test(String(window.history.pushState)),
   scroll: /setWebViewScrollViewIsDragging/.test(String(window.scrollTo)),
   chromeType: typeof window.chrome,
-  // F-169：Blink 的 window.chrome 是 own + configurable:false，删不掉；
-  // 判据改看 runtime 面（真机 Safari 与桌面 Chromium 都无）。
+  // 内核 152 起 window.chrome 为 configurable:true，iOS 侧整条删除；
+  // chromeRuntime 保留作 Android 侧判据（Android 真机有该对象、无 runtime）。
   chromeRuntime: (function () { try { return typeof window.chrome === 'object'
     && window.chrome !== null && 'runtime' in window.chrome; }
     catch (e) { return 'ERR'; } })(),
@@ -2706,6 +2716,8 @@ window.__probe = {
     var e = g.getExtension('WEBGL_debug_renderer_info');
     return e ? g.getParameter(e.UNMASKED_RENDERER_WEBGL) : null; } catch (err) { return 'err'; } })(),
   tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  lang: navigator.language,
+  langs: navigator.languages,
   id: navigator.userAgent.indexOf('PJZ110') >= 0 ? 1 : 0
 };
 </script></head><body>probe</body></html>"""
@@ -2721,8 +2733,8 @@ window.addEventListener('message', function (e) { window.msgs.push(e.data); });
 // 页面文档起点的 Worker：early 为脚本首行读取（验证注入先于首行），
 // late 为 300ms 后读取（多客户端场景下 resume 竞争不影响最终一致性断言）
 try {
-  var code = 'postMessage({early: navigator.platform, uaP: navigator.userAgentData ? navigator.userAgentData.platform : null});'
-    + 'setTimeout(function () { postMessage({late: navigator.platform, devMem: navigator.deviceMemory,'
+  var code = 'postMessage({early: navigator.platform, uaP: navigator.userAgentData ? navigator.userAgentData.platform : null, lang: navigator.language, langs: navigator.languages});'
+    + 'setTimeout(function () { postMessage({late: navigator.platform, devMem: navigator.deviceMemory, lang: navigator.language, langs: navigator.languages,'
     + ' connType: (navigator.connection && ("type" in navigator.connection)) ? navigator.connection.type : "<none>",'
     + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null'
     + ' , connDlMax: (navigator.connection && ("downlinkMax" in navigator.connection)) ? navigator.connection.downlinkMax : "<absent>"'
@@ -2896,8 +2908,8 @@ window.__early = {
   wk: !!(window.webkit && window.webkit.messageHandlers),
   hist: /invokeOnHost/.test(String(window.history.pushState)),
   chromeType: typeof window.chrome,
-  // F-169：Blink 的 window.chrome 是 own + configurable:false，删不掉；
-  // 判据改看 runtime 面（真机 Safari 与桌面 Chromium 都无）。
+  // 内核 152 起 window.chrome 为 configurable:true，iOS 侧整条删除；
+  // chromeRuntime 保留作 Android 侧判据（Android 真机有该对象、无 runtime）。
   chromeRuntime: (function () { try { return typeof window.chrome === 'object'
     && window.chrome !== null && 'runtime' in window.chrome; }
     catch (e) { return 'ERR'; } })(),
@@ -2909,8 +2921,9 @@ try {
   window.__early.gl = ext ? g.getParameter(ext.UNMASKED_RENDERER_WEBGL) : null;
 } catch (e) {}
 try {
-  var code = 'postMessage({early: navigator.platform});'
+  var code = 'postMessage({early: navigator.platform, lang: navigator.language, langs: navigator.languages});'
     + 'setTimeout(function () { postMessage({late: navigator.platform, devMem: navigator.deviceMemory,'
+    + ' lang: navigator.language, langs: navigator.languages,'
     + ' connType: (navigator.connection && ("type" in navigator.connection)) ? navigator.connection.type : "<none>",'
     + ' uaP: navigator.userAgentData ? navigator.userAgentData.platform : null'
     + ' , connDlMax: (navigator.connection && ("downlinkMax" in navigator.connection)) ? navigator.connection.downlinkMax : "<absent>"'
@@ -3095,8 +3108,8 @@ FRAME_LIVE_JS = """(async () => ({
   wk: !!(window.webkit && window.webkit.messageHandlers),
   hist: /invokeOnHost/.test(String(window.history.pushState)),
   chromeType: typeof window.chrome,
-  // F-169：Blink 的 window.chrome 是 own + configurable:false，删不掉；
-  // 判据改看 runtime 面（真机 Safari 与桌面 Chromium 都无）。
+  // 内核 152 起 window.chrome 为 configurable:true，iOS 侧整条删除；
+  // chromeRuntime 保留作 Android 侧判据（Android 真机有该对象、无 runtime）。
   chromeRuntime: (function () { try { return typeof window.chrome === 'object'
     && window.chrome !== null && 'runtime' in window.chrome; }
     catch (e) { return 'ERR'; } })(),
@@ -3116,7 +3129,9 @@ FRAME_LIVE_JS = """(async () => ({
 ACCEPT_CH_VALUE = (
     "Sec-CH-UA-Model, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, "
     "Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List, Sec-CH-UA-Full-Version, "
-    "Sec-CH-UA-WoW64"
+    "Sec-CH-UA-WoW64, DPR, Sec-CH-DPR, Device-Memory, "
+    "Sec-CH-Device-Memory, Viewport-Width, Sec-CH-Viewport-Width, "
+    "Viewport-Height, Sec-CH-Viewport-Height"
 )
 
 ACCEPT_CH_HTML = """<!doctype html><html><head><script>
@@ -3733,8 +3748,31 @@ _INTL_TZ_STYLE = {
 }
 
 
+def _accept_language_matches(header: str | None, languages) -> bool:
+    """Accept-Language 头是否与 navigator.languages 同构。
+
+    真机两引擎都把首选语言放在最前、语族按 q=0.9 追加：
+    `navigator.languages == ["en-US", "en"]` ↔ `en-US,en;q=0.9`。
+    裸单值（`en-US`）说明走的是内核 acceptLanguage 覆盖的归一化结果，
+    与 `navigator.languages` 的两段列表对不上。
+    """
+    if not header or not isinstance(languages, (list, tuple)) or not languages:
+        return False
+    parts = [p.strip().lower() for p in str(header).split(",") if p.strip()]
+    if len(parts) < 2:
+        return False
+    head, second = parts[0], parts[1]
+    if head != str(languages[0]).lower():
+        return False
+    if ";" not in second:
+        return False
+    lang, _, weight = second.partition(";")
+    if lang.strip() != str(languages[1]).lower():
+        return False
+    return weight.strip().replace(" ", "") == "q=0.9"
+
+
 def _intl_tz_ok(locales: dict) -> bool:
-    """逐 locale 核对时区名位置（显式 timeZoneName / dateStyle 两条路径）。"""
     if not locales:
         return False
     for loc, want in _INTL_TZ_EXP.items():
@@ -4322,6 +4360,16 @@ async def main() -> int:
 
     gl = state.get("webgl") or {}
     is_android = target_os == "android"
+    # Keep engine-gated checks resilient to missing/legacy fixture metadata.
+    # ``browserVersion`` is normally a dotted Chromium version (e.g.
+    # ``152.0.7977.82``); malformed or absent values conservatively map to 0
+    # and therefore require the pre-152 surface.
+    try:
+        browser_major = int(str(extra.get("browserVersion") or "0").split(".", 1)[0])
+    except (TypeError, ValueError):
+        browser_major = 0
+    runtime_spec = derive_spec(fpd, target_os)
+    expected_p3 = runtime_spec.get("displayGamut") == "p3"
     ev_touch = [str(e) for e in (event_state.get("touch") or [])]
     ev_mouse = [str(e) for e in (event_state.get("mouse") or [])]
     ev_wheel = [str(e) for e in (event_state.get("wheel") or [])]
@@ -4338,6 +4386,14 @@ async def main() -> int:
     checks: dict[str, bool] = {
         "已按 start_url 导航": "example.com" in (start_url_href or ""),
         "UA 为指纹中的移动端 UA": state["userAgent"] == nav["userAgent"],
+        # UA 缩减：真机 Chrome Android 110+ 的 UA 串把 OS 版本与机型冻结成
+        # 字面量（chromium.org/updates/ua-reduction）；真值只走 UA-CH 高熵。
+        # 出现真实版本号/机型即缩减前形态，与 Chrome/<major> 同现是硬特征。
+        # iOS 不适用（WKWebView 的 UA 不在缩减范围）。
+        "Android UA 为缩减形态（Android 10; K）": (
+            target_os != "android"
+            or ("Android 10; K)" in state["userAgent"]
+                and "Android 10; K)" in nav["userAgent"])),
         "platform 一致": state["platform"] == nav.get("platform"),
         "maxTouchPoints 一致": state["maxTouchPoints"] == nav.get("maxTouchPoints"),
         "hardwareConcurrency 一致": state["hardwareConcurrency"] == nav.get("hardwareConcurrency"),
@@ -4417,7 +4473,9 @@ async def main() -> int:
             str(gl.get("renderer") or "").startswith("ANGLE (") if is_android
             else gl.get("renderer") == "Apple GPU"
         ),
-        "languages 以 zh-CN 开头": bool(state["languages"]) and state["languages"][0] == "zh-CN",
+        "Navigator 语言与 launch.locale 同源": (
+            state.get("language") == "zh-CN"
+            and state.get("languages") == ["zh-CN", "zh"]),
         "时区覆盖生效（launch.timezone）": state.get("timezone") == "America/Los_Angeles",
         # 内核 --lang/acceptLanguage 只改 navigator.language，改不动 ICU 默认
         # locale；Intl 必须由 Emulation.setLocaleOverride 对齐，否则宿主中文机器
@@ -4449,6 +4507,9 @@ async def main() -> int:
         "竞态：首文档色深 24": probe.get("colorDepth") == 24,
         "竞态：首文档触控已启用": int(probe.get("touch") or 0) >= 5,
         "竞态：首文档时区已对齐": probe.get("tz") == "America/Los_Angeles",
+        "竞态：首文档语言序列已对齐": (
+            probe.get("lang") == "zh-CN"
+            and probe.get("langs") == ["zh-CN", "zh"]),
         "竞态：首文档 GPU 已替换": (probe.get("webgl") or "") == vc.get("renderer"),
         # ---- F-86：UA 竞态兜底 ----
         # 首文档 UA 一旦落成内核默认 iOS 形态（iPad 机型表现为 UA 与
@@ -4523,7 +4584,13 @@ async def main() -> int:
         "跨域 iframe：WebAuthn 平台认证器可用（按 target 下发）": (
             fr_live.get("uvpaa") is True and fr_live.get("condMediation") is True),
         "Worker（页面）：platform 一致": wk_main.get("late") == nav.get("platform"),
+        "Worker（页面）：语言与主文档一致": (
+            wk_main.get("lang") == state.get("language")
+            and wk_main.get("langs") == state.get("languages")),
         "Worker（跨域 iframe）：platform 一致": fr_worker.get("late") == nav.get("platform"),
+        "Worker（跨域 iframe）：语言与主文档一致": (
+            fr_worker.get("lang") == state.get("language")
+            and fr_worker.get("langs") == state.get("languages")),
     })
 
     # ---- 传感器面：数值流 / 自洽性 / WebKit 权限面 ----
@@ -4596,6 +4663,12 @@ async def main() -> int:
             "plugins/mimeTypes 为空（Android Chrome 无内置 PDF 插件）": (
                 state["pluginsLen"] == 0 and state["mimeTypesLen"] == 0),
             "pdfViewerEnabled == false（Android 构建口径）": state["pdfViewerValue"] is False,
+            # F-99：Android 的 color-gamut 必须跟显示面板档位走；Pixel 8
+            # 系列默认 P3，未有面板证据的机型保守 sRGB。srgb 是「至少 sRGB」
+            # 能力位，在两档上都应为 true。
+            "色域：Android color-gamut 与机型面板档位一致": (
+                (state.get("mediaQueries") or {}).get("p3") is expected_p3
+                and (state.get("mediaQueries") or {}).get("srgb") is True),
             "WebHID 不存在（Android Chrome 未实现）": state["hasHid"] is False,
             # ---- F-95：Contact Picker（BCD chrome_android 80，真机有）----
             # 桌面 Chromium 的 ContactsManager runtime flag 是 test（默认关），
@@ -4671,9 +4744,12 @@ async def main() -> int:
             "UIEvent.prototype 无 pageX/sourceCapabilities 在 Blink 位置": (
                 "sourceCapabilities" in (state.get("uiEventProto") or [])
                 and state.get("uiPageX") is False),
-            "AnimationEvent/TransitionEvent 无 legacy animation（Blink 已移除）": (
-                state.get("animHasAnimation") is False
-                and state.get("transHasAnimation") is False),
+            # 实测：Chrome 152/156 与 fp-chromium 152 的 AnimationEvent/
+            # TransitionEvent.prototype 均带 legacy `animation`（Blink 重新
+            # 引入，与 iOS 补丁同形）——旧断言「Blink 已移除」已过时。
+            "AnimationEvent/TransitionEvent 的 animation 与 Blink 一致": (
+                state.get("animHasAnimation") is True
+                and state.get("transHasAnimation") is True),
             # ---- F-48：Android 的 visualViewport 与 innerHeight 相等（正确形态）----
             "visualViewport.height == innerHeight（Chrome Android 行为）": (
                 isinstance(state.get("vvH"), (int, float))
@@ -4776,6 +4852,15 @@ async def main() -> int:
             # ---- Accept-CH：站点声明后回送高熵头（真机 Chrome 行为）----
             "Accept-CH：首个文档仅低熵三头（无高熵）": (
                 "sec-ch-ua" in ac_first and "sec-ch-ua-model" not in ac_first),
+            # ---- Accept-Language 与 navigator.languages 同构 ----
+            # 内核的 setUserAgentOverride.acceptLanguage 只发裸单值（CDP 把
+            # `en-US,en;q=0.9` 归一成 `en-US`），而真机 Chrome 发 q 权重列表、
+            # 与 navigator.languages 逐段对应。HTTP 侧与 JS 侧在同一份语言
+            # 列表上自相矛盾时，BrowserScan 的 isLanguageCorrect
+            # （uaLang/headerLang/intlLang 三路对拍）直接判 -10%。
+            "Accept-Language：与 navigator.languages 同构（非裸单值）": (
+                _accept_language_matches(ac_first.get("accept-language"),
+                                         nav.get("languages"))),
             "Accept-CH：声明后同源请求补齐高熵头": (
                 ac_second.get("sec-ch-ua-model") == f'"{ua_ch.get("model") or ""}"'
                 and ac_second.get("sec-ch-ua-platform-version") == f'"{ua_ch.get("platformVersion") or ""}"'
@@ -4787,6 +4872,17 @@ async def main() -> int:
                 and ac_second.get("sec-ch-ua-full-version-list") == ", ".join(
                     f'"{b["brand"]}";v="{b["version"]}"'
                     for b in (ua_ch.get("fullVersionList") or []))),
+            # ---- Client Hints 的非 UA 高熵面：网络层宿主值必须与 JS/CDP
+            #      移动规格一致（桌面默认常见 DPR=2、Device-Memory=16）。 ----
+            "Accept-CH：DPR/内存/视口头与移动规格一致": (
+                ac_second.get("dpr") == str(dpr).rstrip("0").rstrip(".")
+                and ac_second.get("sec-ch-dpr") == str(dpr).rstrip("0").rstrip(".")
+                and ac_second.get("device-memory") == str(mem_class)
+                and ac_second.get("sec-ch-device-memory") == str(mem_class)
+                and ac_second.get("viewport-width") == str(state.get("innerW"))
+                and ac_second.get("sec-ch-viewport-width") == str(state.get("innerW"))
+                and ac_second.get("viewport-height") == str(state.get("innerH"))
+                and ac_second.get("sec-ch-viewport-height") == str(state.get("innerH"))),
             "Accept-CH：低熵三头与 UA 在回送中保持": (
                 ac_second.get("sec-ch-ua") == sec_ch_headers(ua_ch or {}).get("Sec-CH-UA")
                 and ac_second.get("sec-ch-ua-mobile") == "?1"
@@ -4841,8 +4937,24 @@ async def main() -> int:
             "传感器：deviceorientationabsolute 事件流且 absolute == true": (
                 sensor_counts.get("orientationAbsoluteNumeric", 0) >= 10
                 and last_doa.get("abs") is True),
-            "传感器：无 requestPermission（Chromium 152 才实现，148 无）": (
-                rp.get("motion") == "undefined" and rp.get("orientation") == "undefined"),
+            # Chromium 152 added the static sensor permission methods on Android
+            # (Chromium 148 did not). Keep this check engine-aware instead of
+            # pinning the verifier to the legacy 148 behaviour: a profile can
+            # legitimately run either kernel while the UA/feature set remains
+            # self-consistent.
+            "传感器：requestPermission 与 Chromium 版本一致": (
+                (
+                    (
+                        browser_major >= 152
+                        and rp.get("motion") == "function"
+                        and rp.get("orientation") == "function"
+                    )
+                    or (
+                        browser_major < 152
+                        and rp.get("motion") == "undefined"
+                        and rp.get("orientation") == "undefined"
+                    )
+                ) if is_android else True),
             "传感器：跨域 iframe（OOPIF，已委托 allow）内 devicemotion 同样有流": (
                 int(fr.get("dm") or 0) >= 20),
             # ---- 引擎面锁定：Android 保持 Chromium 口径（防误删/防误补）----
@@ -4940,11 +5052,12 @@ async def main() -> int:
                 and sa_plain.get("top") == "0px"),
             # Worker 补建表只服务 iOS（WebKit Worker 面）；Android Chrome 的
             # Worker 里这些接口本就不存在，误挂会反向穿帮。WebCodecs 四件套 /
-            # NavigationPreloadManager / CSSSkewX 是 Chromium Worker 原生就有的，
-            # 不在断言范围内。
+            # NavigationPreloadManager / CSSSkewX / FontFaceSet 是 Chromium
+            # Worker 原生就有的（实测 fp-chromium 152 与 Chrome 156 的 Worker
+            # 作用域均报 function），不在断言范围内。
             "Worker：iOS 补建面在 Android 上全缺席（未误伤）": (
                 all((wk_main.get("wkAdd") or {}).get(n) == "undefined"
-                    for n in ("FontFaceSet", "CSSUnitValue", "CSSMathSum",
+                    for n in ("CSSUnitValue", "CSSMathSum",
                               "CSSTransformValue", "CSSStyleValue",
                               "ManagedMediaSource", "MediaStreamTrack", "Report",
                               "StylePropertyMapReadOnly", "BufferedChangeEvent",
@@ -5051,7 +5164,8 @@ async def main() -> int:
             # 无参抛 'Not enough arguments'；判定走 F-142 的 MSE 独立真值表
             # （WebM 解析器优先、否则 AVFoundation），与 canPlayType 不同源：
             # webm 容器 true、其中 vp9 false（iOS 无 SW VP9）、vp8 true；
-            # ogg 容器 false（iOS 无 Ogg 解析器）；essence 大小写敏感。
+            # ogg 容器按版本门控（iOS 18.4 起 AVFoundation 动态项含 audio/ogg）；
+            # essence 大小写敏感。
             # F-123：av01 与 WebM 的 av1HardwareDecoderAvailable() 同受
             # VideoToolbox 硬解门控 → 跟随机型能力位，非恒 false。
             "ManagedMediaSource.isTypeSupported：存在且为真机形态": (
@@ -5062,12 +5176,12 @@ async def main() -> int:
                 and mms.get("length") == 1
                 and mms.get("native") is True
                 and mms.get("inheritsMS") is True),
-            "ManagedMediaSource.isTypeSupported：mp4/webm 容器 true、vp9/ogg/mkv false": (
+            "ManagedMediaSource.isTypeSupported：mp4/webm 容器 true、vp9/mkv false": (
                 isinstance(mms, dict)
                 and mms.get("cases") == {
                     "mp4": True, "mp4Codecs": True, "audioMp4": True,
                     "mp2t": True, "webm": True, "webmVp9": False,
-                    "audioWebm": True, "ogg": False, "mkv": False,
+                    "audioWebm": True, "ogg": _ios_at_least(18, 4), "mkv": False,
                     "upper": False, "spaces": True,
                     "webmVp8": True, "webmVp9NoQ": False, "webmVp9Full": False,
                     "webmOpus": True, "mp4Dovi": True, "mp4Opus": False,
@@ -5090,7 +5204,7 @@ async def main() -> int:
                 and (mms.get("msNative") is True)
                 and (mms.get("msCases") == {
                     "webmVp9": False, "webmVp8": True, "webmOpus": True,
-                    "ogg": False, "mp4Av1": _av1,
+                    "ogg": _ios_at_least(18, 4), "mp4Av1": _av1,
                     "noArg": "TypeError:Not enough arguments"})),
             # 不与原生 MediaSource.isTypeSupported 对拍：fp-chromium 内核
             # 未编入 MSE 解码器，原生面一律 false（video/mp4 也 false），
@@ -5107,8 +5221,8 @@ async def main() -> int:
                 and wk_main["wkMms"].get("desc") == [True, True, True]
                 and wk_main["wkMms"].get("cases") == {
                     "mp4": True, "mp4Codecs": True, "webm": True,
-                    "webmVp9": False, "audioWebm": True, "ogg": False,
-                    "upper": False}),
+                    "webmVp9": False, "audioWebm": True,
+                    "ogg": _ios_at_least(18, 4), "upper": False}),
             # F-142：Worker 的 MediaSource 是原生 Blink 全局，不经过补建路径，
             # 必须单独包装；否则 Worker 面 webm 家族 true、无参文案为 Blink 版。
             "Worker：MediaSource.isTypeSupported 走同一张 MSE 真值表（F-142）": (
@@ -5184,18 +5298,39 @@ async def main() -> int:
                 and sa_again.get("bottom") == sa_cover.get("bottom")),
             "安全区：max-inset 同步下发（与 inset 同值）": (
                 sa_cover.get("topMax") == sa_cover.get("top")),
-            # ---- P1-3：iOS 真机口径（ogg/webm 整族不可播、HEVC 仅 hvc1）----
-            "canPlayType：ogg/webm 全族 == ''（AVFoundation 容器表无此项）": all(
-                (state.get("canPlay") or {}).get(k) == ""
-                for k in ("ogg", "oggVorbis", "oggOpus", "webm", "webmVp8",
-                          "webmVp9", "videoOgg")),
+            # ---- P1-3：iOS 真机口径（HEVC 仅 hvc1）----
+            # F-199 / 18.4：WebM 是 iOS 17.4 起（AVFoundation 带 WebM 解码器），
+            # Ogg 容器是 iOS 18.4 起（WebKit 自家 Safari 18.4 发布说明逐字点名
+            # iOS 18.4，caniuse ogg-vorbis 的 ios_saf 同版转 y）。两者阈值不同，
+            # 断言必须按 profile 版本推导，不能写死整族 ''。
+            # video/ogg 在所有版本都是 ''——Ogg 支持只覆盖音频容器（AVFoundation
+            # 无 theora 解码器）。
+            "canPlayType：webm 按版本门控（≥17.4 可播、否则整族 ''）": (
+                (state.get("canPlay") or {}).get("webm")
+                == ("maybe" if _ios_at_least(17, 4) else "")
+                and (state.get("canPlay") or {}).get("webmVp8")
+                == ("probably" if _ios_at_least(17, 4) else "")
+                and (state.get("canPlay") or {}).get("webmVp9")
+                == ("probably" if _ios_at_least(17, 4) else "")),
+            "canPlayType：ogg 按版本门控（≥18.4 可播、否则整族 ''）": (
+                (state.get("canPlay") or {}).get("ogg")
+                == ("maybe" if _ios_at_least(18, 4) else "")
+                and (state.get("canPlay") or {}).get("oggVorbis")
+                == ("probably" if _ios_at_least(18, 4) else "")
+                and (state.get("canPlay") or {}).get("oggOpus")
+                == ("probably" if _ios_at_least(18, 4) else "")),
+            "canPlayType：video/ogg 全版本 == ''（Ogg 只覆盖音频容器）": (
+                (state.get("canPlay") or {}).get("videoOgg") == ""),
             "canPlayType：hvc1 两档 == 'probably'，hev1 == ''": (
                 (state.get("canPlay") or {}).get("hvc1") == "probably"
                 and (state.get("canPlay") or {}).get("hvc1Full") == "probably"
                 and (state.get("canPlay") or {}).get("hev1") == ""),
             "canPlayType：MP4/AVC 仍可播（未误伤原生面）": (
                 (state.get("canPlay") or {}).get("mp4Avc") == "probably"),
-            "canPlayType：大小写不敏感命中同一表项": (
+            # 大小写语义分两套：静态容器走 ComparableLettersLiteral（忽略
+            # 大小写），动态项（ogg/flac/caf/mp2t）走 HashSet<String> 精确匹配。
+            # 'AUDIO/OGG' 属动态项 → 全版本 ''，与 codec 名大小写无关。
+            "canPlayType：ogg 容器名大小写敏感（'AUDIO/OGG' == ''）": (
                 (state.get("canPlay") or {}).get("upperCase") == ""),
             "canPlayType：原生外观 + 坏 receiver 抛 TypeError": (
                 (state.get("canPlay") or {}).get("native") is True
@@ -5250,6 +5385,9 @@ async def main() -> int:
                 and state["mcCap"].get("decLen") == 1
                 and state["mcCap"].get("encLen") == 1
                 and state["mcCap"].get("ctorNative") is True),
+            # oggOpus 按版本门控：Ogg 容器 iOS 18.4 起才有（与 canPlayType、
+            # MSE 两处同源），低版本 profile 上 AVFoundation 没有该解码器，
+            # 走 __mcZero() 的 '---'。
             "mediaCapabilities：decodingInfo 文件面 == WebKit 27.2": (
                 isinstance(state.get("mcDec"), dict)
                 and {k: v for k, v in state["mcDec"].items()
@@ -5259,7 +5397,8 @@ async def main() -> int:
                     "avc1": "Smp", "hvc1": "Smp", "hev1": "---",
                     "vp9mp4": "Smp", "vp9webm": "---",
                     "mp4v": "Sm-", "mp4a": "S--", "aacBare": "---",
-                    "flac": "S--", "opusMp4": "---", "oggOpus": "S--",
+                    "flac": "S--", "opusMp4": "---",
+                    "oggOpus": ("S--" if _ios_at_least(18, 4) else "---"),
                     "alac": "S--", "unqAvc1": "Smp", "unqTrail": "Smp"}),
             "mediaCapabilities：AV1 解码按机型硬解门控（F-135）": (
                 isinstance(state.get("mcDec"), dict)
@@ -5427,9 +5566,13 @@ async def main() -> int:
                 for k in ("gpp2", "aiff", "basic", "xm4a", "mp2t", "caf", "aacp")),
             "canPlayType（F-143）：白名单容器 + codecs 走扩展判定": (
                 (state.get("canPlayIos") or {}).get("wavePcm") == "probably"
-                # audio/ogg 不在 30 项白名单内（F-125 排除表同族），裸查询为 ''
-                and (state.get("canPlayIos") or {}).get("oggContainer") == ""
-                and (state.get("canPlayIos") or {}).get("webmCodec") == ""),
+                # audio/ogg 不在 30 项静态白名单内，而是 AVFoundation 的动态项：
+                # iOS 18.4 起才进表（裸查询 'maybe'），此前为 ''。
+                and (state.get("canPlayIos") or {}).get("oggContainer")
+                == ("maybe" if _ios_at_least(18, 4) else "")
+                # video/webm 同理由版本门控（17.4 起）。
+                and (state.get("canPlayIos") or {}).get("webmCodec")
+                == ("probably" if _ios_at_least(17, 4) else "")),
             "canPlayType（F-143）：无参抛 Not enough arguments（WebKit 文案）": (
                 (state.get("canPlayIos") or {}).get("noArg")
                 == "TypeError:Not enough arguments"),
@@ -5932,11 +6075,12 @@ async def main() -> int:
                 == ("function" if _ios_at_least(26) else "undefined")
                 and state["gGPUBufferUsage"]
                 == ("object" if _ios_at_least(26) else "undefined")),
-            # F-85：余量 37 名（WebTransport / Trusted Types / Navigation /
-            # WebCodecs 音频侧 / CSS Position-Try / Streams BYOB / 单丁）。
+            # F-85：余量 40 名（WebTransport / Trusted Types / Navigation /
+            # WebCodecs 音频侧 / CSS Position-Try / Streams BYOB / CSS descriptor
+            # globals / 单丁）。
             # 逐个按 BCD 精确版本判定，不按 26 一刀切——Origin 是 26.5、
             # Navigation 族是 26.2、WebTransport/BYOB 是 26.4。
-            "窗口：F-85 余量族按 iOS 精确版本门控（37 名）": (
+            "窗口：F-85 余量族按 iOS 精确版本门控（40 名）": (
                 all(
                     state["gated26"].get(n) == (want if _ios_at_least(*ver) else "undefined")
                     for n, ver, want in (
@@ -5977,8 +6121,11 @@ async def main() -> int:
                         ("ScrollTimeline", (26, 0), "function"),
                         ("ViewTimeline", (26, 0), "function"),
                         ("URLPattern", (26, 0), "function"),
+                        ("CSSFontFaceDescriptors", (26, 0), "function"),
+                        ("CSSPageDescriptors", (26, 0), "function"),
+                        ("CSSStyleProperties", (26, 0), "function"),
                     ))
-                and len(state["gated26"]) == 37),
+                and len(state["gated26"]) == 40),
             # ---- F-40 / F-49 / F-51：对象子属性与原型方法缺口 ----
             "navigator.mediaDevices.getDisplayMedia 按 iOS 版本门控（27+ 才有）": (
                 state["mdGdm"] == ("function" if _ios_at_least(27) else "undefined")),
@@ -5990,6 +6137,12 @@ async def main() -> int:
             # ---- F-52 / F-55 / F-56：编码与上下文属性面 ----
             "canvas webp 编码回退 PNG（真机 iOS 无 webp 编码器）": (
                 str(state.get("canvasWebp") or "").startswith("data:image/png")),
+            # F-94：空 8×8 画布的 AVIF 能力探针。包装器只返回内嵌的真实
+            # AVIF 容器，任意绘制内容仍保持 Blink 的 PNG 回退。
+            "canvas AVIF：iOS 17+ 透明 8×8 返回合法 AVIF 容器": (
+                (str(state.get("canvasAvif") or "").startswith("data:image/avif")
+                 if _ios_at_least(17)
+                 else str(state.get("canvasAvif") or "").startswith("data:image/png"))),
             # 清单 §46：webm 容器 true、vp8 / vp9,opus true、
             # x-matroska;codecs=avc1 false（容器不在白名单）。h264-in-webm
             # 同样 false（WebM 分支只认 vp8/vp9/opus/vorbis）。
@@ -6105,6 +6258,16 @@ async def main() -> int:
             "Accept-CH：声明前后均无 UA-CH 头": (
                 not any(k.startswith("sec-ch") for k in ac_first)
                 and not any(k.startswith("sec-ch") for k in ac_second)),
+            # ---- Accept-Language 与 navigator.languages 同构 ----
+            # 内核的 setUserAgentOverride.acceptLanguage 只发裸单值（CDP 把
+            # `en-US,en;q=0.9` 归一成 `en-US`），而真机 Chrome/WebKit 都发
+            # q 权重列表，且与 navigator.languages 逐段对应。浏览器侧与 HTTP
+            # 侧在同一份语言列表上自相矛盾时，BrowserScan 的
+            # isLanguageCorrect（uaLang/headerLang/intlLang 三路对拍）会直接
+            # 判 -10%；该站文案是 "Language mismatch"。
+            "Accept-Language：与 navigator.languages 同构（非裸单值）": (
+                _accept_language_matches(ac_first.get("accept-language"),
+                                         nav.get("languages"))),
             # ---- WebGPU：iOS 保持宿主 Apple 适配器（真机 iPhone 同为 Apple GPU）----
             # navigator.gpu 自 Safari 26 起才有（_IOS_MIN_VERSIONS["gpu"]=(26,)）；
             # 低版本档真机整块缺席，这里断言「缺席」而不是「vendor==apple」。
@@ -6149,12 +6312,12 @@ async def main() -> int:
                 (wg.get("validLost") or {}).get("reason") == "destroyed"
                 and (wg.get("validLost") or {}).get("msg") == ""
                 if _ios_at_least(26) else True),
-            # ---- iOS 两口径通用：普通页面无 window.chrome.runtime（报告 §4.4 / B1-5）----
-            # F-169：对象本身在 Blink 上删不掉（own + configurable:false），
-            # 保留原生形态反而与真机一致；真机 Safari 与桌面 Chromium 都没有
-            # runtime，而该守卫正是检测站真正读的那一项。
-            "window.chrome 无 runtime（iOS 普通页面无该面）": (
-                state.get("chromeHasRuntime") is False),
+            # ---- iOS 两口径通用：普通页面整条无 window.chrome（报告 §4.4 / B1-5）----
+            # 真机 Safari 连对象都没有；内核 152 的 window.chrome 是
+            # configurable:true，文档起点 delete 即彻底移除（creepjs 的
+            # hasBadChromeRuntime 守卫在第一支短路，不会抛 TypeError）。
+            "window.chrome 整条缺席（iOS 普通页面无该面）": (
+                state.get("hasChromeObj") is False),
             # ---- 平台 API 差集（Chromium 专有面收敛；BCD safari_ios=false）----
             # 通用传感器 API：WebKit 从未实现（真机一行判假面）
             "平台API：传感器家族整块缺席（WebKit 无通用传感器 API）": (
@@ -6823,16 +6986,16 @@ async def main() -> int:
                 "竞态：首文档 webkit.messageHandlers 已存在": probe.get("wk") is True,
                 "竞态：首文档 history 改写已生效": probe.get("hist") is True,
                 "竞态：首文档 scrollTo 改写已生效": probe.get("scroll") is True,
-                "竞态：首文档无 window.chrome.runtime": probe.get("chromeRuntime") is False,
+                "竞态：首文档无 window.chrome": probe.get("chromeType") == "undefined",
                 # 子帧（OOPIF）随 init 脚本同一份补丁：检测面不应只在顶层成立
                 "跨域 iframe：CriOS 检测面一致": (
                     fr.get("gcr") is True and fr.get("wk") is True
-                    and fr.get("hist") is True and fr.get("chromeRuntime") is False),
+                    and fr.get("hist") is True and fr.get("chromeType") == "undefined"),
                 # 二次客户端（Playwright 自建 OOPIF 会话）实时读取同一补丁
                 "跨域 iframe：二次客户端 CriOS 检测面一致": (
                     fr_live.get("gcr") is True and fr_live.get("wk") is True
                     and fr_live.get("hist") is True
-                    and fr_live.get("chromeRuntime") is False),
+                    and fr_live.get("chromeType") == "undefined"),
                 # ---- POST 重放面（B1-7）：只在 POST 文档出现 ----
                 # 真机源码：post_request.js 把 __crPostRequestWorkaround 定义为
                 # 命名空间对象（不是函数），两个回执通道由路由在重放期间临时注册。
@@ -6885,11 +7048,11 @@ async def main() -> int:
                     state["hasStandalone"] is True and state["standalone"] is False),
                 "跨域 iframe：无 CriOS 检测面（Safari 口径）": (
                     fr.get("gcr") is False and fr.get("wk") is False
-                    and fr.get("hist") is False and fr.get("chromeRuntime") is False),
+                    and fr.get("hist") is False and fr.get("chromeType") == "undefined"),
                 "跨域 iframe：二次客户端无 CriOS 检测面": (
                     fr_live.get("gcr") is False and fr_live.get("wk") is False
                     and fr_live.get("hist") is False
-                    and fr_live.get("chromeRuntime") is False),
+                    and fr_live.get("chromeType") == "undefined"),
             })
 
     # ---- 媒体查询面（全平台）：CDP 触控仿真的语义断言 ----
@@ -6946,6 +7109,11 @@ async def main() -> int:
             mq.get("dynamicRangeHigh") is (
                 "SE" not in (extra.get("marketName") or ""))
             and mq.get("dynamicRangeStandard") is True)
+        checks["ScreenOrientation.lock/unlock：iOS WebKit 不暴露 Chromium 方法"] = (
+            state.get("orientLock") == "undefined"
+            and state.get("orientUnlock") == "undefined"
+            and state.get("orientLockIn") is False
+            and state.get("orientUnlockIn") is False)
 
     # ---- F-15：孤儿实例回收 ----
     # 探针自己拉起的浏览器在 finally 里已被关掉；此刻 profile 目录下不应

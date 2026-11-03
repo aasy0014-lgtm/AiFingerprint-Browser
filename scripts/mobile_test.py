@@ -15,6 +15,7 @@
 用法：
     .venv/bin/python scripts/mobile_test.py
 """
+import base64
 import json
 import re
 import sys
@@ -24,12 +25,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.fingerprint_engine import create_fingerprint, summarize
 from app.mobile_cdp_injector import (
+    _BLANK_AVIF_8X8_B64,
     _android_webgpu,
+    _locale_languages,
+    _normalize_locale,
     _ua_ios_version,
     build_mobile_patch,
+    build_worker_patch,
     derive_spec,
 )
 from app.mobile_fingerprints import (
+    _android_display_gamut,
     _ios_av1_capable,
     _ios_handlers,
     _kernel_browser,
@@ -37,6 +43,7 @@ from app.mobile_fingerprints import (
     library_info,
     list_brands,
 )
+from app.kernels.fp_chromium_kernel import chrome_version
 
 _PASS = 0
 _FAIL = 0
@@ -85,7 +92,7 @@ def load_device_index() -> dict:
 
 
 _RE_ANDROID_UA = re.compile(
-    r"^Mozilla/5\.0 \(Linux; Android (?P<os>\d+(?:\.\d+)?); (?P<model>.+?)\) "
+    r"^Mozilla/5\.0 \(Linux; Android 10; K\) "
     r"AppleWebKit/537\.36 \(KHTML, like Gecko\) Chrome/(?P<major>\d+)\.0\.0\.0 "
     r"(?P<mobile>Mobile )?Safari/537\.36$"
 )
@@ -114,8 +121,13 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
         m = _RE_ANDROID_UA.match(ua)
         check(f"[{tag}] Android UA 格式", m is not None, ua[:100])
         if m:
-            check(f"[{tag}] UA 机型 == 档案机型", m.group("model") == extra["model"], m.group("model"))
-            check(f"[{tag}] UA 系统版本 == 档案", m.group("os") == extra["osVersion"])
+            # UA 缩减：机型与系统版本不在 UA 串里，真值只走高熵提示
+            check(f"[{tag}] UA-CH 机型 == 档案机型",
+                  (extra.get("uaCh") or {}).get("model") == extra["model"],
+                  str((extra.get("uaCh") or {}).get("model")))
+            check(f"[{tag}] UA-CH 系统版本 == 档案",
+                  (extra.get("uaCh") or {}).get("platformVersion")
+                  == f"{extra['osVersion']}.0.0")
             check(f"[{tag}] UA Appendix 与设备类型匹配",
                   (m.group("mobile") is not None) == (extra["deviceType"] == "phone"))
     else:
@@ -165,7 +177,9 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
 
     # --- 平台语义 ---
     if target_os == "android":
-        check(f"[{tag}] platform == Linux aarch64", nav["platform"] == "Linux aarch64")
+        # navigator.platform 在 UA 缩减后被 Blink 硬编码为 "Linux armv81"
+        # （navigator_base.cc GetReducedNavigatorPlatform()），不按 ABI 取值。
+        check(f"[{tag}] platform == Linux armv81", nav["platform"] == "Linux armv81")
         check(f"[{tag}] vendor == Google Inc.", nav["vendor"] == "Google Inc.")
         check(f"[{tag}] GPU 为 ANGLE 格式", data["videoCard"]["renderer"].startswith("ANGLE ("))
         check(f"[{tag}] deviceMemory 为上报表", nav["deviceMemory"] in (1, 2, 4, 8),
@@ -196,6 +210,15 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
               extra.get("connectionType") == "wifi")
         check(f"[{tag}] downlinkMax == 1300（LTE 档，非 Infinity）",
               extra.get("downlinkMax") == 1300.0)
+        check(f"[{tag}] 显示色域档位合法",
+              extra.get("displayGamut") in ("p3", "srgb"),
+              str(extra.get("displayGamut")))
+        check(f"[{tag}] 显示色域与机型档案/兜底一致",
+              extra.get("displayGamut") == _android_display_gamut(rec or {
+                  "model": extra.get("model"),
+                  "market_name": extra.get("marketName"),
+              }),
+              f"{extra.get('displayGamut')} vs {_android_display_gamut(rec or {})}")
         check(f"[{tag}] WebGL 规格剔除桌面专属扩展",
               "WEBGL_compressed_texture_s3tc" in (extra.get("webglProfile") or {}).get("dropExtensions", [])
               and "EXT_texture_compression_bptc" in extra["webglProfile"]["dropExtensions"])
@@ -237,9 +260,26 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
               "EXT_disjoint_timer_query" in (extra.get("webglProfile") or {}).get("dropExtensions", [])
               and "EXT_disjoint_timer_query_webgl2" in extra["webglProfile"]["dropExtensions"])
         codecs = extra.get("codecCapability") or {}
-        check(f"[{tag}] 编解码表：ogg/webm 整族为空串（AVFoundation 容器表无此项）",
-              all(codecs.get(k) == "" for k in
-                  ("audio/ogg", "audio/webm", "video/webm", "video/ogg")))
+        # Ogg/WebM 由 iOS 运行期算法按版本门控，不再在稀疏档案覆盖层里写死
+        # 空串：WebM 自 iOS 17.4 起落地，Ogg 自 iOS 18.4 起落地。若把旧的
+        # 空串覆盖层留在这里，会压过新版本的运行期门控，造成假阴性。
+        ios_spec = derive_spec(fp["fingerprint"], "ios")
+        ios_ver = _ua_ios_version(ua) or ()
+        webm_expected = ios_ver >= (17, 4)
+        ogg_expected = ios_ver >= (18, 4)
+        dynamic_families = {
+            "audio/ogg", "application/ogg", "video/ogg",
+            "audio/webm", "video/webm",
+        }
+        check(f"[{tag}] 编解码表：ogg/webm 由 iOS 版本门控（不写死覆盖层）",
+              not any(str(k).split(";", 1)[0].strip() in dynamic_families
+                      for k in codecs))
+        check(f"[{tag}] WebM 能力按 iOS 17.4 门控",
+              ios_spec.get("webm") is webm_expected
+              and (ios_spec.get("mseTypes") or {}).get("ios") is True)
+        check(f"[{tag}] Ogg 能力按 iOS 18.4 门控",
+              ios_spec.get("ogg") is ogg_expected
+              and (ios_spec.get("mseTypes") or {}).get("ogg") is ogg_expected)
         check(f"[{tag}] 编解码表：HEVC 仅 hvc1 可播，hev1 为空串",
               codecs.get('video/mp4; codecs="hvc1"') == "probably"
               and codecs.get('video/mp4; codecs="hev1"') == "")
@@ -249,6 +289,10 @@ def verify_fp_consistency(fp: dict, target_os: str, devices: dict) -> None:
                   "probably" if _ios_av1_capable(
                       str(extra.get("model") or ""),
                       str(extra.get("marketName") or "")) else ""))
+        check(f"[{tag}] MSE av1 开关与机型能力位一致",
+              (ios_spec.get("mseTypes") or {}).get("av1") is _ios_av1_capable(
+                  str(extra.get("model") or ""),
+                  str(extra.get("marketName") or "")))
 
     # --- 通用 ---
     check(f"[{tag}] navigator.mobile 未伪造", "mobile" not in nav)
@@ -265,10 +309,14 @@ def test_library() -> dict:
     check("机型数量充足（≥30）", info["count"] >= 30)
     brands = list_brands()
     print(f"  品牌: {brands}")
-    check("Android 品牌齐全（含 Samsung/Google/Xiaomi/OnePlus/Honor）",
-          {"Samsung", "Google", "Xiaomi", "OnePlus", "Honor"} <= set(brands["android"]))
+    check("Android 品牌齐全（含 Samsung/Google/Xiaomi/OnePlus/Honor/Huawei）",
+          {"Samsung", "Google", "Xiaomi", "OnePlus", "Honor", "Huawei"} <= set(brands["android"]))
     check("iOS 品牌仅 Apple", brands["ios"] == ["Apple"])
-    return load_device_index()
+    devices = load_device_index()
+    check("F-100：Pixel 8 / 8 Pro Tensor G3 九核",
+          devices.get("Pixel 8", {}).get("cpu_cores") == 9
+          and devices.get("Pixel 8 Pro", {}).get("cpu_cores") == 9)
+    return devices
 
 
 def test_android(devices: dict) -> None:
@@ -287,6 +335,27 @@ def test_android(devices: dict) -> None:
     print("[generate] 品牌 = 不存在的 Foo（应回退随机）")
     fp = create_mobile_fingerprint("android", "generate", "Foo")
     check("未知品牌回退到全库", fp["manufacturer"] in list_brands()["android"], fp["manufacturer"])
+
+    print("[preset] 具体机型 = Pixel 8 Pro")
+    fp = create_mobile_fingerprint("android", "preset", "Google", device_model="Pixel 8 Pro")
+    check("具体机型筛选生效", fp["manufacturer"] == "Google" and fp["device_model"] == "Pixel 8 Pro",
+          f"{fp['manufacturer']} {fp['device_model']}")
+    for brand, model in (
+        ("Xiaomi", "Xiaomi 14T"),
+        ("Xiaomi", "Xiaomi 15 Ultra"),
+        ("Huawei", "Huawei Pura 70 Pro"),
+        ("Huawei", "Huawei Mate 70 Pro+"),
+    ):
+        picked = create_mobile_fingerprint("android", "preset", brand, device_model=model)
+        check(f"新增 Android 机型可精确选择：{model}",
+              picked["manufacturer"] == brand and picked["device_model"] == model,
+              f"{picked['manufacturer']} {picked['device_model']}")
+    try:
+        create_mobile_fingerprint("android", "preset", "Samsung", device_model="Pixel 8 Pro")
+    except ValueError:
+        check("品牌与具体机型不匹配时拒绝", True)
+    else:
+        check("品牌与具体机型不匹配时拒绝", False, "未抛错")
 
 
 def test_ios(devices: dict) -> None:
@@ -357,18 +426,34 @@ def test_preset_determinism() -> None:
 def test_generate_randomness(devices: dict) -> None:
     section("5. generate 随机性与批量一致性（40 套）")
     seen_ua: set[str] = set()
+    seen_android_ua: set[str] = set()
+    seen_ch: set[str] = set()
     seen_chrome: set[str] = set()
     bad = 0
     for i in range(20):
         for os_ in ("android", "ios"):
             fp = create_mobile_fingerprint(os_, "generate")
-            seen_ua.add(fp["fingerprint"]["navigator"]["userAgent"])
+            ua = fp["fingerprint"]["navigator"]["userAgent"]
+            seen_ua.add(ua)
+            if os_ == "android":
+                seen_android_ua.add(ua)
+                # UA 缩减后 Android 串只剩 Chrome major 可变（机型/版本冻结）
+                ch = fp["fingerprint"]["mobileExtra"].get("uaCh") or {}
+                seen_ch.add((ch.get("model"), ch.get("platformVersion")))
             seen_chrome.add(fp["fingerprint"]["mobileExtra"]["browserVersion"])
             if fp["health"]["warnings"]:
                 bad += 1
     check("40 套均无体检告警", bad == 0, f"{bad} 套告警")
-    check("UA 组合多元（≥12 种）", len(seen_ua) >= 12, f"{len(seen_ua)} 种")
-    print(f"  实测组合: {len(seen_ua)} 种 UA，浏览器构建 {sorted(seen_chrome)}")
+    # 真机 Chrome Android 110+ 全量 UA 缩减：所有 Android 机型共用同一条
+    # `Android 10; K` 串，差异只落在 UA-CH 高熵（机型 / 系统版本）。
+    # iOS 不在缩减范围，UA 仍随版本多元。旧的「≥12 种 UA」断言前提已不成立。
+    check("Android UA 已收敛为单一缩减形态", len(seen_android_ua) <= 1,
+          f"{len(seen_android_ua)} 种: {sorted(seen_android_ua)[:2]}")
+    check("UA-CH 高熵面保持多元（≥12 种 机型/版本组合）",
+          len(seen_ch) >= 12, f"{len(seen_ch)} 种")
+    check("iOS UA 仍随系统版本多元（≥4 种）", len(seen_ua) >= 4, f"{len(seen_ua)} 种")
+    print(f"  实测组合: {len(seen_ua)} 种 UA，Android UA-CH {len(seen_ch)} 种，"
+          f"浏览器构建 {sorted(seen_chrome)}")
 
 
 def test_engines_compat() -> None:
@@ -392,6 +477,85 @@ def test_engines_compat() -> None:
     check("注入层读取视口高（< CSS 高）", spec["viewportHeight"] < spec["cssHeight"])
     check("注入层 deviceMemory 为上报表", spec["deviceMemory"] in (1, 2, 4, 8))
     check("Android 无 CSS 版本门控（F-89 仅 iOS）", spec.get("cssGate") == [])
+
+    # ---- F-201：登录 locale 三件套（Intl / Navigator / Worker）同源 ----
+    # geoip 会把海外出口映射成 en-US/ja-JP 等；旧实现只改 Intl 与 TTS，
+    # navigator.languages 仍固定 zh-CN，Google 登录页可直接读出该矛盾。
+    _locale_cases = (
+        ("en-US", "en-US", ["en-US", "en"]),
+        ("zh-CN", "zh-CN", ["zh-CN", "zh"]),
+        ("ja-JP", "ja-JP", ["ja-JP", "ja"]),
+        ("en_US", "en-US", ["en-US", "en"]),
+    )
+    _locale_ok = True
+    for _raw, _want, _langs in _locale_cases:
+        _ls = derive_spec(fp["fingerprint"], "android", _raw)
+        _locale_ok &= (_ls.get("locale") == _want
+                       and _ls.get("language") == _want
+                       and _ls.get("languages") == _langs)
+    check("F-201：locale 规范化并同步 language/languages", _locale_ok)
+    _stored = derive_spec(fp["fingerprint"], "android")
+    check("F-201：未指定 locale 时保持存档语言序列",
+          _stored.get("language") == fp["fingerprint"]["navigator"]["language"]
+          and _stored.get("languages") == fp["fingerprint"]["navigator"]["languages"])
+    _en_spec = derive_spec(fp["fingerprint"], "android", "en-US")
+    _page_patch = build_mobile_patch(_en_spec)
+    _worker_patch = build_worker_patch(_en_spec)
+    check("F-201：页面/Worker 补丁均携带同一语言序列",
+          '"language": "en-US"' in _page_patch
+          and '"languages": ["en-US", "en"]' in _page_patch
+          and '"language": "en-US"' in _worker_patch
+          and '"languages": ["en-US", "en"]' in _worker_patch)
+    check("F-201：非法 locale 不覆盖存档值",
+          _normalize_locale("not a locale") == ""
+          and _normalize_locale("en-US,en;q=0.9") == ""
+          and _locale_languages("not a locale") == [])
+
+    # ---- F-99：Android 显示色域按机型/可选字段下发 ----
+    _engine_major = (chrome_version() or "156.0.0.0").split(".", 1)[0]
+    _gamut_base = {
+        "navigator": {
+            "userAgent": "Mozilla/5.0 (Linux; Android 17; Pixel 8) "
+                          f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{_engine_major}.0.0.0 Mobile Safari/537.36",
+            "platform": "Linux aarch64", "maxTouchPoints": 5,
+        },
+        "screen": {"width": 1080, "height": 2400, "devicePixelRatio": 2.625},
+        "mobileExtra": {"model": "Pixel 8", "marketName": "Pixel 8"},
+    }
+    # UA 缩减：旧档案的缩减前串由 derive_spec 收敛成 `Linux; Android 10; K`
+    check("UA 缩减：存量旧串收敛为缩减形态",
+          derive_spec(_gamut_base, "android")["ua"].startswith(
+              "Mozilla/5.0 (Linux; Android 10; K) "))
+    check("UA 缩减：platform 收敛为 Linux armv81",
+          derive_spec(_gamut_base, "android")["platform"] == "Linux armv81")
+    check("F-99：Pixel 8 旧档案无色域字段时兜底 P3",
+          derive_spec(_gamut_base, "android").get("displayGamut") == "p3")
+    _gamut_srgb = {**_gamut_base,
+                   "mobileExtra": {**_gamut_base["mobileExtra"],
+                                    "displayGamut": "srgb"}}
+    check("F-99：显式 sRGB 覆盖优先于机型兜底",
+          derive_spec(_gamut_srgb, "android").get("displayGamut") == "srgb")
+    _gamut_ios = derive_spec(_gamut_base, "ios")
+    check("F-99：iOS 色域固定 P3（不受 Android 字段影响）",
+          _gamut_ios.get("displayGamut") == "p3")
+
+    # F-94：AVIF 的窄能力探针只对 iOS 17+ 开启，且内嵌 payload 必须是
+    # 真正的 AVIF 容器；非空画布仍由运行期包装器回退 PNG，避免 MIME 伪造。
+    _avif17 = create_fingerprint("ios", "generate")["fingerprint"]
+    _set_ios_version(_avif17, "17.5")
+    _avif16 = create_fingerprint("ios", "generate")["fingerprint"]
+    _set_ios_version(_avif16, "16.4")
+    _avif17_spec = derive_spec(_avif17, "ios")
+    _avif16_spec = derive_spec(_avif16, "ios")
+    _avif_android = derive_spec(_gamut_base, "android")
+    _avif_bytes = base64.b64decode(_BLANK_AVIF_8X8_B64)
+    check("F-94：iOS 17+ 开启透明 8×8 AVIF 窄探针",
+          _avif17_spec.get("canvasAvif") is True)
+    check("F-94：iOS 16/Android 不误报 AVIF 编码能力",
+          _avif16_spec.get("canvasAvif") is False
+          and _avif_android.get("canvasAvif") is False)
+    check("F-94：内嵌空画布 payload 为合法 AVIF 容器",
+          len(_avif_bytes) >= 16 and _avif_bytes[4:12] == b"ftypavif")
 
     # ---- F-140：UA 与 mobileExtra.osVersion 脱钩时以 UA 为准 ----
     # 固定造一个 18.6 的 UA，再把 osVersion 谎报成 27.0：门控必须按 UA
@@ -420,6 +584,34 @@ def test_engines_compat() -> None:
           == sorted(["-webkit-backdrop-filter", "text-autospace"]))
     check("iOS 18.4 profile 无 CSS 门控项", _ios_spec_at("18.4")["cssGate"] == [])
 
+    # F-85 / §63：Safari 26 才引入的 CSS descriptor globals。旧 iOS
+    # profiles 必须像真机一样删掉它们；26.x 以后则不能误删。
+    _css_future = {"CSSFontFaceDescriptors", "CSSPageDescriptors",
+                   "CSSStyleProperties"}
+    _ios186 = set(_ios_spec_at("18.6")["removeGlobals"])
+    _ios265 = set(_ios_spec_at("26.5")["removeGlobals"])
+    check("F-85：CSS descriptor globals 按 iOS 26 门控",
+          _css_future <= _ios186 and not (_css_future & _ios265))
+
+    # F-199：媒体容器的两个落地版本不同，固定测试四个边界，避免只用
+    # 当前主流 26/27 档 profile 而漏掉低版本门控回归。
+    _media_gate_cases = (
+        ("17.3", False, False),
+        ("17.4", True, False),
+        ("18.3", True, False),
+        ("18.4", True, True),
+    )
+    _media_gate_ok = True
+    _media_gate_got = {}
+    for _ver, _webm, _ogg in _media_gate_cases:
+        _ms = _ios_spec_at(_ver)
+        _got = (_ms.get("webm"), _ms.get("ogg"),
+                (_ms.get("mseTypes") or {}).get("ogg"))
+        _media_gate_got[_ver] = _got
+        _media_gate_ok &= _got == (_webm, _ogg, _ogg)
+    check("F-199：WebM/Ogg 按 iOS 17.4/18.4 分别门控",
+          _media_gate_ok, str(_media_gate_got))
+
     # ---- WebGPU 适配器口径（内核 148 二进制内嵌的 Dawn gpu_info 字面量实证：
     #      Qualcomm 代际 adreno-Nxx / ARM valhall·gen-5 / Samsung rdna-N /
     #      ImgTec d-series；非库内 GPU 不伪造）----
@@ -429,6 +621,7 @@ def test_engines_compat() -> None:
         ("ANGLE (ARM, Mali-G715-Immortalis MC10, OpenGL ES 3.2)", ("arm", "gen-5")),
         ("ANGLE (ARM, Mali-G78 MP14, OpenGL ES 3.2)", ("arm", "valhall")),
         ("ANGLE (Samsung, Xclipse 530, OpenGL ES 3.2)", ("samsung", "rdna-2")),
+        ("ANGLE (HUAWEI, Maleoon 910, OpenGL ES 3.2)", ("huawei", "maleoon")),
         ("ANGLE (Imagination Technologies, PowerVR DXT-48-1536, OpenGL ES 3.2)",
          ("img-tec", "d-series")),
     ):
@@ -453,6 +646,10 @@ def test_engines_compat() -> None:
         "battery": {"level": 0.5, "charging": False, "chargingTime": 0, "dischargingTime": 1000},
     }
     spec = derive_spec(legacy, "android")
+    # 无 mobileExtra 的旧结构同样要收敛（UA 串与 platform 两处）
+    check("旧结构：UA 收敛为缩减形态",
+          spec["ua"].startswith("Mozilla/5.0 (Linux; Android 10; K) "), spec["ua"][:70])
+    check("旧结构：platform 收敛为 Linux armv81", spec["platform"] == "Linux armv81")
     check("旧结构：CSS 由物理/DPR 推算", spec["cssWidth"] == 480 and spec["cssHeight"] == 1040)
     check("旧结构：deviceMemory 规范化为 8", spec["deviceMemory"] == 8)
     check("旧结构：视口高回退为 CSS 高", spec["viewportHeight"] == 1040)
@@ -516,6 +713,9 @@ def test_engines_compat() -> None:
                     "isContextLost", "lang", "textRendering"])
           and "filter" not in (dm_ios.get("CanvasRenderingContext2D") or [])
           and "CanvasRenderingContext2D" not in dm_and)
+    check("iOS ScreenOrientation：lock/unlock 缺席（WebKit 只读方向面）",
+          _dropped(dm_ios, "ScreenOrientation", ["lock", "unlock"])
+          and "ScreenOrientation" not in dm_and)
     check("F-105/F-111~F-113：零散与 HTML 元素原型差集",
           _dropped(dm_ios, "MediaMetadata", ["chapterInfo"])
           and _dropped(dm_ios, "MediaRecorder", ["audioBitrateMode"])
@@ -678,8 +878,8 @@ def test_engines_compat() -> None:
           (spec_ios.get("mseTypes") or {}).get("ios") is True
           and "mseTypes" in inj)
     check("F-142：WebM 的 VP9 受 !ios 门控、legacy 拼写不豁免",
-          "if (vp.vp8) { return true; }" in inj
-          and "return !ios;" in inj
+          "if (name === 'vp8' || name === 'vp9')" in inj
+          and "return (name === 'vp8') ? true : !ios;" in inj
           and "if (vp.legacy) { return true; }" not in inj)
     check("F-130：无参抛 Not enough arguments（WebKit 文案）",
           "throw new TypeError('Not enough arguments');" in inj)
@@ -694,7 +894,12 @@ def test_engines_compat() -> None:
           "'Can only call MediaCapabilities.' + name" in inj
           and "if (self !== inst) {" in inj)
     check("F-135：AV1 由机型能力位门控（opt.av1）",
-          "var __mcOpt = { av1: !!D.av1 };" in inj)
+          bool(re.findall(r"var __mcOpt\s*=\s*\{([^}]*)\};", inj))
+          and all(
+              re.search(r"\bav1\s*:\s*!!D\.av1\b", body)
+              and re.search(r"\bogg\s*:\s*!!D\.ogg\b", body)
+              for body in re.findall(
+                  r"var __mcOpt\s*=\s*\{([^}]*)\};", inj)))
     # AVFoundation 的扩展类型闸门问的是系统 isPlayableExtendedMIMEType，AV1
     # 那档答案随机型硬解走——漏了这条分支，能解 AV1 的机型上 file 路径仍判死。
     check("F-135：AVFoundation 闸门对 av01 走机型能力位",
