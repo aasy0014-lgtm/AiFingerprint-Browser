@@ -40,13 +40,13 @@ class ProxyConfig(BaseModel):
         return f"{self.scheme}://{self.host}:{self.port}"
 
 
-# 风控预设：standard=通用；cloudflare=CF/Turnstile 强化；china=极验/易盾等国内风控
-RiskPreset = Literal["standard", "cloudflare", "china"]
+# 风控预设：standard=通用；cloudflare=验证页强化；china=国内风控；login=登录连续性
+RiskPreset = Literal["standard", "cloudflare", "china", "login"]
 
 
 class LaunchConfig(BaseModel):
     headless: bool = False
-    # 启动时根据代理出口 IP 自动匹配时区/经纬度/语言（Camoufox 内核）
+    # 启动时根据出口 IP 自动匹配时区/语言（fp-chromium/Camoufox 内核）
     geoip: bool = True
     # 类人鼠标轨迹（Camoufox 内核）
     humanize: bool = True

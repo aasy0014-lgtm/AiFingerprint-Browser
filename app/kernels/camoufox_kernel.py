@@ -78,6 +78,14 @@ async def start(
                 v["isDefault"] = False
             voices[idx]["isDefault"] = True
 
+    # A direct Camoufox connection has no proxy address to pin into the ICE
+    # candidates.  Leaving WebRTC enabled in that case can expose the host's
+    # interface/public address during an OAuth risk check, even when geoip is
+    # enabled (the geoip lookup and the readiness endpoint may legitimately
+    # use different egress paths).  A proxied session keeps WebRTC available so
+    # the proxy exit can be represented; an explicit user opt-out still wins.
+    block_webrtc = bool(launch.block_webrtc or proxy is None)
+
     kwargs: dict[str, Any] = dict(
         persistent_context=True,
         user_data_dir=str(user_data_dir),
@@ -86,7 +94,7 @@ async def start(
         headless=launch.headless if headless is None else headless,
         # 类人鼠标轨迹；preset=cloudflare 时带时长上限
         humanize=(launch.humanize_max or True) if launch.humanize else None,
-        block_webrtc=True if launch.block_webrtc else None,
+        block_webrtc=block_webrtc if block_webrtc else None,
         # Turnstile 等跨域人机验证 iframe 交互所需
         disable_coop=True if launch.disable_coop else None,
         **_default_addons_kwargs(disable_adblock=launch.disable_adblock),

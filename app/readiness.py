@@ -7,6 +7,8 @@ UA 声称 A 设备但 Canvas/GPU 是 B、自动化标记残留等。本引擎启
 
 检测项（均为运行时实测，非静态检查）:
   ip_reachable   代理/网络可达性（浏览器网络栈内访问 ip-api）
+  ip_continuity  同一次体检内的出口 IP 连续性（发现轮换代理）
+  ip_history     跨次体检/重启的出口 IP 连续性
   tz_match       浏览器时区 vs 出口 IP 属地时区
   locale_match   浏览器语言 vs 出口 IP 国家（CN→zh、欧美→en）
   webrtc_leak    WebRTC 候选公网 IP 是否与出口 IP 一致（或已禁用）
@@ -23,17 +25,29 @@ UA 声称 A 设备但 Canvas/GPU 是 B、自动化标记残留等。本引擎启
   plugins_sane   navigator.plugins 数量合理（真 Chrome 内置 5 个 PDF 插件）
   hw_sane        deviceMemory/hardwareConcurrency 数值合理（Chromium 系）
   turnstile_reachable Cloudflare 验证域可达
+  ua_consistency  UA / platform / UA-CH 与存储指纹一致
+  mobile_surface  移动端触控与 coarse 指针面一致
+  storage_ready   Cookie / localStorage / IndexedDB 可用
+  profile_continuity 环境数据目录可持续复用
+  emulation_channel 移动端 CDP 仿真通道健康
+  headless_mode   登录场景是否仍以无头模式启动
 """
 import asyncio
 import json
 import logging
+import re
 import time
+from urllib.parse import quote
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 import websockets
 
+from .config import PROFILE_ROOT
 from .launcher import LaunchManager
+from .models import ProxyConfig
+from .proxy_test import canonical_timezone, test_proxy
 
 log = logging.getLogger(__name__)
 
@@ -119,18 +133,21 @@ class _CdpPage:
 
 # 出口 IP 探测：多端点回退（http 优先，https 备用；页面在 https 下时混合内容需走 https 端点）
 _IP_PROVIDERS = [
-    ("http://ip-api.com/json/?fields=status,message,query,country,countryCode,city,timezone,isp",
+    ("http://ip-api.com/json/?fields=status,message,query,country,countryCode,city,timezone,isp,proxy,hosting,mobile",
      lambda d: {"query": d.get("query"), "country": d.get("country"), "countryCode": d.get("countryCode"),
-                "city": d.get("city"), "timezone": d.get("timezone"), "isp": d.get("isp")}
+                "city": d.get("city"), "timezone": d.get("timezone"), "isp": d.get("isp"),
+                "proxy": d.get("proxy"), "hosting": d.get("hosting"), "mobile": d.get("mobile")}
      if d.get("status") == "success" else None),
     ("https://ipwho.is/?fields=ip,success,country,country_code,city,timezone,connection",
      lambda d: {"query": d.get("ip"), "country": d.get("country"), "countryCode": d.get("country_code"),
                 "city": d.get("city"), "timezone": d.get("timezone"),
-                "isp": (d.get("connection") or {}).get("isp")}
+                "isp": (d.get("connection") or {}).get("isp"),
+                "proxy": None, "hosting": None, "mobile": None}
      if d.get("success") else None),
     ("https://ipinfo.io/json",
      lambda d: {"query": d.get("ip"), "country": d.get("country"), "countryCode": d.get("country"),
-                "city": d.get("city"), "timezone": d.get("timezone"), "isp": d.get("org")}
+                "city": d.get("city"), "timezone": d.get("timezone"), "isp": d.get("org"),
+                "proxy": None, "hosting": None, "mobile": None}
      if d.get("ip") else None),
 ]
 
@@ -140,6 +157,10 @@ _SECURE_SAMPLE_URLS = ("https://example.com/", "https://ipwho.is/?fields=ip,succ
 # 各检测项与风控体系的关联（用于报告展示）
 VENDOR_MAP = {
     "ip_reachable": ["cloudflare", "google", "geetest", "yidun"],
+    "ip_continuity": ["cloudflare", "google", "geetest", "yidun"],
+    "ip_history": ["cloudflare", "google", "geetest", "yidun"],
+    "proxy_path_consistency": ["cloudflare", "google", "geetest", "yidun"],
+    "ip_quality": ["cloudflare", "google", "geetest", "yidun"],
     "tz_match": ["cloudflare", "google", "geetest", "yidun"],
     "locale_match": ["cloudflare", "geetest", "yidun"],
     "webrtc_leak": ["cloudflare", "google", "geetest", "yidun"],
@@ -156,6 +177,13 @@ VENDOR_MAP = {
     "plugins_sane": ["cloudflare", "google"],
     "hw_sane": ["google", "yidun"],
     "turnstile_reachable": ["cloudflare"],
+    "ua_consistency": ["cloudflare", "google", "geetest", "yidun"],
+    "mobile_surface": ["google", "geetest", "yidun"],
+    "storage_ready": ["google", "cloudflare", "geetest", "yidun"],
+    "auth_surface": ["google"],
+    "profile_continuity": ["google", "cloudflare", "geetest", "yidun"],
+    "emulation_channel": ["google", "geetest", "yidun"],
+    "headless_mode": ["google", "cloudflare", "geetest", "yidun"],
 }
 
 _EXPECT_LANG_PREFIX = {"CN": "zh", "TW": "zh", "HK": "zh", "US": "en", "GB": "en",
@@ -170,6 +198,7 @@ _CHECK_JS = """(async () => {
   out.href = location.href;
   out.lang = navigator.language || '';
   out.langs = (navigator.languages || []).join(',');
+  out.platform = navigator.platform || '';
   out.webdriver = navigator.webdriver;
   out.plugins = (navigator.plugins || []).length;
   out.ua = navigator.userAgent || '';
@@ -178,6 +207,52 @@ _CHECK_JS = """(async () => {
   // deviceMemory / 硬件并发（Chromium 独有 deviceMemory）
   out.deviceMemory = navigator.deviceMemory || null;
   out.hw = navigator.hardwareConcurrency || null;
+  out.maxTouchPoints = Number(navigator.maxTouchPoints || 0);
+  out.touchEvents = 'ontouchstart' in window;
+  out.pointerCoarse = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
+  out.anyPointerCoarse = !!(window.matchMedia && matchMedia('(any-pointer: coarse)').matches);
+  out.anyHover = !!(window.matchMedia && matchMedia('(any-hover: hover)').matches);
+  out.innerWH = window.innerWidth + 'x' + window.innerHeight;
+  out.visualWH = window.visualViewport
+    ? (Math.round(window.visualViewport.width) + 'x' + Math.round(window.visualViewport.height))
+    : '';
+  out.authSurface = {
+    secure: !!window.isSecureContext,
+    popup: typeof window.open === 'function',
+    credentials: !!(navigator.credentials && typeof navigator.credentials.get === 'function'),
+    preventSilentAccess: !!(navigator.credentials &&
+      typeof navigator.credentials.preventSilentAccess === 'function'),
+    publicKey: typeof window.PublicKeyCredential === 'function',
+    storageAccess: typeof document.hasStorageAccess === 'function',
+  };
+  out.cookieEnabled = navigator.cookieEnabled !== false;
+  out.storage = {local: false, session: false, indexedDB: typeof indexedDB !== 'undefined'};
+  try {
+    const k = '__fpwb_readiness__';
+    const prior = localStorage.getItem(k);
+    localStorage.setItem(k, '1');
+    out.storage.local = localStorage.getItem(k) === '1';
+    if (prior === null) localStorage.removeItem(k); else localStorage.setItem(k, prior);
+  } catch (e) {}
+  try {
+    const k = '__fpwb_readiness__';
+    const prior = sessionStorage.getItem(k);
+    sessionStorage.setItem(k, '1');
+    out.storage.session = sessionStorage.getItem(k) === '1';
+    if (prior === null) sessionStorage.removeItem(k); else sessionStorage.setItem(k, prior);
+  } catch (e) {}
+  // 高熵 UA-CH 只读一次并设置超时，避免权限提示或精简内核让体检挂起。
+  out.chHigh = null;
+  if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
+    try {
+      out.chHigh = await Promise.race([
+        navigator.userAgentData.getHighEntropyValues([
+          'platformVersion', 'model', 'uaFullVersion', 'architecture', 'bitness', 'wow64'
+        ]),
+        new Promise((r) => setTimeout(() => r(null), 1500)),
+      ]);
+    } catch (e) { out.chHigh = null; }
+  }
   // 屏幕与像素比
   out.screenWH = screen.width + 'x' + screen.height;
   out.colorDepth = screen.colorDepth;
@@ -276,9 +351,7 @@ _CHECK_JS = """(async () => {
 
 def _normalize_tz(tz: Any) -> str:
     """ipwho.is 等端点的 timezone 字段是 {'id': 'Asia/Shanghai', ...} 对象，统一取字符串。"""
-    if isinstance(tz, dict):
-        return str(tz.get("id") or tz.get("name") or "")
-    return str(tz or "")
+    return canonical_timezone(tz)
 
 
 def _result(check_id: str, status: str, detail: str, advice: str = "") -> dict:
@@ -286,6 +359,43 @@ def _result(check_id: str, status: str, detail: str, advice: str = "") -> dict:
         "id": check_id, "status": status, "detail": detail, "advice": advice,
         "vendors": VENDOR_MAP.get(check_id, []),
     }
+
+
+def _ua_os(ua: str) -> str:
+    """从 UA 提取粗粒度平台，专门用于与 profile 的 target_os 互证。"""
+    ua = str(ua or "")
+    if "Android" in ua:
+        return "android"
+    if re.search(r"iPhone|iPad|iPod", ua):
+        return "ios"
+    if "Windows NT" in ua:
+        return "windows"
+    if "Mac OS X" in ua:
+        return "macos"
+    if "X11; Linux" in ua or "Linux x86_64" in ua:
+        return "linux"
+    return "unknown"
+
+
+def _ch_major(value: Any) -> str:
+    """UA-CH 版本字段的主版本（兼容字符串/缺失值）。"""
+    if isinstance(value, dict):
+        value = value.get("uaFullVersion") or value.get("fullVersion")
+    return str(value or "").split(".", 1)[0]
+
+
+def _proxy_session_advice(proxy: Any) -> str:
+    """Describe an explicit short proxy-session hint without exposing credentials."""
+    username = (proxy.get("username") if isinstance(proxy, dict)
+                else getattr(proxy, "username", ""))
+    username = str(username or "")
+    match = re.search(r"(?:^|[-_])sess(?:ion)?time[-_=]?(\d+)(?:$|[-_])",
+                      username, re.IGNORECASE)
+    if not match:
+        return ""
+    minutes = match.group(1)
+    return (f"当前代理会话标记为约 {minutes} 分钟；供应商可能在会话到期后轮换出口，"
+            "注册期间应使用更长的固定会话")
 
 
 async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
@@ -299,6 +409,7 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
 
     checks: list[dict] = []
     page = None
+    engine_major = ""
     # 移动端 profile：屏幕、插件、Battery/Client Hints/deviceMemory 的存在性
     # 都按真机口径变化，桌面假设会整片误报（详见各检查项注释）。
     target_os = profile.get("target_os") or ""
@@ -306,6 +417,27 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
     spec = (profile.get("fingerprint") or {}).get("fingerprint") or {}
     spec_extra = spec.get("mobileExtra") or {}
     spec_screen = spec.get("screen") or {}
+    spec_nav = spec.get("navigator") or {}
+
+    # 这三项不依赖网络页面，先报告出来；即使出口探测失败，用户仍能知道
+    # 登录环境是否会丢失 Cookie/存储或移动仿真通道是否处于降级态。
+    data_dir = PROFILE_ROOT / str(profile.get("id") or "")
+    if data_dir.is_dir():
+        checks.append(_result("profile_continuity", "pass",
+                              f"环境数据目录可复用（{data_dir.name}）"))
+    else:
+        checks.append(_result("profile_continuity", "fail",
+                              "环境数据目录不存在",
+                              "使用同一环境启动并保留其用户数据目录；登录态不要跨环境复制"))
+
+    configured_headless = bool((profile.get("launch") or {}).get("headless", False))
+    if configured_headless:
+        checks.append(_result("headless_mode", "warn",
+                              "环境配置为 headless",
+                              "登录前改用有头模式；体检自身为隔离无头启动，不代表正式启动方式"))
+    else:
+        checks.append(_result("headless_mode", "pass", "环境配置为有头模式"))
+
     try:
         if inst is None:
             raise RuntimeError("浏览器实例不可用（启动失败）")
@@ -319,9 +451,46 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
             port = inst.info.get("debug_port")
             if not port:
                 raise RuntimeError("chromium 系实例缺少 CDP 调试端口")
+            # Browser.getVersion 的 Browser 字段反映真实内核，而页面 UA
+            # 可能来自旧环境档案。两者主版本不一致时，登录服务会看到
+            # 「引擎 152 + UA 148」这类不可自洽组合；单看页面 UA 无法发现。
+            try:
+                async with httpx.AsyncClient(trust_env=False) as client:
+                    vr = await client.get(
+                        f"http://127.0.0.1:{port}/json/version", timeout=5)
+                browser_text = str(vr.json().get("Browser") or "")
+                vm = re.search(r"(?:Chrome|Chromium|CriOS)/(\d+)", browser_text)
+                if vm:
+                    engine_major = vm.group(1)
+            except Exception:
+                engine_major = ""
             page = _CdpPage(port)
 
         await page.open()
+
+        # 移动仿真会话由 launcher 以后台任务建立；等它完成首屏校验后再判定，
+        # 避免把「浏览器刚启动、CDP 尚未挂载」误报为通道降级。
+        if mobile:
+            emu_state = manager.emulation_state(profile["id"])
+            for _ in range(25):
+                if emu_state is not None:
+                    break
+                await asyncio.sleep(0.2)
+                emu_state = manager.emulation_state(profile["id"])
+            if emu_state == "ok":
+                checks.append(_result("emulation_channel", "pass", "移动端仿真通道健康"))
+            elif emu_state == "degraded":
+                checks.append(_result("emulation_channel", "fail",
+                                      "移动端仿真通道已连接但首屏读数未通过",
+                                      "重启环境；若重复出现，检查 CDP 注入日志与内核版本"))
+            elif emu_state == "reconnecting":
+                checks.append(_result("emulation_channel", "fail",
+                                      "移动端仿真通道正在重连",
+                                      "等待通道恢复为健康后再进入登录页"))
+            else:
+                checks.append(_result("emulation_channel", "warn",
+                                      "未读取到移动端仿真通道状态",
+                                      "确认目标环境使用 fp-chromium，并在仿真状态为健康后登录"))
 
         # ---- 网络路径与出口 IP（浏览器网络栈内实测，天然走代理；多端点回退）
         ipinfo: dict = {}
@@ -344,8 +513,171 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
                                   "仍建议确认代理连通性或更换住宅 IP"))
             return _report(profile, checks)
         exit_ip = ipinfo.get("query", "")
+
+        # 跨重启保留最近一次出口，只记录 IP/属地元数据，不写入 Cookie 或
+        # 账号信息。代理池常在新连接时换地址；服务端会把这种跳变与同一
+        # 设备指纹关联，单次体检的连续性复测捕获不到跨次变化时由此项暴露。
+        history_path = data_dir / ".fpwb_readiness_ip.json"
+        profile_proxy = profile.get("proxy")
+        proxy_session_advice = _proxy_session_advice(profile_proxy)
+        previous_ip = ""
+        try:
+            if history_path.is_file():
+                history = json.loads(history_path.read_text(encoding="utf-8"))
+                previous_ip = str(history.get("ip") or "")
+        except (OSError, ValueError, TypeError):
+            previous_ip = ""
+        if previous_ip and previous_ip != str(exit_ip):
+            advice = "登录期间固定代理会话；跨重启更换出口会触发设备重新确认"
+            if proxy_session_advice:
+                advice += "；" + proxy_session_advice
+            checks.append(_result(
+                "ip_history", "warn",
+                f"上次体检出口 {previous_ip}，本次为 {exit_ip}",
+                advice,
+            ))
+        else:
+            checks.append(_result(
+                "ip_history", "pass",
+                "首次记录出口" if not previous_ip else f"跨次体检出口一致（{exit_ip}）",
+            ))
+        try:
+            tmp = history_path.with_suffix(history_path.suffix + ".tmp")
+            tmp.write_text(json.dumps({
+                "ip": str(exit_ip), "country": ipinfo.get("country"),
+                "timezone": _normalize_tz(ipinfo.get("timezone")),
+                "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+            }, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(history_path)
+        except OSError:
+            log.debug("出口历史写入失败: %s", history_path)
+
+        # 同一浏览器网络栈内立即复测一次出口。轮换代理可能在启动/登录
+        # 的短窗口内更换地址；首个端点连通并不代表后续 OAuth 请求仍沿用
+        # 同一出口。第二次探测失败时显式告警，不猜测放行。
+        continuity_ip = ""
+        continuity_errors: list[str] = []
+        for continuity_url, continuity_extract in _IP_PROVIDERS:
+            try:
+                await page.goto(continuity_url)
+                continuity_raw = json.loads(await page.evaluate("document.body.innerText"))
+                continuity_info = continuity_extract(continuity_raw)
+                if continuity_info and continuity_info.get("query"):
+                    continuity_ip = str(continuity_info["query"])
+                    break
+                continuity_errors.append(f"{continuity_url.split('/')[2]}: 数据无效")
+            except Exception as exc:
+                continuity_errors.append(
+                    f"{continuity_url.split('/')[2]}: {str(exc)[:40]}"
+                )
+        if continuity_ip:
+            if continuity_ip == str(exit_ip):
+                checks.append(_result("ip_continuity", "pass",
+                                      f"连续两次出口一致（{exit_ip}）"))
+            else:
+                checks.append(_result(
+                    "ip_continuity", "warn",
+                    f"同一次体检出口发生变化（{exit_ip} → {continuity_ip}）",
+                    "登录前固定代理会话；轮换出口会使账号会话与设备指纹出现跨 IP 跳变",
+                ))
+        else:
+            checks.append(_result(
+                "ip_continuity", "warn",
+                f"出口连续性复测失败（{'; '.join(continuity_errors[:2])}）",
+                "保持当前代理会话后重试体检；无法完成复测时不要把出口稳定性视为已确认",
+            ))
+
+        # Browser requests travel through the local authenticated forwarder,
+        # while the independent probe opens a fresh upstream connection.  Some
+        # rotating proxy services return a different ASN/IP per connection even
+        # when the username/session is unchanged; an account service sees that
+        # as a device moving between networks.  Compare both paths explicitly so
+        # a browser-only continuity pass does not hide this login-risk signal.
+        if profile_proxy:
+            try:
+                independent = await test_proxy(
+                    ProxyConfig(**profile_proxy), timeout=min(15.0, 8.0))
+                independent_ip = str(independent.get("exit_ip") or "")
+                if not independent.get("ok") or not independent_ip:
+                    checks.append(_result(
+                        "proxy_path_consistency", "warn",
+                        "独立代理连接未返回出口 IP",
+                        "固定代理 session 后重试；登录期间需要浏览器路径与独立连接保持同一出口",
+                    ))
+                elif independent_ip != str(exit_ip):
+                    checks.append(_result(
+                        "proxy_path_consistency", "warn",
+                        f"浏览器出口 {exit_ip} 与独立代理连接 {independent_ip} 不一致",
+                        "代理按连接轮换出口；固定同一 session/出口后再进入登录页",
+                    ))
+                else:
+                    checks.append(_result(
+                        "proxy_path_consistency", "pass",
+                        f"浏览器与独立代理连接出口一致（{exit_ip}）",
+                    ))
+            except Exception as exc:  # noqa: BLE001
+                checks.append(_result(
+                    "proxy_path_consistency", "warn",
+                    f"独立代理连接探测异常（{type(exc).__name__}）",
+                    "固定代理 session 后重试体检；登录前先确认出口一致性",
+                ))
+        else:
+            checks.append(_result(
+                "proxy_path_consistency", "pass", "直连环境，无独立代理路径"))
+
+        # ip-api 的免费 HTTP 端点会被 Chromium 的 HSTS 规则升级到 HTTPS，
+        # 而 HTTPS 版本要求付费 key；ipwho/ipinfo 又只返回 ASN/ISP，不给
+        # proxy/hosting 标志。登录体检因此容易把「未判定」误报成质量告警。
+        # 用同一浏览器网络栈补查 proxycheck（不把服务器出口混进来），只在
+        # 主端点缺少质量字段时请求；服务不可达仍保留 warn，而不是猜测放行。
+        if (exit_ip and all(ipinfo.get(k) is None
+                            for k in ("proxy", "hosting", "mobile"))):
+            try:
+                quality_url = (
+                    "https://proxycheck.io/v2/" + quote(str(exit_ip), safe=".:" )
+                    + "?vpn=1&asn=1")
+                await page.goto(quality_url)
+                quality_raw = json.loads(await page.evaluate("document.body.innerText"))
+                quality = quality_raw.get(str(exit_ip)) if isinstance(quality_raw, dict) else None
+                if isinstance(quality, dict):
+                    q_proxy = str(quality.get("proxy") or "").strip().lower()
+                    q_type_raw = str(quality.get("type") or "").strip()
+                    q_type = re.sub(r"[\s_-]+", "", q_type_raw.lower())
+                    if q_proxy in ("yes", "no"):
+                        ipinfo["proxy"] = q_proxy == "yes"
+                    if q_type:
+                        # proxycheck's ``Business`` label describes an ASN
+                        # category, not a datacenter/hosting verdict.  Treating
+                        # it as hosting made ordinary ISP exits (for example a
+                        # DHCP consumer/business subnet) look like a proxy and
+                        # downgraded login readiness despite the browser-side
+                        # network check passing.  Keep only explicit hosting or
+                        # datacenter labels in the high-risk bucket.
+                        ipinfo["hosting"] = q_type in {
+                            "hosting", "datacenter", "server", "vpn",
+                        }
+                        ipinfo["mobile"] = q_type == "mobile"
+                    ipinfo["quality_type"] = q_type_raw or None
+                    ipinfo["quality_source"] = "proxycheck"
+            except Exception as exc:  # noqa: BLE001
+                log.debug("出口质量补查失败: %s", exc)
         checks.append(_result("ip_reachable", "pass",
                               f"出口 {exit_ip}（{ipinfo.get('country')} {ipinfo.get('city') or ''}，ISP: {str(ipinfo.get('isp') or '')[:30]}）"))
+        quality_flags = (ipinfo.get("proxy"), ipinfo.get("hosting"), ipinfo.get("mobile"))
+        if ipinfo.get("proxy") or ipinfo.get("hosting"):
+            checks.append(_result(
+                "ip_quality", "warn",
+                "出口被归类为代理/机房网络",
+                "登录环境优先使用与目标属地一致的住宅或移动出口；地址质量属于网络侧信号，指纹参数无法抵消"))
+        elif any(flag is not None for flag in quality_flags):
+            quality_type = str(ipinfo.get("quality_type") or "").strip()
+            detail = "出口未被标记为代理或机房网络"
+            if quality_type:
+                detail += f"（网络类型：{quality_type}）"
+            checks.append(_result("ip_quality", "pass", detail))
+        else:
+            checks.append(_result("ip_quality", "warn", "当前探测端点未提供出口质量字段",
+                                  "在代理控制台补做 IP 质量检查；仅凭连通性无法判断地址信誉"))
 
         # ---- 页面内全量采样
         data = await asyncio.wait_for(page.evaluate(_CHECK_JS), timeout=45)
@@ -377,13 +709,149 @@ async def run_readiness(manager: LaunchManager, profile: dict) -> dict:
         cc = ipinfo.get("countryCode", "")
         expected = _EXPECT_LANG_PREFIX.get(cc)
         lang_prefix = (data["lang"] or "").split("-")[0].lower()
+        lang_values = [v for v in str(data.get("langs") or "").split(",") if v]
+        lang_issues: list[str] = []
         if expected and lang_prefix and lang_prefix != expected:
+            lang_issues.append(f"IP 属地 {cc} 期望 {expected}-*，浏览器语言 {data['lang']}")
+        # 登录页常同时读取 language 与 languages；首选项首项必须与单值
+        # getter 同源。这个检查专门捕获旧版「Intl/Accept-Language 已切换，
+        # navigator.languages 仍是 zh-CN」的交叉矛盾。
+        if lang_values and data.get("lang") and lang_values[0] != data["lang"]:
+            lang_issues.append(
+                f"navigator.languages 首项 {lang_values[0]} ≠ language {data['lang']}")
+        if lang_issues:
             checks.append(_result("locale_match", "warn",
-                                  f"IP 属地 {cc} 期望 {expected}-*，浏览器语言 {data['lang']}",
+                                  "；".join(lang_issues),
                                   "语言与属地不符会显著提高人机验证触发率；在启动选项设置 locale（国内预设=zh-CN）"))
         else:
             checks.append(_result("locale_match", "pass",
                                   f"语言 {data['lang'] or '(空)'} 与属地 {cc} 相符"))
+
+        # UA / platform / UA-CH 交叉一致性。单看 userAgentData.platform 不够，
+        # 登录页通常还会读取 model、platformVersion 和完整 Chrome 主版本。
+        stored_nav = dict(spec_nav)
+        if not stored_nav:
+            stored_fp = profile.get("fingerprint") or {}
+            stored_nav = ((stored_fp.get("preset") or {}).get("navigator") or
+                          (stored_fp.get("fingerprint") or {}).get("navigator") or {})
+        ua_issues: list[str] = []
+        ua = str(data.get("ua") or "")
+        page_major_match = re.search(r"(?:Chrome|Chromium|CriOS)/(\d+)", ua)
+        page_major = page_major_match.group(1) if page_major_match else ""
+        if engine_major and page_major and engine_major != page_major:
+            ua_issues.append(f"真实内核主版本 {engine_major} ≠ UA 主版本 {page_major}")
+        declared_os = _ua_os(ua)
+        if target_os and declared_os != target_os:
+            ua_issues.append(f"UA 平台 {declared_os} ≠ 目标 {target_os}")
+        if target_os not in ("android", "ios"):
+            expected_platforms = {
+                "windows": {"Win32"}, "macos": {"MacIntel"},
+                "linux": {"Linux x86_64", "Linux armv81", "Linux armv8l", "Linux armv7l"},
+            }.get(target_os, set())
+            if expected_platforms and data.get("platform") not in expected_platforms:
+                ua_issues.append(f"platform {data.get('platform') or '(空)'} 与目标 {target_os} 不符")
+        if target_os in ("android", "ios"):
+            expected_ua = str(stored_nav.get("userAgent") or "")
+            if expected_ua and ua != expected_ua:
+                ua_issues.append("运行期 UA 与存储指纹不一致")
+            expected_platform = str(stored_nav.get("platform") or "")
+            if expected_platform and data.get("platform") != expected_platform:
+                ua_issues.append(f"platform {data.get('platform') or '(空)'} ≠ 指纹 {expected_platform}")
+
+            high = data.get("chHigh")
+            expected_ch = spec_extra.get("uaCh") or {}
+            if target_os == "android":
+                if not isinstance(high, dict):
+                    ua_issues.append("Android 高熵 UA-CH 不可读")
+                else:
+                    if expected_ch.get("model") and high.get("model") != expected_ch.get("model"):
+                        ua_issues.append("UA-CH model 与机型不一致")
+                    want_pv = str(expected_ch.get("platformVersion") or "")
+                    if want_pv and str(high.get("platformVersion") or "") != want_pv:
+                        ua_issues.append("UA-CH platformVersion 与档案不一致")
+                    ua_major = re.search(r"(?:Chrome|CriOS)/(\d+)", ua)
+                    ch_major = _ch_major(high)
+                    if ua_major and ch_major and ua_major.group(1) != ch_major:
+                        ua_issues.append("UA 主版本与 UA-CH 完整版本不一致")
+            elif isinstance(high, dict):
+                ua_issues.append("iOS 不应暴露高熵 UA-CH")
+        if ua_issues:
+            hard = any("真实内核主版本" in x or "UA 平台" in x or "运行期 UA" in x or "platform " in x
+                       or "model" in x or "platformVersion" in x or "主版本" in x
+                       for x in ua_issues)
+            checks.append(_result("ua_consistency", "fail" if hard else "warn",
+                                  "；".join(ua_issues),
+                                  "重启同一环境，确保设备仿真先于页面脚本生效；Android 需保留完整 UA-CH"))
+        else:
+            checks.append(_result("ua_consistency", "pass",
+                                  f"UA / platform / UA-CH 与 {target_os or '目标环境'} 一致"))
+
+        # 移动端触控与媒体查询是登录页常见的首屏交叉信号；若仿真通道掉线，
+        # screen 可能仍看似正确，但这里会立刻暴露 pointer/touch 回落宿主值。
+        if mobile:
+            touch_issues: list[str] = []
+            want_touch = int(spec_nav.get("maxTouchPoints") or spec_extra.get("maxTouchPoints") or 0)
+            got_touch = int(data.get("maxTouchPoints") or 0)
+            if want_touch and got_touch != want_touch:
+                touch_issues.append(f"maxTouchPoints {got_touch} ≠ 指纹 {want_touch}")
+            if got_touch <= 0 or not data.get("touchEvents"):
+                touch_issues.append("触摸事件面缺失")
+            if not data.get("pointerCoarse") or not data.get("anyPointerCoarse"):
+                touch_issues.append("pointer: coarse 媒体面缺失")
+            if data.get("anyHover"):
+                touch_issues.append("any-hover: hover 与移动设备不符")
+            if touch_issues:
+                checks.append(_result("mobile_surface", "fail", "；".join(touch_issues),
+                                      "检查移动端 CDP 仿真状态；不要在同一环境中混用桌面 CDP 输入路径"))
+            else:
+                checks.append(_result("mobile_surface", "pass",
+                                      f"触控 {got_touch} 点，pointer/coarse 一致"))
+        else:
+            checks.append(_result("mobile_surface", "pass", "非移动端环境，跳过触控面检查"))
+
+        # 登录态依赖 Cookie 与站点存储；这里只做能力探测并清理临时 key，不写入
+        # 持久化登录数据，避免体检改变用户环境。
+        storage = data.get("storage") or {}
+        storage_issues: list[str] = []
+        if not data.get("cookieEnabled"):
+            storage_issues.append("Cookie 被禁用")
+        if not storage.get("local"):
+            storage_issues.append("localStorage 不可写")
+        if not storage.get("session"):
+            storage_issues.append("sessionStorage 不可写")
+        if not storage.get("indexedDB"):
+            storage_issues.append("IndexedDB 不可用")
+        if storage_issues:
+            cookie_hard = any("Cookie" in item for item in storage_issues)
+            checks.append(_result("storage_ready", "fail" if cookie_hard else "warn",
+                                  "；".join(storage_issues),
+                                  "登录页需要可用 Cookie；同时检查隐私扩展、站点权限与无痕/临时上下文"))
+        else:
+            checks.append(_result("storage_ready", "pass", "Cookie、localStorage、sessionStorage、IndexedDB 均可用"))
+
+        # OAuth/登录页面常见的基础能力面：这里只验证能力存在与安全上下文，
+        # 不触发弹窗、不调用凭据 API，也不读取账号信息。Passkey/Storage Access
+        # 是可选增强能力，缺失只作提示，避免把浏览器版本差异误报为硬失败。
+        auth = data.get("authSurface") or {}
+        auth_issues: list[str] = []
+        if not auth.get("secure"):
+            auth_issues.append("登录页面不在安全上下文")
+        if not auth.get("popup"):
+            auth_issues.append("window.open 不可用")
+        if auth_issues:
+            checks.append(_result("auth_surface", "fail" if not auth.get("secure") else "warn",
+                                  "；".join(auth_issues),
+                                  "登录页需要 HTTPS 与可用 OAuth 弹窗；同时检查扩展和浏览器权限"))
+        else:
+            extras = []
+            if auth.get("credentials"):
+                extras.append("Credentials")
+            if auth.get("publicKey"):
+                extras.append("WebAuthn")
+            if auth.get("storageAccess"):
+                extras.append("Storage Access")
+            checks.append(_result("auth_surface", "pass",
+                                  "OAuth 基础能力可用" + (f"（{'+'.join(extras)} 可用）" if extras else "")))
 
         # WebRTC 泄露
         srflx = data.get("srflx") or []
@@ -648,6 +1116,17 @@ def _report(profile: dict, checks: list[dict]) -> dict:
     score = max(0, 100 - 25 * len(fails) - 8 * len(warns))
     verdict = "ready" if not fails and not warns else \
               "needs_work" if not fails else "danger"
+    # 登录预设的报告需要能被 API/自动化直接消费，不让调用方重新按 id
+    # 扫描整表；同时保留完整 checks 供管理端展示。
+    login_ids = {"ip_reachable", "ip_continuity", "ip_history", "ip_quality", "tz_match", "locale_match", "webrtc_leak",
+                 "proxy_path_consistency",
+                 "webdriver", "ua_consistency", "mobile_surface", "storage_ready",
+                 "auth_surface", "profile_continuity", "emulation_channel", "headless_mode"}
+    login_checks = [c for c in checks if c["id"] in login_ids]
+    login_fails = [c for c in login_checks if c["status"] == "fail"]
+    login_warns = [c for c in login_checks if c["status"] == "warn"]
+    login_verdict = "ready" if not login_fails and not login_warns else \
+                    "needs_work" if not login_fails else "danger"
     return {
         "profile_id": profile["id"],
         "profile_name": profile["name"],
@@ -656,6 +1135,13 @@ def _report(profile: dict, checks: list[dict]) -> dict:
         "score": score,
         "verdict": verdict,
         "verdict_label": {"ready": "环境就绪", "needs_work": "建议优化", "danger": "存在穿帮风险"}[verdict],
+        "login_readiness": {
+            "score": max(0, 100 - 25 * len(login_fails) - 8 * len(login_warns)),
+            "verdict": login_verdict,
+            "verdict_label": {"ready": "可进入登录", "needs_work": "登录前建议优化",
+                               "danger": "暂不建议登录"}[login_verdict],
+            "checks": login_checks,
+        },
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
         "checks": checks,
     }

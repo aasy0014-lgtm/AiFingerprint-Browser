@@ -247,7 +247,7 @@ def build_tools(client: WorkbenchClient) -> list[Tool]:
                    "attr": _s("属性名（可选，不传取 textContent）")}, ["profile_id", "selector"]),
              lambda a: client.call("POST", f"/api/v1/browser/{a['profile_id']}/extract",
                                    {"selector": a["selector"], "attr": a.get("attr")})),
-        Tool("get_page_info", "获取页面信息：标题、URL、Cookie（任意内核）",
+        Tool("get_page_info", "获取页面信息：标题、URL、Cookie 元数据（值已脱敏，任意内核）",
              _obj({"profile_id": _s("环境 ID", minLength=1)}, ["profile_id"]),
              lambda a: client.call("POST", f"/api/v1/browser/{a['profile_id']}/page_info")),
         Tool("get_html", "获取页面 HTML 内容（可裁剪长度，任意内核）",
@@ -255,7 +255,7 @@ def build_tools(client: WorkbenchClient) -> list[Tool]:
                    "max_length": _i("最大返回长度（默认 50000）")}, ["profile_id"]),
              lambda a: client.call("POST", f"/api/v1/browser/{a['profile_id']}/get_html",
                                    {"max_length": a.get("max_length", 50000)})),
-        Tool("readiness_check", "环境就绪度体检（约 20-60 秒）：出口 IP/时区/语言/WebRTC/自动化痕迹/Canvas 稳定等 17 项",
+        Tool("readiness_check", "环境就绪度体检（约 20-60 秒）：出口质量/属地一致性/UA-CH/存储/移动仿真/自动化痕迹/Canvas 稳定等多项",
              _obj({"profile_id": _s("环境 ID", minLength=1)}, ["profile_id"]),
              lambda a: client.call("POST", f"/api/v1/profiles/{a['profile_id']}/readiness", {})),
 

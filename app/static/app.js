@@ -252,6 +252,7 @@ async function runReadiness(id) {
                          fail: '<span class="pill err">✘ 风险</span>' };
     const verdictColor = { ready: "var(--ok)", needs_work: "var(--warn)", danger: "var(--danger)" };
     const verdictPill = { ready: "success", needs_work: "warn", danger: "failed" };
+    const login = r.login_readiness || null;
     $("#readinessTitle").textContent = `${r.profile_name} · ${r.kernel} · 预设 ${r.preset} · ${r.checked_at.replace("T", " ").slice(0, 19)}`;
     $("#readinessBody").innerHTML = `
       <div class="kv" style="margin-bottom:12px">
@@ -259,12 +260,24 @@ async function runReadiness(id) {
           <div class="v" style="font-size:26px;color:${verdictColor[r.verdict]}">${r.score}<span style="font-size:14px;color:var(--muted)">/100</span></div></div>
         <div class="item"><div class="k">结论</div><div class="v"><span class="pill ${verdictPill[r.verdict]}" style="font-size:13px">${r.verdict_label}</span></div></div>
       </div>
+      ${login ? `<div class="card" style="margin-bottom:12px;padding:10px 14px">
+        <b>登录子评分</b>：<span style="color:${verdictColor[login.verdict]}">${login.score}/100</span>
+        <span class="pill ${verdictPill[login.verdict]}" style="margin-left:6px">${esc(login.verdict_label)}</span>
+      </div>` : ""}
       <table class="list"><thead><tr><th style="width:80px">状态</th><th>检测项</th><th>详情 / 整改建议</th><th>关联风控</th></tr></thead>
       <tbody>${r.checks.map((c) => `<tr>
         <td>${statusIcon[c.status]}</td>
-        <td><b>${{ip_reachable: "网络出口", tz_match: "时区一致性", locale_match: "语言一致性",
+        <td><b>${{ip_reachable: "网络出口", ip_continuity: "出口连续性", ip_history: "出口历史连续性", tz_match: "时区一致性", locale_match: "语言一致性",
                    webrtc_leak: "WebRTC 泄露", webdriver: "自动化标记", canvas_stable: "Canvas 稳定性",
-                   webgl_sane: "WebGL 渲染器", fonts_render: "字体渲染"}[c.id] || c.id}</b></td>
+                   webgl_sane: "WebGL 渲染器", fonts_render: "字体渲染", ip_quality: "出口质量",
+                   audio_stable: "Audio 稳定性", ua_chips: "UA-CH", screen_sane: "屏幕参数",
+                   media_devices: "媒体设备", webgpu: "WebGPU", adblock_active: "广告拦截",
+                   plugins_sane: "插件列表", hw_sane: "硬件参数", turnstile_reachable: "验证域可达",
+                   ua_consistency: "UA 交叉一致性", mobile_surface: "移动触控面",
+                   storage_ready: "登录存储能力", auth_surface: "OAuth 登录能力面",
+                   proxy_path_consistency: "代理出口一致性",
+                   profile_continuity: "环境连续性",
+                   emulation_channel: "移动仿真通道", headless_mode: "启动模式"}[c.id] || c.id}</b></td>
         <td>${esc(c.detail)}${c.advice ? `<br><span class="muted">建议：${esc(c.advice)}</span>` : ""}</td>
         <td>${c.vendors.map((v) => `<span class="tag">${VENDOR_NAMES[v] || v}</span>`).join(" ")}</td>
       </tr>`).join("")}</tbody></table>`;

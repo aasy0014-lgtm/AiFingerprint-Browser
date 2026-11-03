@@ -104,10 +104,23 @@ def main() -> int:
         for c in report["checks"]:
             print(f"      {c['status']:4s} | {c['id']:13s} | {c['detail'][:60]}")
         assert by_id["ip_reachable"]["status"] == "pass"
+        # 同一次体检内复测出口，若轮换代理则应显式暴露为告警；本机
+        # 固定会话预期为 pass，至少保证检查项已经接入报告。
+        assert by_id["ip_continuity"]["status"] in ("pass", "warn")
+        assert by_id["ip_history"]["status"] in ("pass", "warn")
         assert by_id["webdriver"]["status"] == "pass"
         assert by_id["canvas_stable"]["status"] == "pass"
         assert by_id["webrtc_leak"]["status"] in ("pass", "warn")
-        assert report["score"] >= 60, f"得分过低: {report['score']}"
+        # `p` intentionally uses the china preset without a proxy.  On a
+        # non-China host the strengthened readiness report must surface the
+        # timezone/locale mismatch, so a fixed score floor would turn a
+        # correctly detected risk into a false test failure.  Assert the new
+        # login sub-report and bounded score instead.
+        assert 0 <= report["score"] <= 100, report["score"]
+        login = report.get("login_readiness") or {}
+        assert login.get("verdict") in {"ready", "needs_work", "danger"}, login
+        login_ids = {c["id"] for c in login.get("checks", [])}
+        assert {"storage_ready", "auth_surface", "profile_continuity"} <= login_ids
 
         step(5, "RPA 人机化节奏（步间延迟 + 逐字输入）...")
         task = ok("POST", "/tasks", {

@@ -495,17 +495,18 @@
               <option value="standard">通用（默认）</option>
               <option value="cloudflare">Cloudflare 强化（Turnstile 可交互+轨迹增强）</option>
               <option value="china">国内风控（极验/易盾：zh-CN+上海时区）</option>
+              <option value="login">登录连续性（geoip+稳定节奏+资源可达）</option>
             </select>
           </label>
           <label>显式时区（如 Asia/Shanghai）<input name="timezone" placeholder="留空由 geoip/系统决定"></label>
           <label>语言 locale（如 zh-CN）<input name="locale" placeholder="留空自动"></label>
           <label class="checkbox"><input type="checkbox" name="headless"> 无头模式</label>
-          <label class="checkbox"><input type="checkbox" name="geoip" checked> 按代理 IP 自动对齐时区/语言/经纬度</label>
+          <label class="checkbox"><input type="checkbox" name="geoip" checked> 按出口 IP 自动对齐时区/语言/经纬度</label>
           <label class="checkbox"><input type="checkbox" name="humanize" checked> 类人鼠标轨迹</label>
           <label class="checkbox"><input type="checkbox" name="block_webrtc"> 彻底禁用 WebRTC</label>
             <label class="checkbox"><input type="checkbox" name="disable_coop"> 禁用 COOP（Turnstile 勾选框交互）</label>
             <label class="checkbox"><input type="checkbox" name="disable_adblock"> 禁用广告拦截（防 Turnstile 误伤）</label>
-            <label>起始页 <input name="start_url" value="about:blank"></label>
+            <label>启动首页（环境覆盖） <input name="start_url" value="about:blank" placeholder="留空或 about:blank 使用系统默认"></label>
         </div>
       </fieldset>
 
