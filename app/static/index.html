@@ -23,7 +23,8 @@
       </div>
     </div>
 
-    <nav class="tabs">
+    <nav class="tabs" aria-label="主导航">
+      <div class="nav-section-label">工作区</div>
       <button class="active" data-tab="env">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
         环境管理
@@ -36,6 +37,7 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
         调度计划
       </button>
+      <div class="nav-section-label">诊断与安全</div>
       <button data-tab="matrix">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 3.5v5.4c0 5-3.4 9.3-8 11.1-4.6-1.8-8-6.1-8-11.1V5.5L12 2z"/><path d="M9 12l2 2 4-4"/></svg>
         矩阵风控
@@ -44,21 +46,44 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>
         审计日志
       </button>
+      <div class="nav-section-label">系统</div>
       <button data-tab="settings">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55h.01a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.88v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z"/></svg>
         系统设置
       </button>
       <span class="spacer"></span>
-      <span id="identityBadge"></span>
     </nav>
 
     <div class="sidenav-footer">
+      <div class="identity-card">
+        <span class="identity-icon" aria-hidden="true">◉</span>
+        <div class="identity-copy">
+          <span class="identity-label">当前身份</span>
+          <span id="identityBadge">未连接</span>
+        </div>
+      </div>
+      <div class="kernel-title">运行能力</div>
       <div class="kernel-badges" id="kernelBadges"></div>
     </div>
   </aside>
 
   <!-- ============================ 主区域 ============================ -->
   <main>
+    <header class="shell-header">
+      <div class="shell-heading">
+        <span class="eyebrow">CONTROL CENTER / WORKSPACE</span>
+        <strong id="shellTitle">环境管理</strong>
+        <span id="shellSubtitle">统一管理浏览器环境、自动化任务与风控状态</span>
+      </div>
+      <div class="shell-actions">
+        <div class="service-health" id="serviceHealth">
+          <span class="service-health-dot"></span>
+          <span id="headerHealthText">服务连接中…</span>
+        </div>
+        <button class="icon-btn" id="btnQuickRefresh" title="刷新当前数据" aria-label="刷新当前数据">↻</button>
+      </div>
+    </header>
+
     <!-- 环境管理 -->
     <section class="tab-panel active" id="tab-env">
       <div class="page-head">
@@ -209,18 +234,21 @@
     <section class="tab-panel" id="tab-settings">
       <div class="page-head">
         <h2>系统设置</h2>
-        <div class="sub">团队成员 / 认证 / 环境同步 / 备份恢复 / 内核指引</div>
+        <div class="sub">团队成员 / 认证 / 启动首页 / 环境同步 / 备份恢复 / 内核指引</div>
       </div>
 
-      <div class="settings-section" id="membersSection">
+      <div class="settings-grid">
+      <div class="settings-section settings-wide" id="membersSection">
         <h3>团队成员</h3>
         <p class="muted" style="margin-bottom:12px">
           成员拥有独立 API Key；operator 只能看到和操作自己创建的环境，admin 可管理全部。密钥仅在创建时显示一次。
         </p>
+        <div class="table-shell">
         <table class="list" style="margin-bottom:14px">
           <thead><tr><th>成员</th><th>角色</th><th>密钥</th><th>状态</th><th style="width:170px">操作</th></tr></thead>
           <tbody id="memberRows"></tbody>
         </table>
+        </div>
         <div class="toolbar">
           <input id="memberName" placeholder="成员名称" style="width:160px">
           <select id="memberRole" style="width:170px">
@@ -250,7 +278,7 @@
         <p class="muted" style="margin-top:8px">插件配对码 5 分钟内有效、一次性：在浏览器插件的「一键配置」中输入即可自动完成连接（认证关闭时同样可用）。</p>
       </div>
 
-      <div class="settings-section" id="globalProxySection">
+      <div class="settings-section settings-wide" id="globalProxySection">
         <h3>全局代理</h3>
         <p class="muted" style="margin-bottom:12px">
           一处配置、全体生效：<b>新建环境默认继承</b>该代理；环境自身没配代理时<b>启动时兜底</b>使用它。
@@ -286,9 +314,49 @@
           <button class="btn danger" id="btnClearGp">清除全局代理</button>
           <span class="muted" id="gpResult"></span>
         </div>
+        <div class="proxy-refresh-config">
+          <div class="section-title" style="margin-top:18px">刷新代理地址</div>
+          <p class="muted" style="margin-bottom:10px">
+            一键刷新会由服务端调用供应商接口并验证当前出口。刷新地址只在服务端加密保存，页面不会回显查询参数或密码。
+          </p>
+          <div class="grid2">
+            <label>刷新代理地址（首次配置或更换时粘贴完整 URL）
+              <input id="proxyRefreshUrl" type="url" autocomplete="off" placeholder="https://供应商域名/update?...">
+            </label>
+            <div class="kv" style="margin:0">
+              <div class="item"><div class="k">当前状态</div><div class="v" id="proxyRefreshState">-</div></div>
+            </div>
+          </div>
+          <div class="toolbar" style="margin-top:10px">
+            <button class="btn" id="btnSaveProxyRefresh">保存刷新地址</button>
+            <button class="btn danger" id="btnClearProxyRefresh">清除刷新地址</button>
+            <span class="muted" id="proxyRefreshResult"></span>
+          </div>
+        </div>
       </div>
 
-      <div class="settings-section">
+      <div class="settings-section settings-wide" id="defaultStartPageSection">
+        <h3>启动首页</h3>
+        <p class="muted" style="margin-bottom:12px">
+          配置系统默认启动首页。仅当环境没有设置独立首页（保持 <code>about:blank</code>）时生效；
+          环境编辑弹窗里的启动首页优先。支持 <code>http(s)</code> 和 <code>about:blank</code>。
+        </p>
+        <div class="grid2">
+          <label>系统默认启动首页
+            <input id="defaultStartUrl" type="url" placeholder="https://example.com/ 或 about:blank" autocomplete="off">
+          </label>
+          <div class="kv" style="margin:0">
+            <div class="item"><div class="k">当前生效值</div><div class="v mono" id="defaultStartUrlState">-</div></div>
+          </div>
+        </div>
+        <div class="toolbar" style="margin-top:12px">
+          <button class="btn primary" id="btnSaveDefaultStartUrl">保存启动首页</button>
+          <button class="btn" id="btnResetDefaultStartUrl">恢复 about:blank</button>
+          <span class="muted" id="defaultStartUrlResult"></span>
+        </div>
+      </div>
+
+      <div class="settings-section settings-wide">
         <h3>环境同步（自托管）</h3>
         <p class="muted" style="margin-bottom:12px">
           本机作为<b>同步服务器</b>：开启后其它节点可用令牌向本机推送/拉取环境配置（含指纹，不含 Cookie）。<br>
@@ -315,7 +383,7 @@
         </label>
       </div>
 
-      <div class="settings-section">
+      <div class="settings-section settings-compact">
         <h3>备份与恢复</h3>
         <p class="muted" style="margin-bottom:12px">
           备份包含全部环境的配置与指纹（不含 Cookie 等数据目录与密钥状态）。恢复会<b style="color:var(--danger)">清空并重建</b>现有环境。
@@ -327,14 +395,15 @@
         </div>
       </div>
 
-      <div class="settings-section">
+      <div class="settings-section settings-compact">
         <h3>内核与指纹安装指引</h3>
         <div id="kernelGuide" class="muted"></div>
       </div>
 
-      <div class="settings-section">
+      <div class="settings-section settings-compact">
         <h3>关于</h3>
         <div class="kv" id="aboutBox"></div>
+      </div>
       </div>
     </section>
   </main>

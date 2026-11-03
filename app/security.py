@@ -10,6 +10,7 @@ import logging
 import secrets
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from .config import DATA_DIR, ensure_dirs
 
@@ -50,8 +51,12 @@ def _default_settings() -> dict[str, Any]:
         "sync_remote_token": "",
         # 自动同步（已配置远端后每 30 分钟自动 push）
         "auto_sync": False,
+        # 系统默认启动首页；环境自身 launch.start_url 非 about:blank 时优先
+        "default_start_url": "about:blank",
         # 全局代理：新建环境默认继承、启动时兜底（密码加密存储）
         "global_proxy": None,
+        # 代理供应商的刷新地址（含查询凭据，使用 Fernet 加密保存）
+        "proxy_refresh_url": None,
     }
 
 
@@ -87,7 +92,10 @@ def save_settings(settings: dict[str, Any]) -> None:
 def update_settings(api_key_enabled: Optional[bool] = None, regenerate: bool = False,
                     sync: Optional[dict] = None,
                     global_proxy: Optional[dict] = None,
-                    clear_global_proxy: bool = False) -> dict:
+                    clear_global_proxy: bool = False,
+                    default_start_url: Optional[str] = None,
+                    proxy_refresh_url: Optional[str] = None,
+                    clear_proxy_refresh_url: bool = False) -> dict:
     settings = load_settings()
     if api_key_enabled is not None:
         settings["api_key_enabled"] = api_key_enabled
@@ -100,6 +108,8 @@ def update_settings(api_key_enabled: Optional[bool] = None, regenerate: bool = F
                 settings[key] = sync[key]
         if "regenerate_sync_token" in sync:
             settings["sync_token"] = secrets.token_hex(16)
+    if default_start_url is not None:
+        settings["default_start_url"] = str(default_start_url).strip() or "about:blank"
     if clear_global_proxy:
         settings["global_proxy"] = None
     elif global_proxy is not None:
@@ -109,8 +119,19 @@ def update_settings(api_key_enabled: Optional[bool] = None, regenerate: bool = F
             old = settings.get("global_proxy") or {}
             merged["password"] = decrypt_text(old.get("password")) or None
         settings["global_proxy"] = encrypt_proxy(merged)
+    if clear_proxy_refresh_url:
+        settings["proxy_refresh_url"] = None
+    elif proxy_refresh_url is not None:
+        value = str(proxy_refresh_url).strip()
+        settings["proxy_refresh_url"] = encrypt_text(value) if value else None
     save_settings(settings)
     return settings
+
+
+def get_default_start_url() -> str:
+    """返回系统默认启动首页（空值统一回退到 about:blank）。"""
+    value = load_settings().get("default_start_url")
+    return str(value).strip() if value else "about:blank"
 
 
 def check_api_key(provided: Optional[str]) -> bool:
@@ -193,3 +214,23 @@ def global_proxy_masked() -> Optional[dict]:
     if out.get("password"):
         out["password"] = "****"
     return out
+
+
+def get_proxy_refresh_url() -> Optional[str]:
+    """返回代理刷新地址明文，仅供服务端发起请求。
+
+    地址可能带供应商凭据，调用方不得把返回值写入响应、日志或审计详情。
+    """
+    value = load_settings().get("proxy_refresh_url")
+    return decrypt_text(str(value)) if value else None
+
+
+def proxy_refresh_host() -> Optional[str]:
+    """返回刷新地址的主机名（不暴露查询参数/凭据）。"""
+    value = get_proxy_refresh_url()
+    if not value:
+        return None
+    try:
+        return (urlsplit(value).hostname or "").lower() or None
+    except ValueError:
+        return None

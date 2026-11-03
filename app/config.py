@@ -24,6 +24,14 @@ DEFAULT_HOST = "127.0.0.1"
 # Hyper-V 端口保留范围占用（winerror 10013），故默认使用 18080
 DEFAULT_PORT = 18080
 
+# 代理刷新接口允许的目标主机。刷新地址包含供应商凭据，只允许已知供应商
+# 通过管理端保存和请求，避免把这个管理能力变成任意 SSRF 代理。
+PROXY_REFRESH_ALLOWED_HOSTS = frozenset(
+    host.strip().lower().rstrip(".")
+    for host in os.environ.get("FPWB_PROXY_REFRESH_HOSTS", "us.udealproxy.com").split(",")
+    if host.strip()
+)
+
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)

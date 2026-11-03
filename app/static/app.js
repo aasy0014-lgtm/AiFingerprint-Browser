@@ -63,11 +63,29 @@ function downloadJson(data, filename) {
 
 /* ------------------------------------------------ 页签 */
 
+const TAB_META = {
+  env: { title: "环境管理", subtitle: "统一管理浏览器环境、自动化任务与风控状态" },
+  tasks: { title: "RPA 任务", subtitle: "按步骤运行自动化流程，并保留截图、抽取结果与运行记录" },
+  schedules: { title: "调度计划", subtitle: "让任务按固定时刻或间隔稳定运行，状态一目了然" },
+  matrix: { title: "矩阵风控", subtitle: "扫描指纹分布与重复特征，提前发现环境关联风险" },
+  logs: { title: "审计日志", subtitle: "集中查看环境、浏览器、任务与认证相关的操作记录" },
+  settings: { title: "系统设置", subtitle: "配置团队权限、代理、启动首页、同步、备份与浏览器内核" },
+};
+
+function updateShellHeading(tab) {
+  const meta = TAB_META[tab] || TAB_META.env;
+  const title = $("#shellTitle");
+  const subtitle = $("#shellSubtitle");
+  if (title) title.textContent = meta.title;
+  if (subtitle) subtitle.textContent = meta.subtitle;
+}
+
 $$("nav.tabs button").forEach((btn) =>
   btn.addEventListener("click", () => {
     $$("nav.tabs button").forEach((b) => b.classList.remove("active"));
     $$(".tab-panel").forEach((p) => p.classList.remove("active"));
     btn.classList.add("active");
+    updateShellHeading(btn.dataset.tab);
     $(`#tab-${btn.dataset.tab}`).classList.add("active");
     if (btn.dataset.tab === "tasks") loadTasks().catch(() => {});
     if (btn.dataset.tab === "schedules") loadSchedules().catch(() => {});
@@ -604,6 +622,32 @@ $("#btnProxyTest").addEventListener("click", async () => {
   } catch (e) { toast(`测试失败：${e.message}`, "err"); }
 });
 
+$("#btnProxyRefresh").addEventListener("click", async () => {
+  const btn = $("#btnProxyRefresh");
+  if (btn.disabled) return;
+  const running = profiles.filter((p) => p.running).length;
+  if (running && !confirm(
+    `当前有 ${running} 个环境正在运行。刷新会改变代理出口，可能打断登录会话；` +
+    "确认刷新并在完成后重启环境？"
+  )) return;
+  btn.disabled = true;
+  btn.classList.add("spinning");
+  toast("刷新代理中…");
+  try {
+    const r = await api("POST", "/proxy/refresh");
+    if (!r.ok) {
+      toast(`刷新失败：${r.error || `HTTP ${r.status_code ?? "未知"}`}`, "err");
+      return;
+    }
+    const exit = r.exit_ip ? `，当前出口 ${r.exit_ip}` : "";
+    toast(`代理已刷新（HTTP ${r.status_code}${exit}）。首次体检可能记录出口变化；运行中的环境需重启，注册期间不要重复刷新`);
+  } catch (e) { toast(`刷新失败：${e.message}`, "err"); }
+  finally {
+    btn.disabled = false;
+    setTimeout(() => btn.classList.remove("spinning"), 260);
+  }
+});
+
 /* ------------------------------------------------ 一键解析代理 */
 
 function isPortLike(v) {
@@ -696,6 +740,33 @@ $("#proxyRawInput").addEventListener("keydown", (e) => {
 
 /* ------------------------------------------------ 全局代理（设置页） */
 
+function renderDefaultStartUrl(value) {
+  const url = value || "about:blank";
+  const input = $("#defaultStartUrl");
+  const state = $("#defaultStartUrlState");
+  if (input && document.activeElement !== input) input.value = url;
+  if (state) state.textContent = url;
+}
+
+async function saveDefaultStartUrl(value = $("#defaultStartUrl").value.trim()) {
+  const url = value || "about:blank";
+  try {
+    const r = await api("POST", "/settings", { default_start_url: url });
+    renderDefaultStartUrl(r.default_start_url || url);
+    $("#defaultStartUrlResult").textContent = "已保存，新启动的环境会使用该首页";
+    toast("启动首页已保存");
+  } catch (e) {
+    $("#defaultStartUrlResult").textContent = `保存失败：${e.message}`;
+    toast(`保存失败：${e.message}`, "err");
+  }
+}
+
+$("#btnSaveDefaultStartUrl").addEventListener("click", () => saveDefaultStartUrl());
+$("#btnResetDefaultStartUrl").addEventListener("click", () => saveDefaultStartUrl("about:blank"));
+$("#defaultStartUrl").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); saveDefaultStartUrl(); }
+});
+
 function renderGlobalProxy(gp) {
   const has = !!gp;
   $("#gpState").textContent = has ? "已配置 ✅（新建环境默认继承 + 启动兜底）" : "未配置";
@@ -709,6 +780,14 @@ function renderGlobalProxy(gp) {
   $("#gpUser").value = gp.username || "";
   // 接口只回显掩码，密码框留空表示沿用原密码
   $("#gpPass").value = "";
+}
+
+function renderProxyRefreshState(settings) {
+  const state = $("#proxyRefreshState");
+  if (!state) return;
+  state.textContent = settings?.proxy_refresh_configured
+    ? `已配置 ✅（${settings.proxy_refresh_host || "地址已隐藏"}）`
+    : "未配置";
 }
 
 function collectGlobalProxy() {
@@ -777,6 +856,34 @@ $("#btnSaveGp").addEventListener("click", saveGlobalProxy);
 $("#btnApplyGp").addEventListener("click", () => applyGlobalProxy(true));
 $("#btnApplyGpFill").addEventListener("click", () => applyGlobalProxy(false));
 $("#btnClearGp").addEventListener("click", clearGlobalProxy);
+
+$("#btnSaveProxyRefresh").addEventListener("click", async () => {
+  const input = $("#proxyRefreshUrl");
+  const value = input.value.trim();
+  if (!value) { toast("请先粘贴代理刷新地址", "err"); return; }
+  $("#proxyRefreshResult").textContent = "保存中…";
+  try {
+    const s = await api("POST", "/settings", { proxy_refresh_url: value });
+    input.value = "";
+    renderProxyRefreshState(s);
+    $("#proxyRefreshResult").textContent = "已保存（完整地址不会回显）";
+    toast("代理刷新地址已保存");
+  } catch (e) {
+    $("#proxyRefreshResult").textContent = `保存失败：${e.message}`;
+    toast(`保存失败：${e.message}`, "err");
+  }
+});
+
+$("#btnClearProxyRefresh").addEventListener("click", async () => {
+  if (!confirm("确定清除代理刷新地址？清除后首页按钮将不可用。")) return;
+  try {
+    const s = await api("POST", "/settings", { proxy_refresh_url: "" });
+    $("#proxyRefreshUrl").value = "";
+    renderProxyRefreshState(s);
+    $("#proxyRefreshResult").textContent = "已清除";
+    toast("代理刷新地址已清除");
+  } catch (e) { toast(`清除失败：${e.message}`, "err"); }
+});
 
 /* ------------------------------------------------ 自检链接 */
 
@@ -1113,7 +1220,12 @@ async function loadSettings() {
   if (document.activeElement !== $("#syncRemoteUrl")) $("#syncRemoteUrl").value = s.sync_remote_url || "";
   if (!s.sync_remote_configured) $("#syncRemoteToken").value = "";
   $("#autoSyncToggle").checked = !!s.auto_sync;
+  renderDefaultStartUrl(s.default_start_url || "about:blank");
+  $("#defaultStartUrlResult").textContent = "";
   renderGlobalProxy(s.global_proxy);
+  renderProxyRefreshState(s);
+  // 保存后清空输入框；已有配置不向页面回填完整 URL。
+  if (document.activeElement !== $("#proxyRefreshUrl")) $("#proxyRefreshUrl").value = "";
   await Promise.all([loadMembers(), loadIdentity()]);
 }
 

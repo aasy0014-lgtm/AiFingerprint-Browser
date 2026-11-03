@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -22,6 +23,65 @@ from .risk_presets import apply_preset
 from .mobile_cdp_injector import MobileEmulationSession
 
 log = logging.getLogger(__name__)
+
+
+# 一次性设备确认链接绑定了旧会话，保存到环境的启动页后每次启动都会把
+# 用户重新带回过期检查。启动时只归一化这类已知临时路径到同一站点根页，
+# 不改动 Cookie、LocalStorage 或 IndexedDB，正常的长期登录入口保持不变。
+#
+# Google 在同一条注册链上使用过多个路径：旧版是
+# ``crossflowverification/samedevice``，新版会在点击 Continue 后落到
+# ``devicephoneverification/{initiate,consent}``。这些页面都绑定一次性
+# token；把它们保存为环境起始页会让下一次启动重复打开过期检查，即使
+# Cookie/存储和移动仿真都正常。路径匹配仍限定在 accounts.google.com，
+# 避免影响其它站点的同名路径。
+_STALE_DEVICE_CHECK_PATHS = (
+    "/crossflowverification/samedevice",
+    "/crossflowverification/devicephoneverification",
+    "/devicephoneverification/",
+    "/info/sessionexpired",
+)
+
+
+def _is_stale_device_check_path(path: str) -> bool:
+    """Return whether *path* contains a known one-time Google check route.
+
+    Google has served both root-relative routes (``/devicephoneverification``)
+    and lifecycle routes such as
+    ``/lifecycle/steps/signup/crossflowverification/devicephoneverification/
+    initiate``.  Checking only ``startswith``/``endswith`` misses the latter
+    because the action suffix comes after the marker.  Match path segments
+    instead, while keeping the host restriction in :func:`normalize_start_url`.
+    """
+    segments = tuple(part for part in path.split("/") if part)
+    for marker in _STALE_DEVICE_CHECK_PATHS:
+        marker_segments = tuple(part for part in marker.split("/") if part)
+        width = len(marker_segments)
+        if width and any(segments[i:i + width] == marker_segments
+                         for i in range(len(segments) - width + 1)):
+            return True
+    return False
+
+
+def normalize_start_url(url: str | None) -> str:
+    """把已过期的一次性设备检查页归一化为站点根页。"""
+    raw = str(url or "").strip()
+    if not raw:
+        return raw
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return raw
+    path = (parts.path or "").lower().rstrip("/")
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower().rstrip(".")
+    # The temporary same-device flow belongs to the account service.  Restrict
+    # normalization to that host so a different site that happens to reuse the
+    # path keeps its intended start page.
+    if (scheme in ("http", "https") and host == "accounts.google.com"
+            and _is_stale_device_check_path(path)):
+        return urlunsplit((scheme, parts.netloc, "/", "", ""))
+    return raw
 
 
 class LaunchError(Exception):
@@ -132,6 +192,22 @@ class LaunchManager:
 
             launch = LaunchConfig(**(profile.get("launch") or {}))
             launch = apply_preset(launch)  # 风控预设参数组合
+            requested_start_url = start_url if start_url is not None else launch.start_url
+            # 统一的系统默认启动首页仅填补环境的 about:blank；环境自身配置的
+            # 独立起始页以及本次 API 临时覆盖项优先，便于批量调整而不破坏
+            # 已保存的登录入口。
+            if start_url is None and requested_start_url in ("", "about:blank"):
+                default_start_url = security.get_default_start_url()
+                if default_start_url and default_start_url != "about:blank":
+                    requested_start_url = default_start_url
+                    log.info("使用系统默认启动首页：%s", default_start_url)
+            normalized_start_url = normalize_start_url(requested_start_url)
+            if normalized_start_url != requested_start_url:
+                log.info("已忽略过期设备检查启动页，回到站点根页：%s", normalized_start_url)
+            # 显式传入归一化后的值，让三种内核和移动端 CDP 会话共用同一
+            # 起始页；仅改本次运行，不覆盖用户保存的代理与登录存储。
+            start_url = normalized_start_url or "about:blank"
+            launch = launch.model_copy(update={"start_url": start_url})
             # 移动端仅 fp-chromium 支持（CDP 设备仿真）：其余内核会把移动端参数
             # 直接透传给 camoufox 启动参数而报错，这里提前给出明确错误
             if (profile.get("target_os") in ("android", "ios")

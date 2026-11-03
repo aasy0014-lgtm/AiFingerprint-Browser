@@ -217,9 +217,13 @@ class SettingsUpdate(BaseModel):
     regenerate_sync_token: bool = False
     # 自动同步：已配置远端后每 30 分钟自动推送（scheduler._auto_sync_if_due 读取）
     auto_sync: Optional[bool] = None
+    # 系统默认启动首页：仅在环境没有配置独立起始页（about:blank）时生效
+    default_start_url: Optional[str] = Field(default=None, max_length=2048)
     # 全局代理：新建环境默认继承、启动时兜底
     global_proxy: Optional[ProxyConfig] = None
     clear_global_proxy: bool = False
+    # 代理供应商刷新地址：只在服务端加密保存，管理端不回显完整 URL
+    proxy_refresh_url: Optional[str] = Field(default=None, max_length=2048)
 
 
 class GlobalProxyApply(BaseModel):
@@ -287,7 +291,11 @@ class ScreenshotRequest(BaseModel):
 
 
 class EvaluateRequest(BaseModel):
-    expression: str = Field(min_length=1, max_length=10000)
+    # The built-in multi-site fingerprint probe is intentionally a single
+    # self-contained expression so it can run in the page's world.  Its
+    # cross-site parsers (CreepJS/ProxyLabs/BrowserScan) are slightly over the
+    # old 10k limit; keep a bounded local-API limit while allowing that probe.
+    expression: str = Field(min_length=1, max_length=20000)
 
 
 # 页面交互请求（所有内核通用）

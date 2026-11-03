@@ -47,7 +47,7 @@ import httpx
 
 from . import db
 from .config import DATA_DIR
-from .launcher import LaunchManager
+from .launcher import LaunchManager, normalize_start_url
 from .mobile_input import is_mobile_target, tap_locator, touch_scroll
 from .proxy_dns import is_lan_target
 
@@ -389,7 +389,8 @@ class TaskEngine:
             return None
 
         if action == "navigate":
-            await page.goto(step["url"], wait_until="domcontentloaded", timeout=timeout)
+            await page.goto(normalize_start_url(step["url"]),
+                            wait_until="domcontentloaded", timeout=timeout)
             entry["detail"] = page.url
             return None
 
@@ -529,7 +530,8 @@ class TaskEngine:
             ctx.pages.append(new_page)
             ctx.current = len(ctx.pages) - 1
             if step.get("url"):
-                await new_page.goto(step["url"], wait_until="domcontentloaded",
+                await new_page.goto(normalize_start_url(step["url"]),
+                                    wait_until="domcontentloaded",
                                     timeout=timeout)
             entry["detail"] = f"新标签页 #{ctx.current} {new_page.url}"
             return None

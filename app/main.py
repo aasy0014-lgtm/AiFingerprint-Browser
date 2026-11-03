@@ -17,6 +17,7 @@ import secrets as _secrets_mod
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,9 +27,10 @@ from fastapi.staticfiles import StaticFiles
 from . import db, matrix, pairing, pw_server, security, sync, transfer
 from .kernels import camoufox_kernel, chromium_kernel, fp_chromium_kernel
 from .config import (APP_NAME, BASE_DIR, DATA_DIR, DETECT_LINKS, PHASE,
-                     PROFILE_ROOT, ROLE_ADMIN, ROLE_OPERATOR, VERSION)
+                     PROFILE_ROOT, PROXY_REFRESH_ALLOWED_HOSTS, ROLE_ADMIN,
+                     ROLE_OPERATOR, VERSION)
 from .fingerprint_engine import create_fingerprint, summarize
-from .launcher import LaunchError, LaunchManager
+from .launcher import LaunchError, LaunchManager, normalize_start_url
 from .mobile_input import is_mobile_profile, tap_locator, touch_scroll
 from .models import (
     BatchStartRequest,
@@ -48,6 +50,7 @@ from .models import (
     ProfileCreate,
     ProfileExportData,
     ProfileUpdate,
+    ProxyConfig,
     ProxyTestRequest,
     ScheduleCreate,
     ScheduleUpdate,
@@ -70,11 +73,16 @@ from .task_engine import TaskEngine, validate_steps
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("fpworkbench")
+# httpx 的 INFO 日志会把完整请求 URL（包括代理供应商 password 查询参数）写入
+# 控制台。管理端只记录自身的脱敏审计信息，因此关闭第三方请求 URL 日志。
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 manager = LaunchManager()
 task_engine = TaskEngine(manager)
 scheduler = Scheduler(task_engine)
 _kernel_health: dict[str, Any] = {"status": "ok", "note": None}
+_proxy_refresh_lock = asyncio.Lock()
 
 
 async def _check_kernel_health():
@@ -469,10 +477,54 @@ async def delete_member(request: Request, member_id: str) -> dict:
     return ok()
 
 
+def _normalize_default_start_url(value: str) -> str:
+    """校验并归一化系统默认启动首页。"""
+    raw = str(value or "").strip() or "about:blank"
+    normalized = normalize_start_url(raw)
+    if normalized == "about:blank":
+        return normalized
+    try:
+        parts = urlsplit(normalized)
+    except ValueError as exc:
+        raise ApiError(400, "启动首页 URL 格式无效") from exc
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ApiError(400, "启动首页仅支持 http(s) URL 或 about:blank")
+    return normalized
+
+
+def _normalize_proxy_refresh_url(value: str) -> str:
+    """校验代理供应商刷新地址，只允许已知 HTTPS/HTTP 主机。
+
+    刷新地址通常携带 session/password 查询参数。这里仅在服务端保存密文，
+    且不允许 URL 中再嵌入 userinfo；响应和审计日志只使用主机与状态码。
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower().rstrip(".")
+        # 访问 .port 会在端口不是数字或超出范围时抛 ValueError。
+        port = parts.port
+    except ValueError as exc:
+        raise ApiError(400, "代理刷新地址格式无效") from exc
+    if parts.scheme.lower() not in ("http", "https") or not host:
+        raise ApiError(400, "代理刷新地址仅支持 http(s) URL")
+    if parts.username or parts.password:
+        raise ApiError(400, "代理刷新地址不得包含账号密码，请放在查询参数中")
+    if host not in PROXY_REFRESH_ALLOWED_HOSTS:
+        allowed = ", ".join(sorted(PROXY_REFRESH_ALLOWED_HOSTS)) or "无"
+        raise ApiError(400, f"代理刷新地址主机不在允许列表（{allowed}）")
+    if port is not None and not (1 <= port <= 65535):
+        raise ApiError(400, "代理刷新地址端口无效")
+    return raw
+
+
 @app.get("/api/v1/settings")
 async def get_settings(request: Request) -> dict:
     settings = security.load_settings()
     gp = security.global_proxy_masked()
+    refresh_host = security.proxy_refresh_host()
     return ok({
         "api_key_enabled": settings["api_key_enabled"],
         "api_key_masked": settings["api_key"][:4] + "****" + settings["api_key"][-4:],
@@ -481,8 +533,12 @@ async def get_settings(request: Request) -> dict:
         "sync_remote_url": settings.get("sync_remote_url", ""),
         "sync_remote_configured": bool(settings.get("sync_remote_token")),
         "auto_sync": settings.get("auto_sync", False),
+        "default_start_url": security.get_default_start_url(),
         "global_proxy": gp,
         "global_proxy_configured": bool(settings.get("global_proxy")),
+        # 绝不向浏览器回传包含 session/password 的完整刷新 URL
+        "proxy_refresh_configured": bool(security.get_proxy_refresh_url()),
+        "proxy_refresh_host": refresh_host,
     })
 
 
@@ -500,6 +556,12 @@ async def update_settings(request: Request, body: SettingsUpdate) -> dict:
         sync_cfg["regenerate_sync_token"] = True
     if body.auto_sync is not None:
         sync_cfg["auto_sync"] = body.auto_sync
+    default_start_url = None
+    if body.default_start_url is not None:
+        default_start_url = _normalize_default_start_url(body.default_start_url)
+    proxy_refresh_url = None
+    if body.proxy_refresh_url is not None:
+        proxy_refresh_url = _normalize_proxy_refresh_url(body.proxy_refresh_url)
 
     # 全局敏感项统一要求管理员：认证开关、同步服务器（开启即暴露 /api/sync/*，
     # 且重新生成令牌会让其它节点的配置全部失效）、远端同步目标、全局代理
@@ -509,27 +571,36 @@ async def update_settings(request: Request, body: SettingsUpdate) -> dict:
             or body.sync_server_enabled is not None or body.regenerate_sync_token
             or body.sync_remote_url is not None or body.sync_remote_token is not None
             or body.auto_sync is not None
-            or body.global_proxy is not None or body.clear_global_proxy):
+            or body.default_start_url is not None
+            or body.global_proxy is not None or body.clear_global_proxy
+            or body.proxy_refresh_url is not None):
         require_admin(request)
 
     settings = security.update_settings(
         api_key_enabled=body.api_key_enabled, regenerate=body.regenerate_key,
         sync=sync_cfg or None,
+        default_start_url=default_start_url,
         global_proxy=body.global_proxy.model_dump() if body.global_proxy else None,
         clear_global_proxy=body.clear_global_proxy,
+        proxy_refresh_url=proxy_refresh_url,
     )
     gp_note = "清除" if body.clear_global_proxy else (
         "更新" if body.global_proxy else "无")
     audit("settings.update", "系统设置",
           f"api_key_enabled={settings['api_key_enabled']} sync={sync_cfg or '无'} "
-          f"global_proxy={gp_note}", member=member)
+          f"default_start_url={default_start_url or '无'} global_proxy={gp_note} "
+          f"proxy_refresh={'清除' if proxy_refresh_url == '' else ('更新' if body.proxy_refresh_url is not None else '无')}",
+          member=member)
     out = {
         "api_key_enabled": settings["api_key_enabled"],
         "api_key": settings["api_key"] if body.regenerate_key else None,
         "sync_token": settings["sync_token"] if body.regenerate_sync_token else None,
         "sync_server_enabled": settings.get("sync_server_enabled"),
+        "default_start_url": security.get_default_start_url(),
         "global_proxy": security.global_proxy_masked(),
         "global_proxy_configured": bool(settings.get("global_proxy")),
+        "proxy_refresh_configured": bool(security.get_proxy_refresh_url()),
+        "proxy_refresh_host": security.proxy_refresh_host(),
     }
     return ok(out)
 
@@ -1169,8 +1240,13 @@ def _require_page(request: Request, profile_id: str):
 @app.post("/api/v1/browser/{profile_id}/navigate")
 async def browser_navigate(request: Request, profile_id: str, body: NavigateRequest) -> dict:
     async with _require_context(request, profile_id) as page:
+        # 账号注册的设备检查链接是一次性 token；RPA/API 直接导航到已保存的
+        # ``samedevice`` 或 ``devicephoneverification`` 地址时，同样会把用户
+        # 带回过期检查页。与启动路径共用同一归一化函数，避免只修复启动而
+        # 通过管理端“导航”再次复现。
+        target_url = normalize_start_url(body.url)
         try:
-            await page.goto(body.url, wait_until="domcontentloaded", timeout=60_000)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
         except Exception as e:
             raise ApiError(500, f"导航失败: {e}")
         return ok({"url": page.url})
@@ -1295,9 +1371,27 @@ async def browser_page_info(request: Request, profile_id: str) -> dict:
         title = await page.title()
         url = page.url
         cookies = await page.context.cookies()
+    # Cookie values are bearer credentials.  Returning them from a local
+    # management endpoint made page_info an accidental credential exfiltration
+    # surface (especially when a profile has visited more than one domain).
+    # Keep the metadata useful for diagnostics while preserving the existing
+    # response keys and never exposing the value itself.
+    cookie_meta = []
+    for cookie in cookies[:100]:
+        value = str(cookie.get("value") or "")
+        cookie_meta.append({
+            "name": cookie.get("name", ""),
+            "value": "<redacted>",
+            "value_length": len(value),
+            "domain": cookie.get("domain", ""),
+            "path": cookie.get("path", "/"),
+            "expires": cookie.get("expires"),
+            "secure": bool(cookie.get("secure")),
+            "httpOnly": bool(cookie.get("httpOnly")),
+            "sameSite": cookie.get("sameSite"),
+        })
     return ok({"title": title, "url": url, "cookie_count": len(cookies),
-               "cookies": [{"name": c["name"], "value": c["value"], "domain": c["domain"],
-                             "path": c["path"]} for c in cookies[:100]]})
+               "cookies": cookie_meta})
 
 
 @app.post("/api/v1/browser/{profile_id}/get_html")
@@ -1622,8 +1716,89 @@ async def audit_logs(request: Request, action: Optional[str] = None, limit: int 
 
 
 @app.post("/api/v1/proxy/test")
-async def proxy_test(body: ProxyTestRequest) -> dict:
+async def proxy_test(request: Request, body: ProxyTestRequest) -> dict:
+    """Test a proxy only for an authenticated administrator.
+
+    The probe makes outbound requests through a caller-supplied proxy.  Leaving
+    this route unauthorised would let an operator (or any caller when API-key
+    mode is enabled but role checks are skipped) turn the workbench into an
+    unbounded network relay/SSRF primitive.  Proxy credentials are still
+    handled by ``ProxyConfig`` and are never included in the response.
+    """
+    require_admin(request)
     return ok(await test_proxy(body.proxy, body.timeout))
+
+
+@app.post("/api/v1/proxy/refresh")
+async def proxy_refresh(request: Request) -> dict:
+    """调用已配置的代理供应商刷新接口。
+
+    刷新 URL 只在服务端以 Fernet 密文保存；该端点和审计日志只返回目标
+    主机、HTTP 状态和（可选的）代理出口 IP，永远不回传查询参数或响应正文。
+    """
+    member = require_admin(request)
+    url = security.get_proxy_refresh_url()
+    if not url:
+        raise ApiError(409, "尚未配置代理刷新地址，请在系统设置中保存")
+
+    # 设置保存时已经做过校验；请求前再次检查，防止旧配置或手工修改 settings
+    # 绕过 SSRF 约束。
+    normalized = _normalize_proxy_refresh_url(url)
+    host = (urlsplit(normalized).hostname or "").lower().rstrip(".")
+    async with _proxy_refresh_lock:
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(
+                trust_env=False,
+                timeout=15,
+                follow_redirects=False,
+            ) as client:
+                response = await client.get(normalized)
+            status_code = response.status_code
+        except Exception as exc:
+            error_type = type(exc).__name__
+            audit("proxy.refresh", host, f"请求失败（{error_type}）", "error", member)
+            return ok({
+                "ok": False,
+                "status_code": None,
+                "host": host,
+                "error": f"刷新请求失败（{error_type}）",
+            })
+
+        succeeded = 200 <= status_code < 300
+        result: dict[str, Any] = {
+            "ok": succeeded,
+            "status_code": status_code,
+            "host": host,
+            # 只返回长度，不返回供应商响应正文（正文可能回显凭据）。
+            "response_bytes": len(response.content),
+            "response_summary": "供应商响应成功" if succeeded
+            else f"刷新接口返回 HTTP {status_code}",
+        }
+        if not succeeded:
+            result["error"] = f"刷新接口返回 HTTP {status_code}"
+
+        # 供应商刷新后顺手验证当前全局代理的出口；探测失败不影响刷新结果。
+        global_proxy = security.get_global_proxy()
+        if succeeded and global_proxy:
+            try:
+                probe = await test_proxy(ProxyConfig.model_validate(global_proxy), timeout=8)
+                if probe.get("ok"):
+                    result.update({
+                        "exit_ip": probe.get("exit_ip"),
+                        "country": probe.get("country"),
+                        "city": probe.get("city"),
+                        "timezone": probe.get("timezone"),
+                    })
+                else:
+                    result["probe_error"] = "出口探测失败"
+            except Exception as exc:
+                result["probe_error"] = f"出口探测失败（{type(exc).__name__}）"
+
+        detail = f"HTTP {status_code}，出口 {result.get('exit_ip') or '未探测'}"
+        audit("proxy.refresh", host, detail, "ok" if succeeded else "error", member)
+        return ok(result)
 
 
 # ---------------------------------------------------------------- 静态资源（最后挂载，避免吞掉 API 路由）

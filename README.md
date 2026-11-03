@@ -82,7 +82,9 @@
 
 - **Webhook 通知**：任务运行结束回调运行结果 JSON（对接企微/钉钉/飞书机器人或自有系统）
 
-- **代理**：HTTP/HTTPS/SOCKS4/SOCKS5，按环境绑定，可选按出口 IP 自动对齐时区/经纬度/语言（geoip），WebRTC IP 自动伪造，一键测试连通性与归属地
+- **代理**：HTTP/HTTPS/SOCKS4/SOCKS5，按环境绑定，可选按出口 IP 自动对齐时区/语言（geoip），WebRTC IP 自动伪造，一键测试连通性与归属地
+
+- **启动首页**：系统设置可配置默认启动首页（`http(s)` 或 `about:blank`）；环境自身的启动首页优先，旧环境也会在下次启动时继承系统默认值
 
 ### 安全与审计
 
@@ -115,6 +117,36 @@ RPA 任务（步骤编辑器、运行记录、截图预览、Webhook）、调度
 开启开发者模式 → 加载已解压的扩展程序 → 选择 `extension` 目录。
 
 ## 快速开始
+
+### macOS 桌面会话启动
+
+如果 macOS 返回 `_RegisterApplication`/`SIGABRT`，请在已登录的桌面会话中双击项目根目录的
+`启动工作台.command`，或在 Terminal.app 执行它。不要从受限自动化终端启动浏览器内核。
+fp-chromium 在 macOS 上会通过 LaunchServices 打开 `Chromium.app`，再接管其 CDP 端口，
+避免直接执行二进制时触发应用注册崩溃。
+
+API/验证脚本使用 `headless=true` 时会绕过 LaunchServices，直接启动内核进程，
+因此不依赖 Finder/WindowServer；桌面可见环境仍使用 LaunchServices。若桌面会话中
+必须由自定义启动器接管进程，可设置 `FPWB_FPCHROMIUM_DIRECT=1`，但该模式要求
+当前进程拥有可用的图形会话。
+
+若管理端是由 IDE/后台服务启动，且 LaunchServices 返回 `kLSNoExecutableErr`，
+工作台会自动把 Chromium 命令转交给当前用户的 Terminal.app；可用
+`FPWB_LAUNCH_TERMINAL=0` 关闭此回退。
+启动可见环境前也会尝试用系统 `lsregister` 刷新当前 `.app` 的记录，以清理替换旧版
+后可能残留的记录。macOS 安装脚本还会给应用包设置工作台专用 Bundle ID，避免与
+`/Applications/Chromium.app` 或其它 Chromium 副本冲突。
+
+项目启动脚本默认在登录桌面中直接接管 bundle 内二进制，以绕过该机失效的
+LaunchServices；也可设置 `FPWB_FPCHROMIUM_DIRECT=0` 强制恢复 LaunchServices。
+直接启动仍要求当前进程处于可用的登录桌面会话。
+
+若需要尝试旧版 macOS ARM 构建，安装脚本支持显式版本并会先备份当前 `.app`：
+`FPWB_FPCHROMIUM_VERSION=142.0.7444.175 bash scripts/install_fpchromium.sh`。
+
+线上还找到一个社区 macOS ARM 构建（Chromium 152）；安装脚本支持通过
+`FPWB_FPCHROMIUM_REPO` 指定仓库，并可用 SHA-256 校验后再替换内核。该构建不是
+adryfish 官方发布，使用前请保留自动备份并自行核对来源。
 
 ### 方式一：一键启动器（推荐）
 
@@ -170,10 +202,18 @@ python -m venv .venv
 | GET/POST/PUT/DELETE | `/api/v1/schedules` / POST `/{id}/run-now`                        | 定时调度 CRUD 与立即运行                                                                     |
 | GET                 | `/api/v1/matrix/report` / POST `/matrix/regenerate`               | 矩阵风控扫描 / 风险指纹重生成                                                                    |
 | GET/POST/DELETE     | `/api/v1/members` / POST `/{id}/toggle`                           | 团队成员管理（admin）                                                                       |
-| GET/POST            | `/api/v1/settings`                                                | 认证 / 同步服务器 / 远端配置                                                                   |
+| GET/POST            | `/api/v1/settings`                                                | 认证 / 同步服务器 / 默认启动首页 / 远端配置                                                     |
 | POST                | `/api/v1/sync/push` `pull`                                        | 推送 / 拉取远端同步服务器                                                                      |
 | GET                 | `/api/v1/audit-logs`                                              | 审计日志                                                                                |
 | POST                | `/api/v1/proxy/test`                                              | 测试代理（body 的 proxy 为 null 时测直连）                                                      |
+
+设置系统默认启动首页（环境 `launch.start_url` 为 `about:blank` 时生效）：
+
+```bash
+curl -X POST http://127.0.0.1:18080/api/v1/settings \
+  -H "Content-Type: application/json" \
+  -d '{"default_start_url":"https://example.com/"}'
+```
 
 创建并启动一个带代理的环境（curl）：
 
