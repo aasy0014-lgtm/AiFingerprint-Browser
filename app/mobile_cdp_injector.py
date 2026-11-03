@@ -9,7 +9,8 @@
   是移动端仿真最常见的穿帮点）
 - Touch Emulation（多点触控，maxTouchPoints）
 - User-Agent / navigator.platform 覆盖
-- 时区（Emulation.setTimezoneOverride，与内核 --timezone 参数对齐 geoip 出口时区）
+- 时区（Emulation.setTimezoneOverride；移动端由本层下发，内核不下发
+  --timezone，否则该覆盖会静默失效）
 - WebGL 非遮蔽渲染器/厂商（内核原生 GPU 伪装不支持 Android/iOS 平台，
   不覆盖会直接暴露宿主机的 GPU 字符串）
 - 补丁函数原生伪装：Function.prototype.toString 对补丁函数返回
@@ -42,14 +43,20 @@ width/height 按视口传、screenWidth/screenHeight 按屏幕传。
 """
 import asyncio
 import contextlib
+import ctypes
+import ctypes.util
+import glob
 import itertools
 import json
 import logging
 import math
+import os
+import plistlib
 import random
 import re
+import struct
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 from urllib.parse import urlsplit
 
 from .mobile_fingerprints import (
@@ -63,11 +70,15 @@ from .mobile_fingerprints import (
     _IOS_WORKER_GLOBAL_DROPS,
     _IOS_WORKER_NAV_PROTO,
     _ANDROID_DOWNLINK_MAX_MBPS,
+    _reduced_android_ua,
+    ANDROID_REDUCED_NAV_PLATFORM,
     _android_tts_voices,
+    _android_display_gamut,
     _codec_capability,
     _add_members,
     _drop_proto_members,
     _generate_mobile_font_subset,
+    _ios_font_visible,
     _IOS_PROTO_ORDER,
     _IOS_PROTO_ORDER_IPAD,
     _ios_av1_capable,
@@ -89,6 +100,38 @@ _IOS_GLOBAL_DROPS = list(_IOS_REMOVE_GLOBALS)
 _ANDROID_GLOBAL_DROPS = list(_ANDROID_REMOVE_GLOBALS)
 _IOS_WORKER_DROPS = list(_IOS_REMOVE_WORKER_GLOBALS)
 _ANDROID_WORKER_DROPS = list(_ANDROID_REMOVE_WORKER_GLOBALS)
+
+# Android Chrome normally hands ``intent://`` links to a system application.
+# The fp-chromium mobile surface runs on the desktop and has no Google Play
+# Services package to receive those intents.  Google's account-registration
+# device check uses exactly such a link for its Continue action, so the visible
+# button otherwise appears inert even though the touch sequence is delivered.
+# Keep the bridge narrow: only account-service intents are converted to their
+# HTTPS web fallback, and the server-side verification/SMS step remains intact.
+_ACCOUNT_INTENT_FALLBACK_JS = r"""(() => {
+  const KEY = '__fpwb_account_intent_fallback__';
+  if (window[KEY]) return;
+  window[KEY] = true;
+  const toWebUrl = (raw) => {
+    if (typeof raw !== 'string' || !raw.startsWith('intent://')) return '';
+    const marker = raw.indexOf('#Intent');
+    const body = (marker >= 0 ? raw.slice(0, marker) : raw).slice(9);
+    const semi = body.indexOf(';');
+    const target = semi >= 0 ? body.slice(0, semi) : body;
+    if (!target.startsWith('accounts.google.com/')) return '';
+    return 'https://' + target;
+  };
+  document.addEventListener('click', (event) => {
+    let node = event.target;
+    while (node && node.nodeType === 1 && node.tagName !== 'A') node = node.parentElement;
+    if (!node || node.tagName !== 'A') return;
+    const next = toWebUrl(node.getAttribute('href') || '');
+    if (!next) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    window.location.assign(next);
+  }, true);
+})()"""
 
 # ---------------- 传感器面（Android 真机口径）----------------
 # 真机 Chrome Android 在注册 devicemotion/deviceorientation 监听后会收到持续
@@ -217,7 +260,9 @@ def _memory_bucket(value: Any) -> Optional[int]:
 # 的 gpu_info 数据（PCI 设备 ID → 架构映射，见 Dawn src/dawn/gpu_info.json）。
 # 依据本仓库内核（148.0.7778.215）二进制内嵌字面量实证：Qualcomm 为代际级
 # "adreno-4xx".."adreno-8xx"（非具体型号）；ARM 为 "midgard"/"bifrost"/
-# "valhall"/"gen-5"；Samsung 为 "rdna-1".."rdna-4"；ImgTec 为 "d-series"。
+# "valhall"/"gen-5"；Samsung 为 "rdna-1".."rdna-4"；ImgTec 为 "d-series"；
+# Huawei Maleoon 驱动按 Dawn 的 vendor/architecture 口径为
+# "huawei"/"maleoon"。
 # 非库内 GPU 返回 None（不伪造口径）。
 _MALI_ARCH = {
     # 5th Gen（Dawn: 0xC/0xD/0xE0 千位段）
@@ -232,6 +277,354 @@ _MALI_ARCH = {
     "G71": "midgard", "G72": "midgard",
 }
 _XCLIPSE_ARCH = {"530": "rdna-2", "920": "rdna-2", "940": "rdna-3"}
+
+# F-93③：宿主上「按名字解析」的字体族清单。真机 Android 一个都没有，但
+# macOS 宿主全部有字形，字体探测（IPHey/mixvisit 的 offsetWidth 比对、
+# creepjs 的 FontFace.load）会逐个命中。
+# 硬编码表漏得多：IPHey 的 181 个名字里只有 62 个在表内，其余（Hiragino
+# Sans W3、Avenir Black、Kefa、本地化韩文/印度文族名）照样命中。改成运行时
+# 枚举，覆盖「按名字能解析」的全部形式：
+#   1. 三个系统字体目录的 name 表（nameID 1/4/6/16/17/21/22/25/263）；
+#   2. com_apple_MobileAsset_Font* 的 plist（FontFamilyName/PostScriptFontName/
+#      LocalizedFamilyNames）；
+#   3. CoreText 的家族名与 PostScript 名（覆盖磁盘上没有文件的字体）；
+#   4. Blink 对 `.` 开头的系统族名先剥 Bidi 隔离符再查表，故补 202D/202C 形式。
+# 合计 5473 个名字、含全部 873 个可解析名，实测 0.43s，按进程记忆化。
+_FONT_NAME_IDS = frozenset({1, 4, 6, 16, 17, 21, 22, 25, 263})
+_FONT_ROOTS = ("/System/Library/Fonts", "/Library/Fonts",
+               "~/Library/Fonts", "/System/Library/AssetsV2")
+# name 表里混着版权/版本/厂商串，探测站点不会拿它们当族名
+_NOT_A_FONT_NAME = (
+    "copyright", "trademark", "version", "http://", "https://", "reserved",
+    "licen", "fonts(tm)", "all rights", "inc.", "author", "project",
+    "designed", "generated", "www.",
+)
+# 这两个是 Blink 的通用族别名，不来自任何字体文件
+_ALIAS_FONT_NAMES = ("system-ui", "BlinkMacSystemFont")
+_HOST_FONT_NAMES: Optional[List[str]] = None
+
+
+def _sfnt_name_strings(data: bytes, offset: int) -> Iterator[str]:
+    """读一个 sfnt 头（TTC 里每个子字体一份）的 name 表中与字体名相关的串。"""
+    try:
+        count = struct.unpack_from(">H", data, offset + 4)[0]
+        name_offset = None
+        for i in range(count):
+            record = offset + 12 + i * 16
+            if data[record:record + 4] == b"name":
+                name_offset = struct.unpack_from(">I", data, record + 8)[0]
+                break
+        if name_offset is None:
+            return
+        _, record_count, strings_offset = struct.unpack_from(">HHH", data, name_offset)
+        for i in range(record_count):
+            record = name_offset + 6 + i * 12
+            platform, _, _, name_id, length, string_offset = struct.unpack_from(
+                ">HHHHHH", data, record)
+            if name_id not in _FONT_NAME_IDS:
+                continue
+            start = name_offset + strings_offset + string_offset
+            raw = data[start:start + length]
+            try:
+                if platform in (0, 3):
+                    text = raw.decode("utf-16-be")
+                elif platform == 1:
+                    text = raw.decode("mac_roman")
+                else:
+                    continue
+            except (UnicodeDecodeError, LookupError):
+                continue
+            text = text.strip()
+            if text:
+                yield text
+    except (struct.error, IndexError):
+        return
+
+
+def _font_name_plausible(text: str) -> bool:
+    if not text or len(text) > 120 or text[0].isdigit():
+        return False
+    lowered = text.lower()
+    if any(bad in lowered for bad in _NOT_A_FONT_NAME):
+        return False
+    return not any(ch in text for ch in ";{}<>")
+
+
+def _coretext_font_names() -> Iterator[str]:
+    """CoreText 报告的家族名与 PostScript 名（覆盖磁盘上没有文件的字体）。"""
+    try:
+        core_foundation = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+        core_text = ctypes.CDLL(ctypes.util.find_library("CoreText"))
+    except (OSError, TypeError):
+        return
+    try:
+        core_foundation.CFStringGetCString.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        core_foundation.CFStringGetCString.restype = ctypes.c_bool
+        core_foundation.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+        core_foundation.CFArrayGetCount.restype = ctypes.c_long
+        core_foundation.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+        core_foundation.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+        core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+        getters = []
+        for name in ("CTFontManagerCopyAvailableFontFamilyNames",
+                     "CTFontManagerCopyAvailablePostScriptNames"):
+            getter = getattr(core_text, name)
+            # 不设 argtypes/restype 会把 64 位指针截成 int，实测段错误
+            getter.argtypes = []
+            getter.restype = ctypes.c_void_p
+            getters.append(getter)
+        for getter in getters:
+            array = getter()
+            if not array:
+                continue
+            try:
+                for i in range(core_foundation.CFArrayGetCount(array)):
+                    value = core_foundation.CFArrayGetValueAtIndex(array, i)
+                    if not value:
+                        continue
+                    buf = ctypes.create_string_buffer(4096)
+                    if core_foundation.CFStringGetCString(
+                            value, buf, 4096, 0x08000100):
+                        text = buf.value.decode("utf-8", "replace")
+                        if text:
+                            yield text
+            finally:
+                core_foundation.CFRelease(array)
+    except (AttributeError, OSError):
+        return
+
+
+def _host_font_names() -> List[str]:
+    """枚举宿主上按名字可解析的全部字体名（进程内记忆化，实测 0.43s）。"""
+    global _HOST_FONT_NAMES
+    if _HOST_FONT_NAMES is not None:
+        return _HOST_FONT_NAMES
+    names = set()
+    for root in _FONT_ROOTS:
+        root = os.path.expanduser(root)
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for filename in filenames:
+                if not filename.lower().endswith((".ttf", ".otf", ".ttc")):
+                    continue
+                try:
+                    with open(os.path.join(dirpath, filename), "rb") as handle:
+                        data = handle.read()
+                except OSError:
+                    continue
+                if data[:4] == b"ttcf":
+                    try:
+                        faces = struct.unpack_from(">I", data, 8)[0]
+                        offsets = struct.unpack_from(">" + "I" * faces, data, 12)
+                    except struct.error:
+                        continue
+                else:
+                    offsets = (0,)
+                for offset in offsets:
+                    names.update(_sfnt_name_strings(data, offset))
+    for path in sorted(glob.glob(
+            "/System/Library/AssetsV2/com_apple_MobileAsset_Font*/*.xml")):
+        try:
+            with open(path, "rb") as handle:
+                plist = plistlib.loads(handle.read())
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            continue
+        for asset in (plist.get("Assets") or []):
+            for key in ("FontInfo4", "FontInfo", "FontInfo2", "FontInfo3"):
+                for info in (asset.get(key) or []):
+                    for field in ("FontFamilyName", "PostScriptFontName"):
+                        value = info.get(field)
+                        if isinstance(value, str) and value.strip():
+                            names.add(value.strip())
+                    localized = info.get("LocalizedFamilyNames") or {}
+                    if isinstance(localized, dict):
+                        for value in localized.values():
+                            if isinstance(value, str) and value.strip():
+                                names.add(value.strip())
+    names.update(_coretext_font_names())
+    plausible = {name for name in names if _font_name_plausible(name)}
+    # Blink 对 `.` 开头的系统族名先剥掉 LRI/PDI 再查表
+    plausible.update(
+        "‭" + name[0] + "‬" + name[1:]
+        for name in [n for n in plausible if n.startswith(".")])
+    plausible.update(_ALIAS_FONT_NAMES)
+    _HOST_FONT_NAMES = sorted(plausible)
+    return _HOST_FONT_NAMES
+
+# F-93③：抢占用的占位字体。真实可加载的 WOFF2（Arial 子集化后剥掉字体名与
+# 版权信息）。配合 unicode-range:U+10FFFF，探测文本（拉丁/数字/标点）在该 face
+# 里没有字形 → 回落到族列表里的下一个族。
+# 必须是**能加载成功**的字体：src 加载失败会让 face 转 error，Blink 随即丢掉
+# 它并按族名回落到宿主本地字形——探测站点只要触发一次字体加载（BrowserLeaks
+# 在页面脚本里就会）就看到真值。实测 url(data:,) 在 about:blank 上有效，在
+# 真实页面上 5 个探针全部回落；换成这份 WOFF2 后同一页面全部落空。
+# range 必须窄到只含「永远不会被渲染的码位」。U+10FFFF 是永久未分配码位，
+# 因此这个 face 对任何真实字符都不生效，度量与「族根本不存在」逐像素相同。
+# 早先用的 U+E000-10FFFF 会把整个私用区算进来：BrowserLeaks 的度量串里嵌了
+# 一个不可见的 U+F003，该码位落到 shadow 的 .notdef（0.75em）而不是缺席族
+# 的 LastResort（1em），每字符差 32px——同族各名字量出一致的 4392 而不是
+# 缺席基线 4424，于是 900 个名字被判「存在」。U+E000 单码位也不行：私用区
+# 字符会真被渲染成 shadow 的字形（U+F003 量出 384 而非 512）。
+_SHADOW_FONT_RANGE = "U+10FFFF"
+_SHADOW_FONT_B64 = (
+    "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"
+)
+
+# F-94（增量）：iOS 17+ 的 WebKit 对透明 8×8 空画布可以返回合法 AVIF，
+# 而 fp-chromium 的同步 Canvas API 没有 AVIF 编码器，只会按规范回退 PNG。
+# 这里保留一个由 pillow-avif-plugin 编出的真实 AVIF 作为**空画布能力探针**
+# 的最小覆盖；非空画布继续走原生 PNG，绝不把 PNG payload 冒充成 AVIF。
+# 这不是通用 AVIF 编码器，任意绘制内容仍属于 F-94 的未覆盖面。
+_BLANK_AVIF_8X8_B64 = (
+    'AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUIAAAGGbWV0YQAAAAAAAAAhaGRscgAAAAAA'
+    'AAAAcGljdAAAAAAAAAAAAAAAAAAAAAAOcGl0bQAAAAAAAQAAACxpbG9jAAAAAEQAAAIAAQAAAAEA'
+    'AAHBAAAAFwACAAAAAQAAAa4AAAATAAAAQmlpbmYAAAAAAAIAAAAaaW5mZQIAAAAAAQAAYXYwMUNv'
+    'bG9yAAAAABppbmZlAgAAAAACAABhdjAxQWxwaGEAAAAAGmlyZWYAAAAAAAAADmF1eGwAAgABAAEA'
+    'AADDaXBycAAAAJ1pcGNvAAAAFGlzcGUAAAAAAAAACAAAAAgAAAAQcGl4aQAAAAADCAgIAAAADGF2'
+    'MUOBAAwAAAAAE2NvbHJuY2x4AAEADQAGgAAAAA5waXhpAAAAAAEIAAAADGF2MUOBABwAAAAAOGF1'
+    'eEMAAAAAdXJuOm1wZWc6bXBlZ0I6Y2ljcDpzeXN0ZW1zOmF1eGlsaWFyeTphbHBoYQAAAAAeaXBt'
+    'YQAAAAAAAAACAAEEAQKDBAACBAEFhgcAAAAybWRhdBIACgUYCL9hUDIIEAAAGOFCchASAAoIGAi/'
+    'YICGg0IyCRAAAAAHyCTGYg=='
+)
+
+
+def _host_font_block_list(declared: Any, *, visible=None) -> List[str]:
+    """返回需要在页面侧用同名 @font-face 抢占的族名（F-93③）。
+
+    `declared` 是设备声明的字体子集（指纹里的 `fonts`）。声明里有的族保留
+    宿主字形——真机确实有这个字体，屏蔽会把「有」变成「无」，反而造假。
+
+    `visible` 是真机可见性判据：给了就按它判（iOS 传 `_ios_font_visible`，
+    覆盖宿主枚举出的 PostScript 名与 Apple 族名不同构的情况）；不给则退回
+    「声明表里有就放行」的老口径（Android，AOSP 族名与宿主枚举同构）。
+    """
+    if visible is not None:
+        return [f for f in _host_font_names() if not visible(f)]
+    allow = {str(f).strip().lower() for f in (declared or []) if str(f).strip()}
+    return [f for f in _host_font_names() if f.lower() not in allow]
 
 
 def _android_webgpu(renderer: str) -> Optional[Dict[str, str]]:
@@ -253,6 +646,12 @@ def _android_webgpu(renderer: str) -> Optional[Dict[str, str]]:
         m = re.search(r"Xclipse\s*(\d{3,4})", renderer)
         if m and m.group(1) in _XCLIPSE_ARCH:
             return {"vendor": "samsung", "architecture": _XCLIPSE_ARCH[m.group(1)]}
+    # Kirin 9000S1/9010/9020 的公开 WebGL 字符串为
+    # "ANGLE (HUAWEI, Maleoon 910, OpenGL ES 3.2)"。Dawn 的 gpu_info
+    # 将 Huawei PCI vendor 的这组设备统一归为 "maleoon"，不按 910
+    # 具体代号拆分；WebGL 与 WebGPU 必须保持同一厂商/架构口径。
+    if re.search(r"\bMaleoon\b", renderer, flags=re.IGNORECASE):
+        return {"vendor": "huawei", "architecture": "maleoon"}
     if "PowerVR" in renderer:
         if "DXT" in renderer or "D-Series" in renderer:
             return {"vendor": "img-tec", "architecture": "d-series"}
@@ -364,8 +763,16 @@ _IOS_MIN_VERSIONS = {
     #   PerformanceEventTiming 为 26.2；Origin 为 26.5。
     "WebTransport": (26, 4), "WebTransportBidirectionalStream": (26, 4),
     "WebTransportDatagramDuplexStream": (26, 4), "WebTransportError": (26, 4),
+    "WebTransportReceiveStream": (26, 4), "WebTransportSendStream": (26, 4),
+    "WebTransportSendGroup": (26, 4), "WebTransportDatagramsWritable": (26, 4),
     "ReadableByteStreamController": (26, 4),
     "ReadableStreamBYOBReader": (26, 4), "ReadableStreamBYOBRequest": (26, 4),
+    # CSS Typed OM descriptor interfaces landed with the Safari 26 family.
+    # Chromium exposes these constructors on every profile, so older iOS
+    # profiles (18.x and below) otherwise leak a future-only global even though
+    # the rest of the CSS surface is already version-gated.
+    "CSSFontFaceDescriptors": (26,), "CSSPageDescriptors": (26,),
+    "CSSStyleProperties": (26,),
     "Navigation": (26, 2), "NavigateEvent": (26, 2),
     "NavigationActivation": (26, 2),
     "NavigationCurrentEntryChangeEvent": (26, 2),
@@ -501,17 +908,75 @@ def _ios_add_members_gated(add: Dict[str, Any], os_version: Any) -> Dict[str, An
     return add
 
 
+_LOCALE_LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,3}$")
+_LOCALE_SCRIPT_RE = re.compile(r"^[A-Za-z]{4}$")
+_LOCALE_REGION_RE = re.compile(r"^(?:[A-Za-z]{2}|\d{3})$")
+
+
+def _normalize_locale(locale: Any) -> str:
+    """规范化运行期 locale，供 Intl / Navigator / TTS 共用。
+
+    启动配置可能来自 geoip、管理端输入或旧存档，既有 ``en_US`` 也有
+    BCP-47 的 ``en-US`` 写法。Chromium 的 ``Emulation.setLocaleOverride``
+    接受 BCP-47 标签；如果不先收敛，``Intl`` 可能得到 ``en-US``，而
+    ``navigator.language`` 却保留 ``en_US``，登录风控会把两者视为环境拼接。
+    非法/空值返回空串，由调用方保持档案原值，不覆盖宿主默认语言。
+    """
+    raw = str(locale or "").strip().replace("_", "-")
+    if not raw:
+        return ""
+    parts = [p for p in raw.split("-") if p]
+    if not parts or not _LOCALE_LANGUAGE_RE.fullmatch(parts[0]):
+        return ""
+    if any(not re.fullmatch(r"[A-Za-z0-9]+", part) for part in parts):
+        return ""
+    out = [parts[0].lower()]
+    for part in parts[1:]:
+        if _LOCALE_SCRIPT_RE.fullmatch(part):
+            out.append(part.title())
+        elif _LOCALE_REGION_RE.fullmatch(part):
+            out.append(part.upper() if part.isalpha() else part)
+        else:
+            # Unicode 扩展/私有区段统一小写；不丢弃它们，避免把用户显式
+            # 选择的 hour-cycle / calendar 等偏好悄悄改掉。
+            out.append(part.lower())
+    return "-".join(out)
+
+
+def _locale_languages(locale: str) -> List[str]:
+    """返回与 Chrome 真机首选语言形态一致的短列表（locale + 语族）。"""
+    tag = _normalize_locale(locale)
+    if not tag:
+        return []
+    base = tag.split("-", 1)[0]
+    return [tag] if tag == base else [tag, base]
+
+
 def derive_spec(fingerprint: dict, target_os: str,
                 locale: str = "") -> Dict[str, Any]:
     """从存储的移动端 fingerprint 提取运行期仿真规格（兼容旧版结构）。
 
-    `locale` 只影响 TTS 默认语音的语族（F-161）：真机 Android 的默认语音
-    跟随系统语言，而系统语言由 geoip 在运行期决定，存储指纹里没有。
+    `locale` 是运行期属地语言（由 geoip/启动配置决定）。它同时收敛
+    `Intl`、`navigator.language(s)` 与 Android TTS 默认语音；空值保持档案
+    中的语言字段，兼容旧存档。
     """
     fp = fingerprint or {}
     nav = fp.get("navigator") or {}
     screen = fp.get("screen") or {}
     extra = dict(fp.get("mobileExtra") or {})
+
+    runtime_locale = _normalize_locale(locale)
+    if runtime_locale:
+        runtime_language = runtime_locale
+        runtime_languages = _locale_languages(runtime_locale)
+    else:
+        # 无运行期 locale 时不擅自改写旧档案。这里只做类型收敛，避免把
+        # None/字符串误当作可迭代对象塞入 JSON payload。
+        runtime_language = str(nav.get("language") or "")
+        stored_languages = nav.get("languages")
+        runtime_languages = (list(stored_languages)
+                             if isinstance(stored_languages, (list, tuple))
+                             else [])
 
     # F-140：UA 与 osVersion 脱钩时以 UA 为准。产品生成流内部一致，脱钩只
     # 发生在生成之后的变更路径（存量档案迁移、DB 手工编辑）；不改存档，
@@ -520,6 +985,14 @@ def derive_spec(fingerprint: dict, target_os: str,
         _ua_ver = _ua_ios_version(nav.get("userAgent"))
         if _ua_ver and _parse_ios_version(extra.get("osVersion")) != _ua_ver:
             extra["osVersion"] = ".".join(str(p) for p in _ua_ver)
+
+    # Android 的 UA 缩减形态同理，但方向相反：存量档案里存的是缩减前串
+    # （`Linux; Android 16; <Build.MODEL>`），运行期必须收敛成真机口径
+    # `Linux; Android 10; K`——机型与系统版本改由 UA-CH 两条高熵头承载。
+    # 只改运行期取值，不回写存档（与 F-140 同处置）。
+    ua = str(nav.get("userAgent") or "")
+    if target_os == "android":
+        ua = _reduced_android_ua(ua)
 
     dpr = float(screen.get("devicePixelRatio") or 1.0) or 1.0
     phys_w = int(screen.get("width") or 0)
@@ -691,6 +1164,14 @@ def derive_spec(fingerprint: dict, target_os: str,
         # av01='probably' 是假阳性（F-148），AV1 机型上的 '' 是假阴性。
         merged['video/mp4; codecs="av01.0.05m.08"'] = (
             "probably" if av1_capable else "")
+        # ogg/webm 同理：旧档案的表把整族钉成 ''（当时「iOS 全版本无 ogg」
+        # 还是对的）。现在由 __cptIos 的版本门控 + 算法回答，覆盖层里这两族
+        # 的陈旧值必须剔掉，否则 18.4+ 的机型照样答假。
+        for _stale in [k for k in merged
+                       if k.split(';')[0].strip() in (
+                           'audio/ogg', 'application/ogg', 'video/ogg',
+                           'audio/webm', 'video/webm')]:
+            del merged[_stale]
         codec_capability = merged
 
     # WebGL 参数上限 / 扩展集：宿主是 Apple M 系列（16384 上限 + 桌面专属
@@ -732,6 +1213,19 @@ def derive_spec(fingerprint: dict, target_os: str,
         or _device_type == "tablet"
     )
 
+    # F-99：`color-gamut` 由显示面板决定，不能从宿主屏幕或 GPU 推断。
+    # iOS 档按既有全系 Display-P3 口径；Android 优先读可选的
+    # mobileExtra.displayGamut（兼容 snake_case），缺失时只对已有 Pixel 8
+    # 兜底事实下发 P3，其余保守落到 sRGB。
+    _gamut_probe = {
+        "model": extra.get("model"),
+        "market_name": extra.get("marketName"),
+        "display_gamut": extra.get("displayGamut", extra.get("display_gamut")),
+    }
+    display_gamut = (
+        "p3" if target_os == "ios" else _android_display_gamut(_gamut_probe)
+    )
+
     # iOS 安全区：非 cover 页面在运行期置 0（见 _sync_safe_area）
     safe_area = None
     if target_os == "ios":
@@ -746,8 +1240,13 @@ def derive_spec(fingerprint: dict, target_os: str,
             str(extra.get("model") or ""), str(extra.get("marketName") or ""))
 
     return {
-        "ua": str(nav.get("userAgent") or ""),
-        "platform": str(nav.get("platform") or ""),
+        "ua": ua,
+        # Android 的 navigator.platform 同属 UA 缩减范围，被 Blink 硬编码为
+        # "Linux armv81"（navigator_base.cc GetReducedNavigatorPlatform()）。
+        # 存量档案里可能存着旧值（aarch64 / armv8l / 早先的 armv81），一律
+        # 收敛，避免「UA 已缩减、platform 仍按 ABI」的跨面矛盾。
+        "platform": (ANDROID_REDUCED_NAV_PLATFORM if target_os == "android"
+                     else str(nav.get("platform") or "")),
         "vendor": str(nav.get("vendor") or ""),
         "maxTouchPoints": int(nav.get("maxTouchPoints") or 5),
         "deviceMemory": device_memory,
@@ -768,7 +1267,13 @@ def derive_spec(fingerprint: dict, target_os: str,
         "android": target_os == "android",
         # F-45：Android 的 TTS 语音表（iOS 侧为空表 → getVoices() 返回 []）
         # F-161：默认语音按 locale 选语族，避免与 Intl 的 locale 冲突
-        "androidVoices": _android_tts_voices(target_os, locale),
+        "androidVoices": _android_tts_voices(target_os, runtime_locale),
+        # 语言面必须与 Emulation.setLocaleOverride 的运行期 locale 同源；
+        # 否则海外出口会出现 Intl=en-US、navigator.languages=zh-CN 的
+        # 交叉矛盾。空 locale 时保留档案值（兼容历史指纹）。
+        "locale": runtime_locale,
+        "language": runtime_language,
+        "languages": runtime_languages,
         "iosChrome": ios_chrome,
         "webgl": webgl,
         "webgpu": webgpu,
@@ -779,6 +1284,12 @@ def derive_spec(fingerprint: dict, target_os: str,
         "dpr": dpr,
         "safeArea": safe_area,
         "dynamicRangeHigh": dynamic_range_high,
+        "displayGamut": display_gamut,
+        # F-94：iOS 17+ WebKit 有 AVIF canvas 编码。Blink 没有同步 AVIF
+        # 编码器，只对透明 8×8 空画布的能力探针提供合法容器（见
+        # _BLANK_AVIF_8X8_B64）；任意绘制内容仍走原生 PNG，避免伪造 payload。
+        "canvasAvif": bool(target_os == "ios" and _ios_ver is not None
+                           and _ios_ver >= (17,)),
         # F-44：自然方向是否横屏（决定 portrait-primary 的 angle 是 90 还是 0）
         "naturalLandscape": natural_landscape,
         # F-26/F-27：接口原型级成员差集（删除清单）
@@ -802,14 +1313,32 @@ def derive_spec(fingerprint: dict, target_os: str,
             _add_members(target_os, extra.get("osVersion")),
             extra.get("osVersion") if target_os == "ios" else None),
         "av1": av1_capable,
+        # F-199：iOS 17.4 起 AVFoundation 才有 WebM 解码器（caniuse webm 的
+        # ios_saf 在 17.3 仍属「仅 WebRTC 内 VP8/VP9」的 a 档，17.4 转 y）。
+        # 之前 canPlayType 一律按「iOS 无 webm」写死，17.4+ 的 profile 会被
+        # 一行 canPlayType('video/webm; codecs="vp9"') 判成「不是 iOS」。
+        "webm": (target_os == "ios"
+                 and (_parse_ios_version(extra.get("osVersion")) or ())
+                 >= (17, 4)),
+        # iOS 18.4 起 WebKit 支持 Ogg 容器（vorbis/opus/flac）。WebKit 自家
+        # Safari 18.4 发布说明（webkit.org/blog/16495）逐字点名「iOS 18.4」；
+        # caniuse ogg-vorbis 的 ios_saf 在 17.4–18.3 是 a 档（「支持 Vorbis
+        # 编解码器但不支持 Ogg 容器」），18.4 转 y。之前按「iOS 全版本无
+        # ogg」写死，18.4+ 的 profile 一行 canPlayType('audio/ogg') 即可判假。
+        # 与 webm 同源但阈值不同——两者的解码器是不同代次落地的。
+        "ogg": (target_os == "ios" and _ios_ver is not None
+                and _ios_ver >= (18, 4)),
         # F-140：机型类别显式下发。元素级全屏的 iPad 保留路径原先只读
         # platform/UA，与 deviceType 脱钩时（存量档案迁移、DB 手工编辑）
         # 会把 iPad 误判成 iPhone 而整块抹掉。
         "deviceType": _device_type,
-        # F-142：MSE 真值表的两个运行期开关。`ios` 决定 WebM 的 VP9/ogg 分支
-        # （iOS 只有硬件 VP9），`av1` 决定 av01-in-webm 的机型门控；其余分支
-        # 与平台无关。不能复用 codecCapability——那是 canPlayType 表。
-        "mseTypes": {"ios": target_os == "ios", "av1": av1_capable},
+        # F-142：MSE 真值表的运行期开关。`ios` 决定 WebM 的 VP9 分支（iOS
+        # 只有硬件 VP9），`av1` 决定 av01-in-webm 的机型门控，`ogg` 决定
+        # Ogg 容器分支（18.4 阈值）；其余分支与平台无关。不能复用
+        # codecCapability——那是 canPlayType 表。
+        "mseTypes": {"ios": target_os == "ios", "av1": av1_capable,
+                     "ogg": (target_os == "ios" and _ios_ver is not None
+                             and _ios_ver >= (18, 4))},
         # F-89：CSS 白名单的版本门控（低于 profile 版本的属性一律 false）
         "cssGate": (_css_version_gated(extra.get("osVersion"))
                     if target_os == "ios" else []),
@@ -819,6 +1348,25 @@ def derive_spec(fingerprint: dict, target_os: str,
         # isFontOSBad 据此判定「Android UA 却是 Apple 字体」记 bold。
         # 注入器据此白名单裁剪 local() 源。
         "fonts": [str(f) for f in (fp.get("fonts") or []) if str(f)],
+        # F-93③：宿主 macOS 的字体族按名字解析，绕过 Page.setFontFamilies
+        # 的通用族映射——`font-family: Menlo` 在 Android 身份下照样量到
+        # 宿主真实字形宽度。mixvisit（IPHey 的引擎）的字体探测把
+        # `'<族名>',<通用族>` 三组 span 的 offsetWidth/offsetHeight 与纯
+        # 通用族比对，命中即报该字体存在：Android 上传体因此列出 8 个
+        # macOS 专有族（Helvetica Neue/Menlo/Monaco/Apple Color Emoji/
+        # Avenir/Geneva/Lucida Grande/Apple SD Gothic Neo），与主文档声明的
+        # Android 机型直接矛盾 → Browser 卡「inconsistent browser
+        # fingerprint」。用同名的空 @font-face 抢占族名（src 指向空
+        # data URL），宿主字体在该族名下不再参与解析，探测全部落空。
+        # iOS 以前不抢占，理由是「设备字体表本就含 Helvetica Neue/Menlo/
+        # Monaco，真机确实可见」。Monaco 那条是错的：Apple 把它标成
+        # `downloadable iOS`，iPhone 出厂没有，而宿主 macOS 有——量到它
+        # 就是宿主字形。判据换成「宿主有、设备没有」，白名单取 Apple 的
+        # system font / document support 族 + 手列的 CJK 族
+        # （见 mobile_fingerprints._ios_font_visible）。
+        "fontBlock": _host_font_block_list(
+            fp.get("fonts") or [],
+            visible=_ios_font_visible if target_os == "ios" else None),
     }
 
 
@@ -832,17 +1380,151 @@ def sec_ch_headers(ua_ch: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+# 默认请求头按引擎分叉：内核是 Blink，导航请求的 Accept / Accept-Encoding
+# 由网络栈按 Chromium 口径拼装，直接照发就会在 iOS 档上留下
+# `application/signed-exchange;v=b3`、`image/avif`、`gzip, deflate, br, zstd`
+# 这些 Safari 从不发送的取值（amiunique 的 HTTP HEADERS 段直接判为 Chrome）。
+# 取值来自真机实测（/tmp/f856 明文、/tmp/f866 tls.peet.ws 的 h2 HEADERS 帧）：
+#   Safari iOS  : text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+#                 image/webp,image/avif,image/jxl,image/heic,image/heic-sequence,
+#                 video/*;q=0.8,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5
+#                 gzip, deflate, br（明文 HTTP 只有 gzip, deflate）
+#   Chrome And. : 与 Blink 默认一致，无需改写
+# Accept-Encoding 用 Network.setExtraHTTPHeaders 覆盖即可；Accept 必须在
+# Fetch 请求阶段重写——它在 extra-headers 合并之后才由网络栈写入，覆盖不住
+# （实测 /tmp/f862 的 B 组）。
+_SAFARI_DOCUMENT_ACCEPT = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+_SAFARI_IMAGE_ACCEPT = (
+    "image/webp,image/avif,image/jxl,image/heic,image/heic-sequence,"
+    "video/*;q=0.8,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
+# 只有这两个资源类型在 Safari 与 Blink 之间取值不同：样式表
+# （text/css,*/*;q=0.1）、脚本/字体/取数（*/*）逐字相同，不必拦。
+# 资源类型到 Safari Accept 的映射；未列出的类型不拦（取值本就一致）。
+_SAFARI_ACCEPT_BY_TYPE = {
+    "Document": _SAFARI_DOCUMENT_ACCEPT,
+    "Image": _SAFARI_IMAGE_ACCEPT,
+}
+
+
+# 页面级 auto-attach 的目标过滤：只放 iframe，不放任何 worker。
+#
+# Service Worker 目标会被**根会话与页面会话同时**投递（实测两路各收到
+# 一次 attachedToTarget，waitForDebuggerOnStart 都把目标暂停）。同一目标
+# 上挂着两个暂停会话时，该目标的 Runtime/Debugger 域整条挂死——命令永不
+# 应答（实测 Runtime.enable / Runtime.evaluate / Debugger.enable 全部
+# 超时 20s，只有 runIfWaitingForDebugger 有应答），于是页面里任何
+# navigator.serviceWorker.ready 都永远不 resolve，Worker 补丁也注不进去。
+# 把 Service Worker 交给根会话独占后，单会话通道完全正常（实测
+# Runtime.evaluate 1-2ms 返回）。
+#
+# Dedicated Worker 只被页面会话投递、Shared Worker 只被根会话投递，两路
+# 都不重复，故 dedicated 仍需由页面会话接管（放行 worker，排 service_worker）。
+_PAGE_AUTO_ATTACH_FILTER = [
+    {"type": "iframe", "exclude": False},
+    {"type": "worker", "exclude": False},
+    {"type": "shared_worker", "exclude": True},
+    {"type": "service_worker", "exclude": True},
+]
+
+
+def safari_wire_headers(headers: Dict[str, str], resource_type: str, *,
+                        locale: str = "", ios: bool = True) -> Dict[str, str]:
+    """把 Blink 口径的请求头改写成真机口径。
+
+    iOS 档（Safari 与 CriOS 都是系统 WebKit 网络栈）三件事全做：
+    1. Accept：只改取值真正不同的两个资源类型。
+    2. UA-CH / Client Hints：内核（Blink 152）对**每一个**请求都发全套
+       `Sec-CH-UA*` 与 DPR/Device-Memory/Viewport-*（实测 /tmp/fb04/barch.py
+       的首请求就有 15 个头，连 `sec-ch-ua-platform-version` 都在），而真机
+       Safari/CriOS 一个都不发——WKWebView 网络栈根本没有这套提示。注入层
+       对 iOS 明确关掉了 Accept-CH 回送，但关的只是「回送」，发头的是内核
+       网络栈本身，必须在请求阶段删掉。
+    3. Accept-Language：见 accept_language_header()。
+
+    Android 档只做第 3 件：Blink 的 UA-CH 头本来就是真机 Chrome 的行为，
+    Accept 取值也与真机一致，都不能动。
+
+    Sec-Fetch-User 在 Blink 里由导航发起方计算后直接写入网络层，extra-headers
+    覆盖、Fetch 阶段删除/置空三条路都拦不住（实测 /tmp/f867 四组取值全为
+    `?1`），暂不可改。
+    """
+    out = dict(headers)
+    changed = False
+    for name in list(out):
+        low = name.lower()
+        if ios and (low.startswith("sec-ch-") or low in _CLIENT_HINT_LEGACY_HEADERS):
+            del out[name]
+            changed = True
+        elif low == "accept-language" and locale:
+            out[name] = accept_language_header(locale)
+            changed = True
+    if ios:
+        accept = _SAFARI_ACCEPT_BY_TYPE.get(resource_type)
+        if accept is not None:
+            for name in list(out):
+                if name.lower() == "accept":
+                    out[name] = accept
+                    changed = True
+    return out if changed else headers
+
+
+def accept_language_header(locale: str) -> str:
+    """locale → 真机形态的 Accept-Language（主语言全权重 + 语族 q=0.9）。
+
+    两引擎实测一致：Chrome 156 与 WebKit 26.6 都发
+    `zh-CN,zh;q=0.9` / `en-US,en;q=0.9`，与 `navigator.languages`
+    （`[zh-CN, zh]` / `[en-US, en]`）逐段对应。单段 locale（`en`）只发
+    一段、无 q 值。
+
+    内核走 `Emulation.setUserAgentOverride.acceptLanguage` 只发**裸单值**
+    （实测传入 `en-US,en;q=0.9` 后头仍是 `en-US`，CDP 把列表归一掉了），
+    而 `navigator.languages` 是两段——HTTP 与 JS 在同一份语言列表上自相
+    矛盾，BrowserScan 的 `isLanguageCorrect` 正是拿 uaLang/headerLang/intlLang
+    三者对拍。故必须在请求阶段改写，不能只靠 UA 覆盖。
+    """
+    langs = _locale_languages(locale)
+    if not langs:
+        return locale
+    if len(langs) == 1:
+        return langs[0]
+    return f"{langs[0]},{langs[1]};q=0.9"
+
+
+# 不带 Sec-CH- 前缀的旧式 Client Hints（Chrome 在 Accept-CH 声明后照样发，
+# Safari 不发；DPR/Viewport-* 尤其容易被 BrowserLeaks 的 HTTP 段抓到）。
+_CLIENT_HINT_LEGACY_HEADERS = frozenset({
+    "dpr", "device-memory", "viewport-width", "viewport-height", "rtt",
+    "downlink", "ect",
+})
+
+
 # 高熵提示：仅当站点在响应里回 Accept-CH 声明后才发送（真机 Chrome 行为）。
 # 内核既不发送低熵头也不处理 Accept-CH，本层在 Fetch 域里按「源」精确回送。
 _HIGH_ENTROPY_HINTS = frozenset({
     "sec-ch-ua-model", "sec-ch-ua-platform-version", "sec-ch-ua-arch",
     "sec-ch-ua-bitness", "sec-ch-ua-full-version", "sec-ch-ua-full-version-list",
     "sec-ch-ua-wow64", "sec-ch-ua-form-factors",
+    # 视口 / DPR / 内存提示同样由 Accept-CH 触发。桌面内核会把宿主值
+    # （DPR=2、Device-Memory=16）写进网络层，而页面 JS 已按移动规格暴露
+    # 3.5 / 8；只补 UA-CH 会留下 HTTP ↔ JS 的一行矛盾。
+    "dpr", "sec-ch-dpr", "device-memory", "sec-ch-device-memory",
+    "viewport-width", "sec-ch-viewport-width",
+    "viewport-height", "sec-ch-viewport-height",
 })
 
 
-def high_entropy_headers(ua_ch: Dict[str, Any], hints: set) -> Dict[str, str]:
-    """按站点声明的高熵提示构造头值（与 JS UA-CH 同一数据源，保证头/JS 一致）。"""
+def high_entropy_headers(ua_ch: Dict[str, Any], hints: set, *,
+                         dpr: Any = None, device_memory: Any = None,
+                         viewport_width: Any = None,
+                         viewport_height: Any = None) -> Dict[str, str]:
+    """按站点声明的提示构造头值（与 JS / CDP 移动规格同一数据源）。
+
+    ``DPR``、``Device-Memory`` 与 ``Viewport-*`` 是历史上不带 ``Sec-CH-``
+    前缀的 Client Hints；较新的站点会声明带前缀的别名。两种名字都返回，
+    由调用方做大小写不敏感替换，避免 Chromium 网络层遗留宿主值或产生
+    同名重复头。
+    """
     out: Dict[str, str] = {}
     if "sec-ch-ua-model" in hints:
         out["Sec-CH-UA-Model"] = f'"{ua_ch.get("model") or ""}"'
@@ -864,6 +1546,48 @@ def high_entropy_headers(ua_ch: Dict[str, Any], hints: set) -> Dict[str, str]:
         ff = ua_ch.get("formFactors") or []
         if ff:
             out["Sec-CH-UA-Form-Factors"] = ", ".join(f'"{v}"' for v in ff)
+    # Accept-CH token 的比较在 _on_fetch_paused 中已统一为小写；同一 token
+    # 只需生成对应的规范头名。部分老站点把前缀/非前缀两者都声明，两个
+    # 变体一起覆盖才不会留下默认宿主值。
+    if "dpr" in hints or "sec-ch-dpr" in hints:
+        try:
+            value = str(float(dpr)) if dpr is not None else ""
+            # 3.0 应按 HTTP 数值语法写成 3，避免站点的严格比较失败。
+            if value.endswith(".0"):
+                value = value[:-2]
+        except (TypeError, ValueError):
+            value = ""
+        if value:
+            # Chromium 148 仍可能把旧/新两个变体一起发出；只声明其中一个
+            # 时也要同步覆盖另一个已经存在的网络层字段，避免宿主值残留。
+            out["DPR"] = value
+            out["Sec-CH-DPR"] = value
+    if "device-memory" in hints or "sec-ch-device-memory" in hints:
+        try:
+            value = str(float(device_memory)) if device_memory is not None else ""
+            if value.endswith(".0"):
+                value = value[:-2]
+        except (TypeError, ValueError):
+            value = ""
+        if value:
+            out["Device-Memory"] = value
+            out["Sec-CH-Device-Memory"] = value
+    if "viewport-width" in hints or "sec-ch-viewport-width" in hints:
+        try:
+            value = str(int(viewport_width))
+        except (TypeError, ValueError):
+            value = ""
+        if value:
+            out["Viewport-Width"] = value
+            out["Sec-CH-Viewport-Width"] = value
+    if "viewport-height" in hints or "sec-ch-viewport-height" in hints:
+        try:
+            value = str(int(viewport_height))
+        except (TypeError, ValueError):
+            value = ""
+        if value:
+            out["Viewport-Height"] = value
+            out["Sec-CH-Viewport-Height"] = value
     return out
 
 
@@ -1166,57 +1890,96 @@ _MSE_SUPPORT_SRC = r"""function __mseSupports(raw, opt) {
   function aacCodecOk(c) { return mp4aOk(c); }
   function mpegAudioCodecOk(c) { return c === 'mp3'; }
   // ---- WebM（容器忽略大小写，codec 区分大小写）----
+  // 与 _CPT_IOS_SRC 的 vpOk 同源同语义（parseVPCodecParameters +
+  // isVPCodecConfigurationRecordSupported），但两处代码独立，禁止互推：
+  // canPlayType 走 MIMETypeCache/AVFoundation，MSE 走 SourceBufferParser，
+  // 两者在其它编解码器上本就矛盾（清单 §49 F-144）。
+  var VP_LEVELS = [10, 11, 20, 21, 30, 31, 40, 41, 50, 51, 52, 60, 61, 62];
+  var VP_PRIMARIES = [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 22];
+  var VP_TRANSFER = [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
+  var VP_MATRIX = [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+  var VP_WS = ' \t\n\r\f\v';
+  // WTF::parseInteger<uint8_t>（StringToIntegerConversion.h:60-101）：允许
+  // isUnicodeCompatibleASCIIWhitespace 的前导/尾随空白与至多一个 '+'，
+  // 但 uint8_t 无符号故 '-' 不被跳过；无数字、有尾随垃圾、溢出 >255 皆失败。
+  function vpInt(str) {
+    var a = 0, b = str.length;
+    while (a < b && VP_WS.indexOf(str.charAt(a)) !== -1) { a++; }
+    if (a < b && str.charAt(a) === '+') { a++; }
+    var start = a, v = 0;
+    while (a < b && str.charAt(a) >= '0' && str.charAt(a) <= '9') {
+      v = v * 10 + (str.charCodeAt(a) - 48);
+      if (v > 255) { return null; }
+      a++;
+    }
+    if (a === start) { return null; }
+    while (a < b && VP_WS.indexOf(str.charAt(a)) !== -1) { a++; }
+    return (a === b) ? v : null;
+  }
+  // StringView::split('.') 跳过空段，故 'vp09..00.10.08' / 'vp09.00.10.08..'
+  // 与规范形式同义（WebKit 26.5 实测）。
+  function vpSegs(codec) {
+    var raw = codec.split('.');
+    var out = [];
+    for (var i = 0; i < raw.length; i++) {
+      if (raw[i]) { out.push(raw[i]); }
+    }
+    return out;
+  }
+  // 返回 true=认、false=VP 族但被拒、null=不属 VP 族。
   function parseVP(c) {
     var isVP9 = c.indexOf('vp09') === 0 || c === 'vp9' || c === 'vp9.0';
     var isVP8 = c.indexOf('vp08') === 0 || c === 'vp8' || c === 'vp8.0';
     if (!isVP9 && !isVP8) { return null; }
-    if (isVP8) {
-      if (c === 'vp8' || c === 'vp8.0') { return { vp8: true, legacy: true }; }
-      if (c !== 'vp8.0' && c.indexOf('vp08') !== 0) { return null; }
-      if (c === 'vp08') { return null; }
-      if (c.charAt(4) !== '.') { return null; }
-      var p8 = c.slice(5).split('.');
-      if (p8.length !== 3) { return null; }
-      for (var i = 0; i < 3; i++) { if (!allDigits(p8[i])) { return null; } }
-      if (parseInt(p8[0], 10) !== 0) { return null; }
-      var bd8 = parseInt(p8[2], 10);
-      if (bd8 !== 8) { return null; }
-      return { vp8: true, ok: true };
+    var segs = vpSegs(c);
+    var name = segs[0];
+    // 遗留别名（VP9Utilities.cpp:166-173）：无后续段取默认记录；有后续段时
+    // 只认整串 'vp8.0' / 'vp9.0'，其余 nullopt。
+    if (name === 'vp8' || name === 'vp9') {
+      if (segs.length === 1 || c === 'vp8.0' || c === 'vp9.0') {
+        return (name === 'vp8') ? true : !ios;
+      }
+      return false;
     }
-    if (c === 'vp9' || c === 'vp9.0') { return { vp9: true, legacy: true }; }
-    if (c === 'vp09') { return null; }
-    if (c.charAt(4) !== '.') { return null; }
-    var p = c.slice(5).split('.');
-    if (p.length !== 3 && p.length !== 8) { return null; }
-    for (var j = 0; j < p.length; j++) { if (!allDigits(p[j])) { return null; } }
-    var prof = parseInt(p[0], 10);
-    if (prof !== 0 && prof !== 2) { return null; }
-    var lv = parseInt(p[1], 10);
-    if (lv > 60) { return null; }
-    var bd = parseInt(p[2], 10);
-    if (p.length === 3) {
-      if (bd === 8) { if (lv < 10) { return null; } }
-      else if (bd !== 10) { return null; }
-    } else if (bd !== 8 && bd !== 10) { return null; }
-    if (p.length === 8) {
-      var chroma = parseInt(p[3], 10), cp = parseInt(p[4], 10), tc = parseInt(p[5], 10);
-      var mc = parseInt(p[6], 10), fr = parseInt(p[7], 10);
-      if (chroma > 3 || [1,2,4,5,6,7,8,9,10,11,12,22].indexOf(cp) === -1) { return null; }
-      if ([1,2,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18].indexOf(tc) === -1) { return null; }
-      if ([0,1,2,4,5,6,7,8,9,10,11,12,13,14].indexOf(mc) === -1) { return null; }
-      if (mc === 0 && chroma !== 3) { return null; }
-      if (fr > 1) { return null; }
+    if (name !== 'vp08' && name !== 'vp09') { return false; }
+    // profile/level/bitDepth 三必填段，之后要么收尾，要么再带齐五个可选段
+    // （互斥全有或全无）——故段数只能是 4 或 9。
+    if (segs.length !== 4 && segs.length !== 9) { return false; }
+    var profile = vpInt(segs[1]);
+    if (profile === null || profile > 3) { return false; }
+    var level = vpInt(segs[2]);
+    if (level === null || VP_LEVELS.indexOf(level) === -1) { return false; }
+    var bitDepth = vpInt(segs[3]);
+    if (bitDepth !== 8 && bitDepth !== 10 && bitDepth !== 12) { return false; }
+    var chroma = 1;   // 缺省 Subsampling_420_Colocated
+    if (segs.length === 9) {
+      chroma = vpInt(segs[4]);
+      if (chroma === null || chroma > 3) { return false; }
+      var cp = vpInt(segs[5]);
+      if (cp === null || VP_PRIMARIES.indexOf(cp) === -1) { return false; }
+      var tc = vpInt(segs[6]);
+      if (tc === null || VP_TRANSFER.indexOf(tc) === -1) { return false; }
+      var mc = vpInt(segs[7]);
+      if (mc === null || VP_MATRIX.indexOf(mc) === -1) { return false; }
+      if (mc === 0 && chroma !== 3) { return false; }
+      var fr = vpInt(segs[8]);
+      if (fr === null || fr > 1) { return false; }
     }
-    return { vp9: true, ok: true };
+    if (name === 'vp08') {
+      // isVP8CodecConfigurationRecordSupported：仅 profile 0、chroma ≤1、8bit。
+      // VP8 解码器在 iOS 上可用（真机 vp8-in-webm 为 true）。
+      return !(profile !== 0 || chroma > 1 || bitDepth > 8);
+    }
+    // isVP9CodecConfigurationRecordSupported：profile 只认 0/2、chroma ≤1、
+    // bitDepth ≤10、level ≤ Level_6(60)。iOS 无 SW VP9 解码器 →
+    // isVP9DecoderAvailable() 为假，整族恒拒（与 canPlayType 侧同口径）。
+    if (ios) { return false; }
+    return !(profile !== 0 && profile !== 2) && !(chroma > 1)
+        && !(bitDepth > 10) && !(level > 60);
   }
   function webmCodecOk(c) {
     var vp = parseVP(c);
-    if (vp) {
-      // 解码器可用性判定在 parseVPCodecParameters **之前**，legacy 拼写
-      // （vp9 / vp9.0）同样受 !isVP9DecoderAvailable() 拦截。
-      if (vp.vp8) { return true; }
-      return !ios;
-    }
+    if (vp !== null) { return vp; }
     if (c === 'opus' || c === 'vorbis') { return true; }
     if (c.indexOf('av01.') === 0) { return av1dev; }
     return false;
@@ -1240,10 +2003,15 @@ _MSE_SUPPORT_SRC = r"""function __mseSupports(raw, opt) {
       || container === 'audio/mpg' || container === 'video/mp2t';
   var lc = lower(container);
   var isWebm = lc === 'video/webm' || lc === 'audio/webm';
-  var isOgg = lc === 'audio/ogg' || lc === 'application/ogg';
+  // Ogg 是 AVFoundation 动态项（HashSet<String> 精确匹配），大小写敏感：
+  // 'AUDIO/OGG' / 'Audio/ogg' 均 false。WebM 走 SourceBufferParserWebM 的
+  // equalLettersIgnoringASCIICase，不敏感，故上面用 lc。
+  var isOgg = container === 'audio/ogg' || container === 'application/ogg';
   if (!isAVF && !isWebm && !isOgg) { return false; }
   if (isOgg) {
-    if (opt.ios) { return false; }
+    // iOS 18.4 起 WebKit 带 Ogg 解码器（vorbis/opus/flac），opt.ogg 由注入层
+    // 按机型版本给出；低于 18.4 整族不可播。
+    if (opt.ios && !opt.ogg) { return false; }
     var oc = codecParam === '' ? [] : codecParam.split(',').map(trim);
     if (!oc.length) { return true; }
     // audio/ogg 才列 codec；application/ogg 不列
@@ -1342,7 +2110,12 @@ _CPT_IOS_SRC = r"""function __cptIos(raw, opt) {
     return s.slice(a, b);
   }
   var MP4_CODECS = ['avc1', 'hvc1', 'dvh1', 'vp09', 'av01', 'mp4a', 'alac',
-                    'ac-3', 'ec-3', 'Opus', 'fLaC', 'samr', 'ulaw'];
+                    'ac-3', 'ec-3', 'Opus', 'fLaC', 'samr', 'ulaw', 'mp4v'];
+  // mp4a.<objectTypeIndication>：AVFoundation 只认 0x67 与 0x40.2/5/29/32/33/42
+  // （MPEG-2 AAC LC 与 MPEG-4 Audio 的 AAC-LC/HE/HEv2/… 子集）。0x6b（MP3）、
+  // 0x40.34（MP3）、0x69（MP3）等一律 ''——实测 WebKit 26.5 全扫 131 个取值。
+  var MP4A_OTI = { '67': 1, '40.2': 1, '40.5': 1, '40.29': 1,
+                   '40.32': 1, '40.33': 1, '40.42': 1 };
   var STATIC = {
     'application/vnd.apple.mpegurl': 1, 'application/x-mpegurl': 1,
     'audio/3gpp': 1, 'audio/aac': 1, 'audio/aacp': 1, 'audio/aiff': 1,
@@ -1355,25 +2128,143 @@ _CPT_IOS_SRC = r"""function __cptIos(raw, opt) {
     'video/x-mpeg': 1, 'video/x-mpg': 1
   };
   var DYNAMIC = { 'audio/flac': 1, 'audio/x-caf': 1, 'video/mp2t': 1 };
+  // iOS 17.4 起 AVFoundation 带 WebM 解码器（caniuse webm：ios_saf 17.3 仍是
+  // 「仅 WebRTC 内 VP8/VP9」的 a 档，17.4 才升 y；macOS Safari 14.1 就已 y，
+  // 故平台差必须显式建模，不能照抄 macOS 基线）。容器进 STATIC 后 codecs
+  // 为空即 "maybe"，与 WebKit 的 MayBeSupported 同义。
+  var WEBM = opt.webm ? { 'audio/webm': 1, 'video/webm': 1 } : null;
+  // ---- WebM 的 VP 族：不走 AVFoundation，走 SourceBufferParserWebM 自己的解析器 ----
+  // SourceBufferParserWebM.cpp:1508-1522 对每个 codec 先判族：
+  //   isVP9 = startsWith('vp09') || =='vp9' || =='vp9.0'
+  //   isVP8 = startsWith('vp08') || =='vp8' || =='vp8.0'
+  // 命中后 parseVPCodecParameters（VP9Utilities.cpp:153-272），再
+  // isVPCodecConfigurationRecordSupported（VP9UtilitiesCocoa.mm:260-341）。
+  // 所以裸 'vp09' 在 WebM 里是 ''，而 MP4 侧 AVFoundation 反而认裸 vp09
+  // ——两条路必须分开，禁止互推。
+  var VP_LEVELS = [10, 11, 20, 21, 30, 31, 40, 41, 50, 51, 52, 60, 61, 62];
+  var VP_PRIMARIES = [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 22];
+  var VP_TRANSFER = [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
+  var VP_MATRIX = [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+  var VP_WS = ' \t\n\r\f\v';
+  // WTF::parseInteger<uint8_t>（StringToIntegerConversion.h:60-101）：
+  // 前导 isUnicodeCompatibleASCIIWhitespace、至多一个 '+'（uint8_t 无符号，
+  // '-' 不被跳过，故 'vp09.-0.10.08' 直接失败）、至少一位十进制、尾部仅允许
+  // 空白，溢出（>255）即失败。注意这是 Disallow 尾随垃圾的严格版。
+  function vpInt(str) {
+    var a = 0, b = str.length;
+    while (a < b && VP_WS.indexOf(str.charAt(a)) !== -1) { a++; }
+    if (a < b && str.charAt(a) === '+') { a++; }
+    var start = a, v = 0;
+    while (a < b && str.charAt(a) >= '0' && str.charAt(a) <= '9') {
+      v = v * 10 + (str.charCodeAt(a) - 48);
+      if (v > 255) { return null; }
+      a++;
+    }
+    if (a === start) { return null; }
+    while (a < b && VP_WS.indexOf(str.charAt(a)) !== -1) { a++; }
+    return (a === b) ? v : null;
+  }
+  // StringView::split('.') 跳过空段（StringView.h:1199-1206 传 allowEmptyEntries=false），
+  // 故 'vp09..00.10.08' / 'vp09.00.10.08..' 与规范形式同义（实测 WebKit 26.5）。
+  function vpSegs(codec) {
+    var raw = codec.split('.');
+    var out = [];
+    for (var i = 0; i < raw.length; i++) {
+      if (raw[i]) { out.push(raw[i]); }
+    }
+    return out;
+  }
+  // 返回 true=认、false=VP 族但被拒、null=不属 VP 族（交给其它分支）。
+  function vpOk(codec) {
+    var isVP9 = codec.indexOf('vp09') === 0 || codec === 'vp9' || codec === 'vp9.0';
+    var isVP8 = codec.indexOf('vp08') === 0 || codec === 'vp8' || codec === 'vp8.0';
+    if (!isVP9 && !isVP8) { return null; }
+    var segs = vpSegs(codec);
+    var name = segs[0];
+    // 遗留别名分支（parseVPCodecParameters:166-173）：无后续段即取默认记录
+    // （profile 0 / level 10 / bitDepth 8 / chroma 1，两族都过支持检查）；
+    // 有后续段时只认**整串** 'vp8.0' / 'vp9.0'，其余一律 nullopt。
+    if (name === 'vp8' || name === 'vp9') {
+      return (segs.length === 1) || (codec === 'vp8.0') || (codec === 'vp9.0');
+    }
+    if (name !== 'vp08' && name !== 'vp09') { return false; }
+    // profile / level / bitDepth 三个必填段，之后要么收尾，要么再带齐五个
+    // 可选段（互斥全有或全无）——所以段数只能是 4 或 9。
+    if (segs.length !== 4 && segs.length !== 9) { return false; }
+    var profile = vpInt(segs[1]);
+    if (profile === null || profile > 3) { return false; }
+    var level = vpInt(segs[2]);
+    if (level === null || VP_LEVELS.indexOf(level) === -1) { return false; }
+    var bitDepth = vpInt(segs[3]);
+    if (bitDepth !== 8 && bitDepth !== 10 && bitDepth !== 12) { return false; }
+    var chroma = 1;   // 缺省 Subsampling_420_Colocated
+    if (segs.length === 9) {
+      chroma = vpInt(segs[4]);
+      if (chroma === null || chroma > 3) { return false; }
+      var cp = vpInt(segs[5]);
+      if (cp === null || VP_PRIMARIES.indexOf(cp) === -1) { return false; }
+      var tc = vpInt(segs[6]);
+      if (tc === null || VP_TRANSFER.indexOf(tc) === -1) { return false; }
+      var mc = vpInt(segs[7]);
+      if (mc === null || VP_MATRIX.indexOf(mc) === -1) { return false; }
+      // 「matrixCoefficients 为 0（RGB）时 chromaSubsampling 必须是 3（4:4:4）」
+      if (mc === 0 && chroma !== 3) { return false; }
+      var fr = vpInt(segs[8]);
+      if (fr === null || fr > 1) { return false; }
+    }
+    if (name === 'vp08') {
+      // isVP8CodecConfigurationRecordSupported：仅 profile 0、chroma ≤1、8bit
+      return !(profile !== 0 || chroma > 1 || bitDepth > 8);
+    }
+    // isVP9CodecConfigurationRecordSupported：profile 只认 0/2、chroma ≤1、
+    // bitDepth ≤10、level ≤ Level_6(60)——故 61/62 虽在合法 level 表里仍被拒。
+    return !(profile !== 0 && profile !== 2) && !(chroma > 1)
+        && !(bitDepth > 10) && !(level > 60);
+  }
+  // iOS 18.4 起 WebKit 支持 Ogg 容器（vorbis/opus/flac）。WebKit 自家 Safari
+  // 18.4 发布说明逐字点名 iOS 18.4，caniuse ogg-vorbis 的 ios_saf 也在 18.4
+  // 转 y（17.4–18.3 是 a 档：支持 Vorbis 编解码器但不支持 Ogg 容器）。
+  // application/ogg 是裸容器别名，裸查询同为 "maybe"，带 codecs 反被拒——
+  // 与 AVAssetMIMETypeCache 的动态项（HashSet<String> 精确匹配）一致。
+  // video/ogg 在所有版本都缺席：Ogg 支持只覆盖音频容器（AVFoundation
+  // 无 theora 解码器，实测 macOS WebKit 26.5 亦为 ''）。
+  var OGG = opt.ogg ? { 'audio/ogg': 1, 'application/ogg': 1 } : null;
+  var OGG_CODECS = ['vorbis', 'opus', 'flac'];
   var ACCEPT = {
     'video/mp4': MP4_CODECS, 'audio/mp4': MP4_CODECS, 'video/x-m4v': MP4_CODECS,
     'video/3gpp': MP4_CODECS, 'video/3gpp2': MP4_CODECS,
     'audio/3gpp': MP4_CODECS, 'audio/x-m4a': MP4_CODECS,
-    'video/quicktime': ['avc1', 'hvc1', 'mp4a', 'alac', 'ac-3', 'ec-3',
-                        'opus', 'fLaC', 'flac', 'lpcm'],
+    // HLS 容器（application/vnd.apple.mpegurl / *mpegurl）：AVFoundation 按
+    // MP4 片段判定，接受整套 MP4 codec，但 flac 只认 'fLaC' 拼写（无小写改写）。
+    'application/vnd.apple.mpegurl': MP4_CODECS, 'application/x-mpegurl': MP4_CODECS,
+    'audio/mpegurl': MP4_CODECS, 'audio/x-mpegurl': MP4_CODECS,
+    'video/quicktime': ['avc1', 'hvc1', 'dvh1', 'vp09', 'mp4a', 'alac', 'ac-3',
+                        'ec-3', 'opus', 'flac', 'lpcm', 'samr', 'ulaw', 'mp4v'],
     'video/mp2t': ['avc1', 'mp4a', 'ac-3', 'ec-3'],
+    'audio/x-caf': ['alac', 'ac-3', 'ec-3', 'opus', 'flac', 'lpcm', 'samr', 'ulaw'],
+    'audio/aiff': ['ulaw'], 'audio/x-aiff': ['ulaw'],
     'audio/mpeg': ['mp3'], 'audio/mp3': ['mp3'], 'audio/mpeg3': ['mp3'],
     'audio/mpg': ['mp3'],
-    'audio/aac': ['mp4a'], 'audio/aacp': ['mp4a'], 'audio/x-aac': ['mp4a'],
+    'audio/aac': ['mp4a'], 'audio/x-aac': ['mp4a'],
     'audio/wav': ['1'], 'audio/wave': ['1'], 'audio/x-wav': ['1'],
     'audio/vnd.wave': ['1']
   };
   var s = trim(String(raw));
   if (!s) { return ''; }
   var parts = s.split(';');
-  var container = trim(parts[0]).toLowerCase();
-  if (!container) { return ''; }
-  if (!STATIC[container] && !DYNAMIC[container]) { return ''; }
+  var rawContainer = trim(parts[0]);
+  if (!rawContainer) { return ''; }
+  var container = rawContainer.toLowerCase();
+  // AVAssetMIMETypeCache 的两套容器表大小写语义不同（WebKit 26.5 实测）：
+  // isStaticContainerType 走 ComparableLettersLiteral 的
+  // NoUppercaseLettersOptimized 子集比较 → 忽略大小写（'VIDEO/MP4' → maybe）；
+  // 动态项由 initializeCache 从 AVURLAsset.audiovisualMIMETypes 灌进
+  // HashSet<String>，是精确匹配 → 'AUDIO/FLAC' / 'AUDIO/OGG' 一律 ''。
+  // WebM 走 SourceBufferParserWebM 的 equalLettersIgnoringASCIICase，不认大小写。
+  var staticHit = !!STATIC[container];
+  var dynamicHit = !!DYNAMIC[rawContainer] || !!(OGG && OGG[rawContainer]);
+  var webmHit = !!(WEBM && WEBM[container]);
+  if (!staticHit && !dynamicHit && !webmHit) { return ''; }
   var codecs = null;
   for (var i = 1; i < parts.length; i++) {
     var eq = parts[i].indexOf('=');
@@ -1398,10 +2289,59 @@ _CPT_IOS_SRC = r"""function __cptIos(raw, opt) {
   if (container === 'audio/mpeg' && codecs.length === 1 && codecs[0] === 'mp3') {
     return 'probably';
   }
-  var accept = ACCEPT[container];
-  if (!accept) { return ''; }
+  // application/ogg 是容器别名，AVFoundation 只在裸查询时命中（带 codecs
+  // 反被拒，实测 WebKit 26.5）。audio/ogg 才走 codec 族判定。
+  if (container === 'application/ogg') { return ''; }
+  // 带 codecs 时走 canDecodeExtendedType → AVURLAsset
+  // isPlayableExtendedMIMEType:，参数是**原始串**。只有少数容器的 codec 侧
+  // 会做大小写归一，其余容器前缀一旦偏离小写就整条拒：'VIDEO/MP4; codecs="hvc1"'
+  // / 'Video/mp4; ...' 一律 ''，而裸 'VIDEO/MP4' 仍是 'maybe'。
+  // 实测（WebKit 26.5，31 项静态容器 × 17 组 codec）：video/mp4 与
+  // video/quicktime 对**全部可接受 codec** 敏感（quicktime 直接复用 ACCEPT
+  // 清单，避免两份表漂移）；audio/mp4 只对 flac、audio/aac 只对 mp4a、
+  // audio/aiff 只对 ulaw、audio/vnd.wave 只对 '1' 敏感；
+  // audio/3gpp、video/3gpp、audio/x-m4a、video/x-m4v 等均不敏感。
+  var EXACT_CASE = {
+    // video/mp4 另加小写 'flac'：canDecodeExtendedType 的 flac→fLaC 改写按
+    // containerType() == "video/mp4" 精确比较，大写容器走不到改写，故也拒。
+    'video/mp4': MP4_CODECS.concat(['flac']),
+    'video/quicktime': ACCEPT['video/quicktime'],
+    'audio/mp4': ['flac'], 'audio/aac': ['mp4a'], 'audio/aiff': ['ulaw'],
+    'audio/vnd.wave': ['1']
+  };
+  var containerExact = (rawContainer === container) ? null
+      : (EXACT_CASE[container] || null);
+  if (containerExact) {
+    for (var e = 0; e < codecs.length; e++) {
+      for (var x = 0; x < containerExact.length; x++) {
+        var px = containerExact[x];
+        // mp4a 按前缀命中后还要过 OTI 白名单，故 mp4a 前缀串不在此处提前拒；
+        // 只有可接受且大小写敏感的组合才返回 ''
+        if (codecs[e] === px || codecs[e].indexOf(px + '.') === 0) {
+          if (px === 'mp4a' && !MP4A_OTI[codecs[e].slice(5)]) { continue; }
+          return '';
+        }
+      }
+    }
+  }
+  var isWebm = !!(WEBM && WEBM[container]);
+  var accept = ACCEPT[container]
+      || (OGG && OGG[container] ? OGG_CODECS : null);
+  if (!accept && !isWebm) { return ''; }
   for (var k = 0; k < codecs.length; k++) {
     var c = codecs[k];
+    if (isWebm) {
+      // WebM 容器：VP 族走 vpOk（parseVP + 支持检查），音频只认小写
+      // opus/vorbis，av01 由机型能力位门控。其余（avc1/pcm 需 Matroska
+      // 限制档，移动端未开）一律拒。
+      var v = vpOk(c);
+      var webmOk = (v === null)
+          ? ((c === 'opus' || c === 'vorbis')
+             || (c.indexOf('av01.') === 0 && !!opt.av1))
+          : v;
+      if (!webmOk) { return ''; }
+      continue;
+    }
     // AVAssetMIMETypeCache::canDecodeExtendedType（:108-112）：MP4 容器内的
     // 小写 'flac' 先改写成 MP4RA 注册的 'fLaC' 再问 AVFoundation —— 所以
     // mp4 认 flac，而 audio/flac 容器带 codecs="flac" 反而不认。
@@ -1413,8 +2353,13 @@ _CPT_IOS_SRC = r"""function __cptIos(raw, opt) {
     for (var m = 0; m < accept.length; m++) {
       var b = accept[m];
       if (c === b || c.indexOf(b + '.') === 0) {
-        // av01 由机型能力位门控（A17 Pro 起才有硬解）
-        ok = (b === 'av01') ? !!opt.av1 : true;
+        // av01 由机型能力位门控（A17 Pro 起才有硬解）。裸 'av01' 与
+        // 'mp4a' 本身 AVFoundation 不认（缺 profile/OTI 参数），实测 ''
+        ok = (b === 'av01') ? (c !== 'av01' && !!opt.av1) : true;
+        // mp4a 的前缀命中还不够：AVFoundation 还要看 objectTypeIndication
+        if (b === 'mp4a') {
+          ok = c !== 'mp4a' && !!MP4A_OTI[c.slice(5)];
+        }
         break;
       }
     }
@@ -2078,6 +3023,10 @@ var __mc = (function () {
 
     function __mcAvfQuoted(container, codec, opt) {
         if (container === 'audio/ogg' || container === 'video/ogg') {
+            // Ogg 容器在 iOS 18.4 前整族缺席（AVFoundation 无对应解码器，
+            // 动态 MIME 缓存里也没有该容器），与 canPlayType / MSE 两处
+            // 同源版本门控（清单 F-134 / F-199）。
+            if (!(opt && opt.ogg)) { return false; }
             return codec === 'opus' || codec === 'flac' || codec === 'vorbis';
         }
         var p = codec.split('.');
@@ -2592,7 +3541,7 @@ var __mc = (function () {
         return m ? parseInt(m[0], 10) : 0;
     }
 
-    function __mcCocoaAudioInfo(audio, type) {
+    function __mcCocoaAudioInfo(audio, type, opt) {
         var raw = audio.contentType;
         var container = __mcContainer(raw);
         var codecs = __mcCodecs(raw);
@@ -2604,7 +3553,7 @@ var __mc = (function () {
                 || container === 'audio/vnd.apple.mpegurl') { return null; }
         if (type === 'file' && __mcSemiInQuotedCodec(raw)) { return null; }
         if (type === 'file' && container !== 'audio/webm') {
-            var gate = __mcPreGate(container, raw, true);
+            var gate = __mcPreGate(container, raw, true, opt);
             if (gate === false) { return null; }
             // 过闸门等于 AVFoundation 认了这条 MIME，音频分支只回 supported
             if (gate === 'pass') { return __mcAudioFlags(audio, true); }
@@ -2619,7 +3568,9 @@ var __mc = (function () {
                 || container === 'audio/3gpp2') {
             ok = __mcMp4AudioCodec(codec);
         } else if (container === 'audio/ogg') {
-            ok = (codec === 'opus' || codec === 'vorbis' || codec === 'flac');
+            // iOS 18.4 起才有 Ogg 容器（见 __mcAvfQuoted 同处注释）
+            ok = !!(opt && opt.ogg)
+                && (codec === 'opus' || codec === 'vorbis' || codec === 'flac');
         } else if (container === 'audio/webm') {
             ok = (codec === 'opus' || codec === 'vorbis');
         }
@@ -2642,7 +3593,7 @@ var __mc = (function () {
             if (!res) { return null; }
         }
         if (!norm.audio) { return res; }
-        var a = __mcCocoaAudioInfo(norm.audio, norm.type);
+        var a = __mcCocoaAudioInfo(norm.audio, norm.type, opt);
         if (!a) { return null; }
         if (!res) { return a; }
         res.supported = a.supported;    // 音频分支只覆盖 supported
@@ -2819,11 +3770,14 @@ var __mc = (function () {
 # 构造器面同样按原生复刻：new.target 透传给 Reflect.construct（子类实例
 # 原型链正确）、无 new 时借用原生报错文案、prototype 复用原生对象并置
 # 不可写、length 2、原型上的 constructor 指回包装器。
-_FONT_FACE_SRC = r"""var __ffWrap = (function () {
+_FONT_FACE_SRC = r"""var __ffNative = null;
+var __ffWrap = (function () {
     try {
         var RealFF = (typeof self !== 'undefined' && self.FontFace)
             || (typeof FontFace !== 'undefined' ? FontFace : null);
         if (typeof RealFF !== 'function') { return null; }
+        // F-93③ 的抢占 face 要用包装前的构造器，否则会被 local() 裁剪绕进去
+        __ffNative = RealFF;
         var allow = {};
         var list = (D && D.fonts) || [];
         for (var i = 0; i < list.length; i++) {
@@ -2861,23 +3815,50 @@ _FONT_FACE_SRC = r"""var __ffWrap = (function () {
             return f.replace(/^\s+|\s+$/g, '');
         };
 
+        // 返回 {src, fake}：fake 为真表示整条源都换成了占位字体，构造器要
+        // 同时补上窄 unicode-range（见 W）。
         var fix = function (src) {
             // ArrayBuffer / TypedArray 源合法，String() 会毁掉它们
-            if (typeof src !== 'string') { return src; }
-            if (src.indexOf('local(') < 0) { return src; }
-            var parts = tok(src), keep = [], dropped = 0;
+            if (typeof src !== 'string') { return {src: src, fake: false}; }
+            if (src.indexOf('local(') < 0) { return {src: src, fake: false}; }
+            var parts = tok(src), keep = [], other = 0, local = 0;
             for (var k = 0; k < parts.length; k++) {
-                var fam = famOf(parts[k]);
-                if (fam === null) { keep.push(parts[k]); continue; }
+                if (famOf(parts[k]) === null) { other++; } else { local++; }
+            }
+            // 页面自己带了真实 url() 源：只裁掉 local()，其余原样留下，也不
+            // 动 unicode-range——否则这个 face 会整体失效，页面文字掉回默认
+            // 字体（真机上它是能正常加载的）。
+            var sh = (typeof D !== 'undefined' && D && D.shadowFont) || '';
+            var url = sh ? ('url("data:font/woff2;base64,' + sh
+                + '") format("woff2")') : '';
+            var fakeAll = !other && !!url;
+            for (var j = 0; j < parts.length; j++) {
+                var fam = famOf(parts[j]);
+                if (fam === null) { keep.push(parts[j]); continue; }
                 // CSS 家族名忽略大小写，子族名（"Helvetica Neue Bold"）按
                 // 完整串比较——声明表里没有就丢
-                if (allow[fam.toLowerCase()]) { keep.push(parts[k]); }
-                else { dropped++; }
+                if (allow[fam.toLowerCase()]) {
+                    if (fakeAll) { keep.push(url); }
+                    // 有真实 url() 作伴、或拿不到占位字体时，local() 一律丢：
+                    // 宿主装着这个族就会泄漏宿主字形，而设备声明表本身不能
+                    // 证明宿主有这个字体（Roboto 在 macOS 上就没有）。
+                }
             }
-            if (!dropped) { return src; }
-            var out = keep.join(',');
-            out = out.replace(/^\s+|\s+$/g, '');
-            return out || 'local("__fp_absent__")';
+            if (!local) { return {src: src, fake: false}; }
+            if (fakeAll) {
+                // 同一族写了多个 local()（粗细/斜体回退）时只保留一份
+                var uniq = [], seen = false;
+                for (var n = 0; n < keep.length; n++) {
+                    if (keep[n] === url) {
+                        if (seen) { continue; }
+                        seen = true;
+                    }
+                    uniq.push(keep[n]);
+                }
+                keep = uniq;
+            }
+            var out = keep.join(',').replace(/^\s+|\s+$/g, '');
+            return {src: out || 'local("__fp_absent__")', fake: fakeAll};
         };
 
         var W = function FontFace(family, source, descriptors) {
@@ -2890,10 +3871,23 @@ _FONT_FACE_SRC = r"""var __ffWrap = (function () {
                 return Reflect.construct(RealFF,
                     arguments.length === 1 ? [family] : [], nt);
             }
-            var args = arguments.length < 3
-                ? [family, fix(source)]
-                : [family, fix(source), descriptors];
-            return Reflect.construct(RealFF, args, nt);
+            var f = fix(source);
+            if (!f.fake) {
+                return Reflect.construct(RealFF, arguments.length < 3
+                    ? [family, f.src] : [family, f.src, descriptors], nt);
+            }
+            // 占位字体必须配窄 unicode-range：它只有 U+E000 的字形，不设范围
+            // 时会接管拉丁文本、宽度探测从缺席基线 4296 变成 4296,143。
+            // 页面若自己给了描述符，逐项复制后覆盖 unicode-range。
+            var ds = {};
+            if (descriptors && typeof descriptors === 'object') {
+                for (var key in descriptors) {
+                    try { ds[key] = descriptors[key]; } catch (e) {}
+                }
+            }
+            ds.unicodeRange = (typeof D !== 'undefined' && D && D.shadowRange)
+                || 'U+10FFFF';
+            return Reflect.construct(RealFF, [family, f.src, ds], nt);
         };
         W.prototype = RealFF.prototype;
         try {
@@ -2936,33 +3930,447 @@ __MC_SRC__
     // F-163：FontFace 的 local() 源裁剪（见模块级 _FONT_FACE_SRC）
 __FF_SRC__
 
+    // ---- F-93③：宿主字体族按名字解析，用同名 FontFace 抢占 ----
+    // 字体探测（IPHey/mixvisit 的 span.offsetWidth 三组比对）读的是族名解析
+    // 结果，绕开 Page.setFontFamilies 的通用族映射：Android 身份下
+    // `font-family: Menlo` 仍量到宿主真实字形宽度 → 上传体列出 macOS 专有族，
+    // 与声明的 Android 机型矛盾。
+    // 做法：给每个宿主族名注册一个「可加载但字形只覆盖私用区」的 FontFace，
+    // 探测文本（拉丁/数字/标点）在该 face 里没有字形 → 回落到族列表里的下一个
+    // 族（monospace），三组比对全部相等，探测落空。
+    // 两个描述符都不能省，实测：
+    //   WOFF2 + unicode-range → face 稳定 loaded，真实页面上 5 个探针全部落空
+    //   WOFF2，无 unicode-range → face 供出 Arial 字形，探测照旧命中
+    //   url(data:,)，无论有无 range → 页面一旦触发字体加载，face 转 error，
+    //                                Blink 丢掉它回落宿主字形（about:blank 上
+    //                                看不出来，真实页面上必现）
+    // 用 CSSOM 插 <style> 也一样有效，但那样会把 5000+ 条规则塞进页面的
+    // styleSheets——页面遍历样式表时会看到成片的 @font-face，反而更可疑。
+    // 被隐藏层接管的原型（给下方 __maskNative 之后的 toString 补登记用）；
+    // 没有抢占地面的目标上保持 null。__fbIterNext 是被接管原型上的 next，
+    // 同样要在 __maskNative 之后补登记。
+    var __fbHideProto = null;
+    var __fbIterNext = null;
+    if (D.fontBlock && D.fontBlock.length) {
+        try {
+            // 用包装前的原生构造器：window.FontFace 已被 F-163 换成 W，
+            // 走 W 会绕进 local() 白名单裁剪。
+            var __fbCtor = (typeof __ffNative === 'function') ? __ffNative : null;
+            var __fbSrc = 'url("data:font/woff2;base64,' + D.shadowFont
+                + '") format("woff2")';
+            // 抢占 face 的登记表，隐藏层（下方）按它过滤。必须在第一次
+            // __fbInstall 之前建好——否则首轮加的 face 无人登记，页面照旧看得到。
+            var __fbHidden = (typeof WeakSet === 'function') ? new WeakSet() : null;
+            var __fbInstall = function (doc) {
+                try {
+                    if (!doc || !doc.documentElement) { return; }
+                    if (doc.__fpFontRoot === doc.documentElement) { return; }
+                    var set = doc.fonts;
+                    if (!set || !__fbCtor) { return; }
+                    for (var i = 0; i < D.fontBlock.length; i++) {
+                        var face;
+                        try {
+                            face = new __fbCtor(String(D.fontBlock[i]),
+                                __fbSrc,
+                                {unicodeRange: D.shadowRange});
+                        } catch (e) { continue; }
+                        if (__fbHidden) { try { __fbHidden.add(face); } catch (e) {} }
+                        try { set.add(face); } catch (e) {}
+                    }
+                    doc.__fpFontRoot = doc.documentElement;
+                } catch (e) {}
+            };
+            // 文档起点执行时 documentElement 可能尚未创建：此时挂 document
+            // 级监听，等 <html> 一出现立刻注册；about:blank 子帧会二次初始化
+            //（先初始空文档、再正式文档），只在 documentElement 上打标记会漏掉
+            // 后一份——监听常驻到 DOMContentLoaded 为止，每次根节点换新都补一次。
+            __fbInstall(document);
+            document.addEventListener('readystatechange', function () {
+                __fbInstall(document);
+            });
+            document.addEventListener('DOMContentLoaded', function () {
+                __fbInstall(document);
+            });
+            var __fbSweep = function () {
+                __fbInstall(document);
+            };
+
+            // ---- F-93③：把抢占地面的 face 从 FontFaceSet 面上藏起来 ----
+            // 抢占（上面 4287 / 5480 条）是让宿主字形落不到探测族名上，但那些
+            // face 就摆在 `document.fonts` 里：`document.fonts.size` 直接量到
+            // 4287，`[...document.fonts]` 逐条吐出带 family 名的 FontFace——
+            // 比字体度量泄漏更直白，一行就能判假。真机 FontFaceSet 只有页面
+            // 自己声明的 face，正常页面是 0。
+            //
+            // 改的是**真实原型** `Object.getPrototypeOf(document.fonts)`，不是
+            // `window.FontFaceSet.prototype`：裸 fp-chromium 根本没有
+            // `window.FontFaceSet` 这个全局（实测 /tmp/f837），它是本补丁按
+            // `_IOS_ADD_SPEC` 合成出来的，原型是另造的一份、成员全是返回
+            // undefined 的桩。把实例改挂过去会把 size/迭代/check 全弄坏
+            // （实测 /tmp/f835：size → null、`[...fs]` 抛 not iterable）。
+            var __fbHide = (function () {
+                try {
+                    var set = document.fonts;
+                    if (!set) { return null; }
+                    var proto = Object.getPrototypeOf(set);
+                    if (!proto) { return null; }
+                    var hidden = __fbHidden;
+                    if (!hidden) { return null; }
+                    var sizeGet = Object.getOwnPropertyDescriptor(proto, 'size');
+                    sizeGet = sizeGet && sizeGet.get;
+                    var natValues = proto.values, natKeys = proto.keys;
+                    var natEntries = proto.entries, natForEach = proto.forEach;
+                    var natHas = proto.has, natIter = proto[Symbol.iterator];
+                    if (!sizeGet || !natValues || !natEntries || !natHas) {
+                        return null;
+                    }
+                    // 迭代器对象：真机 values/keys/entries/[Symbol.iterator] 返回的
+                    // 都是 `[object FontFaceSet Iterator]`，原型自带 next 与
+                    // Symbol.iterator，next() 结果对象的键序按引擎分叉——
+                    // WebKit/JSC 是 `{value, done}`，Blink/V8 是 `{done, value}`
+                    // （实测 /tmp/f849 的四条迭代路径，两引擎各自一致）。
+                    // 返回 Array Iterator 会被 `toString` 一行看穿，故照抄一份。
+                    var itProto = null;
+                    try { itProto = Object.getPrototypeOf(natValues.call(set)); } catch (e) {}
+                    // 真机的 next 挂在**共享原型**上（三种迭代器同一个原型，
+                    // /tmp/f851 `all_same:true`），不在迭代器实例自身；描述符
+                    // w/e/c 全 true、length 0。写成实例自有属性本身就是一处
+                    // `Object.getOwnPropertyNames(it)` 可判的破绽。
+                    // 迭代器的内部状态放在这个 WeakMap 里——JS 拿不到真机的
+                    // 内部槽，用表代替，接收者校验按「表里有没有」判定。
+                    var itState = (typeof WeakMap === 'function') ? new WeakMap() : null;
+                    // 原生 next 必须先存下来：这个原型同时被原生迭代器
+                    // （natValues/natKeys/natEntries 产出的那些）使用，我们替换
+                    // 后它们也会走到新函数上。不在 itState 里的一律交还原生——
+                    // 既让原生迭代器继续工作，又白得两引擎各自的接收者校验文案
+                    // （/tmp/f852：Blink `Illegal invocation`、WebKit
+                    // `Cannot call next() on a non-Iterator object`）。
+                    var natNext = itProto ? itProto.next : null;
+                    if (itProto && itState && natNext) {
+                        var __fbNextImpl = function (self) {
+                            var st = itState.get(self);
+                            var out = {};
+                            if (st.i >= st.arr.length) {
+                                if (D.ios) {
+                                    out.value = undefined; out.done = true;
+                                } else {
+                                    out.done = true; out.value = undefined;
+                                }
+                                return out;
+                            }
+                            var v = st.pair ? [st.arr[st.i], st.arr[st.i]] : st.arr[st.i];
+                            if (D.ios) {
+                                out.value = v; out.done = false;
+                            } else {
+                                out.done = false; out.value = v;
+                            }
+                            st.i++;
+                            return out;
+                        };
+                        var __fbNext = function next() {
+                            if (!itState.has(this)) {
+                                // 不在表里 → 原生迭代器或非法接收者。iOS 面要让
+                                // 原生先判：合法原生迭代器放行（结果键序是 V8
+                                // 原生口径，本层不接管），非法接收者则由原生抛
+                                // Blink 的 `Illegal invocation`，再归一成 WebKit
+                                // 文案（/tmp/f852 两引擎文案不同）。
+                                if (!D.ios) { return natNext.call(this); }
+                                try {
+                                    return natNext.call(this);
+                                } catch (e8) {
+                                    if (e8 instanceof TypeError) {
+                                        throw new TypeError(
+                                            'Cannot call next() on a non-Iterator object');
+                                    }
+                                    throw e8;
+                                }
+                            }
+                            return __fbNextImpl(this);
+                        };
+                        try { Object.defineProperty(__fbNext, 'length', { value: 0, configurable: true }); } catch (e) {}
+                        Object.defineProperty(itProto, 'next', {
+                            value: __fbNext, writable: true,
+                            enumerable: true, configurable: true,
+                        });
+                        // 给 __maskNative 之后的 toString 补登记用。
+                        __fbIterNext = __fbNext;
+                    }
+                    var mkIter = function (arr, pair) {
+                        var o = Object.create(itProto);
+                        if (itState) { itState.set(o, { arr: arr, pair: pair, i: 0 }); }
+                        return o;
+                    };
+                    // 可见集合：按「是不是我们塞的」过滤。原生迭代器是快照语义
+                    // （Set 迭代器按插入序、删过的不会再出现），逐条取完再过滤，
+                    // 页面在迭代中途 add/delete 也落不到我们头上。
+                    var vis = function (raw) {
+                        var out = [];
+                        for (var v of raw) {
+                            if (!hidden.has(v)) { out.push(v); }
+                        }
+                        return out;
+                    };
+                    // Blink 的 entries() 吐 [face, face] 键值对（同族同对象，因为
+                    // FontFaceSet 的键就是 face 本身），WebKit 吐单个 face。跑在
+                    // Blink 上必须解包后再判归属，否则过滤整条失效。
+                    var visEntries = function (raw) {
+                        var out = [];
+                        for (var v of raw) {
+                            var f = Array.isArray(v) ? v[0] : v;
+                            if (!hidden.has(f)) { out.push(f); }
+                        }
+                        return out;
+                    };
+                    var keep = function (fn, name, len) {
+                        try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e) {}
+                        try { Object.defineProperty(fn, 'length', { value: len, configurable: true }); } catch (e) {}
+                        return fn;
+                    };
+                    var def = function (key, fn) {
+                        Object.defineProperty(proto, key, {
+                            value: fn, writable: true, enumerable: true, configurable: true,
+                        });
+                    };
+                    // 真机 getter 有接收者校验：`Object.create(原型).size` 抛
+                    // 「The FontFaceSet.size getter can only be used on instances
+                    // of FontFaceSet」。这里先让原生 getter 校验（不认的对象它
+                    // 自己会抛），再扣掉藏起来的条数。
+                    // 必须是访问器：写成数据属性的话 `fs.size` 读到的是那个
+                    // 包装函数本身，`Object.getOwnPropertyDescriptor(p,'size').get`
+                    // 也会变成 undefined（真机上是 getter）。
+                    Object.defineProperty(proto, 'size', {
+                        get: keep(function () {
+                            var n = sizeGet.call(this);
+                            var c = 0;
+                            try { for (var v of natValues.call(this)) { if (hidden.has(v)) { c++; } } } catch (e) {}
+                            return n - c;
+                        }, 'get size', 0),
+                        enumerable: true, configurable: true,
+                    });
+                    def('values', keep(function () {
+                        return mkIter(vis(natValues.call(this)), false);
+                    }, 'values', 0));
+                    def('keys', keep(function () {
+                        return mkIter(vis(natKeys.call(this)), false);
+                    }, 'keys', 0));
+                    // 真机 entries() 每项吐**一个** FontFace（不是 [k, v] 对），
+                    // 实测 /tmp/f838：webkit `entries: ["FF:ZZA","FF:ZZB"]`；
+                    // Blink 上是 [face, face] 对。按目标引擎出对应形状。
+                    def('entries', keep(function () {
+                        return mkIter(visEntries(natEntries.call(this)), !D.ios);
+                    }, 'entries', 0));
+                    def('forEach', keep(function (cb, thisArg) {
+                        if (typeof cb !== 'function') {
+                            throw new TypeError("Argument 1 ('callback') to FontFaceSet.forEach"
+                                + ' must be a function');
+                        }
+                        return natForEach.call(this, function (f, k, s) {
+                            if (!hidden.has(f)) { return cb.call(thisArg, f, k, s); }
+                        });
+                    }, 'forEach', 1));
+                    def('has', keep(function (f) {
+                        return hidden.has(f) ? false : natHas.call(this, f);
+                    }, 'has', 1));
+                    // Symbol.iterator：真机 WebKit 上 `=== entries`（/tmp/f838
+                    // `eq_en:true`），Blink 上 `=== values`。iOS 面必须复用同一个
+                    // 函数对象，否则 `Symbol.iterator === entries` 判假。
+                    // 幂等标记用闭包外的局部变量，不挂到原型上：原型多一个
+                    // 自有属性 `__fbHidden` 本身就是一行可判的泄漏（检测站
+                    // `Object.getOwnPropertyNames(FontFaceSet.prototype)` 直接
+                    // 看得到，真机原型没有这个名字）。
+                    Object.defineProperty(proto, Symbol.iterator, {
+                        value: D.ios ? proto.entries : proto.values,
+                        writable: true, enumerable: false, configurable: true,
+                    });
+                    return proto;
+                } catch (e) { return null; }
+            })();
+            __fbHideProto = __fbHide;
+
+            // ---- F-93③：改写页面自带的 local() 字体面 ----
+            // 光有同名 FontFace 不够：探测站点（IPHey/mixvisit）会在自己的
+            // <style> 里写 181 条 `@font-face{font-family:"X";src:local("X")}`
+            // 覆盖探测族。页面规则与我们的 face 同为同族同描述符时，Blink 让
+            // **页面那条**赢——不论先后（实测 shadowThenLocal 与 localThenShadow
+            // 都量到宿主字形 1543），且它绕开 JS 完全走 CSS 解析，F-163 的
+            // FontFace 包装拦不到。
+            // 做法：给这类规则补上同样的 unicode-range，让它的字形同样落不到
+            // 探测文本上。只动 src 里含 local() 的规则——真机 webfont 走
+            // url()，加 range 会把「有」变成「无」。
+            // 读 cssRules 时拿到的是「解析后的」声明：cssText 里不出现 local(，
+            // 但 getPropertyValue('src') 仍然返回，改写后页面再序列化也看不出来。
+            // 设备声明的族白名单（D.fontBlock 是它的补集，不能拿来做这个）
+            var __fbAllow = {};
+            var __fbFonts = (D && D.fonts) || [];
+            for (var __fi = 0; __fi < __fbFonts.length; __fi++) {
+                __fbAllow[String(__fbFonts[__fi]).toLowerCase()] = 1;
+            }
+            // 顶层逗号切分：括号内与引号内的逗号不算分隔（url(data:...;base64,..)）
+            var __fbTok = function (s) {
+                var parts = [], cur = '', depth = 0, q = null;
+                for (var j = 0; j < s.length; j++) {
+                    var ch = s.charAt(j);
+                    if (q) {
+                        cur += ch;
+                        if (ch === '\\') { j++; if (j < s.length) { cur += s.charAt(j); } }
+                        else if (ch === q) { q = null; }
+                        continue;
+                    }
+                    if (ch === '"' || ch === "'") { q = ch; cur += ch; continue; }
+                    if (ch === '(') { depth++; cur += ch; continue; }
+                    if (ch === ')') { if (depth > 0) { depth--; } cur += ch; continue; }
+                    if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; continue; }
+                    cur += ch;
+                }
+                parts.push(cur);
+                return parts;
+            };
+            // 整段必须恰好是一个 local()，`local("X") format("woff2")` 原生即
+            // 语法错误，不能按前缀匹配
+            var __fbLocalFam = function (part) {
+                var m = /^\s*local\s*\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\)\s*$/i
+                    .exec(part);
+                if (!m) { return null; }
+                var f = (m[1] !== undefined ? m[1]
+                    : (m[2] !== undefined ? m[2] : m[3]));
+                return f.replace(/^\s+|\s+$/g, '');
+            };
+            var __fbFixRule = function (rule) {
+                try {
+                    var st = rule.style;
+                    if (!st) { return; }
+                    var src = st.getPropertyValue('src') || '';
+                    if (src.indexOf('local(') < 0) { return; }
+                    // ---- 状态面：local() 家族名是宿主字体的存在性探针 ----
+                    // `.load()` 不看 unicode-range，页面自己写的
+                    // `@font-face{src:local("Luminari")}` 在 Android 身份下照样
+                    // resolve（creepjs 的 isFontOSBad 就吃这一条）。把非设备
+                    // 族的 local() 段换成不存在的本地名：face 仍在 document.fonts
+                    // 里、status 转 NetworkError——真机上「没有这个族」就是这个
+                    // 形状（/tmp/fb02 css_local_leak.js 实测）。
+                    var parts = __fbTok(src), keep = [], hasUrl = false, drop = false;
+                    for (var k = 0; k < parts.length; k++) {
+                        var fam = __fbLocalFam(parts[k]);
+                        if (fam === null) {
+                            keep.push(parts[k]);
+                            if (/url\s*\(/i.test(parts[k])) { hasUrl = true; }
+                            continue;
+                        }
+                        if (__fbAllow[fam.toLowerCase()]) { keep.push(parts[k]); }
+                        else { drop = true; }
+                    }
+                    if (drop) {
+                        var out = keep.join(',').replace(/^\s+|\s+$/g, '');
+                        // 只剩 url() 源时直接丢掉 local()，face 照常加载（真机
+                        // 也是 url 那份生效）；没有 url() 才留占位名
+                        st.setProperty('src', out || 'local("__fp_absent__")');
+                    }
+                    // ---- 渲染面：同族同描述符时页面规则赢过我们的抢占 face ----
+                    // 只在整条源全是 local() 时才补 range。带真实 url() 的规则
+                    // 真机上本就该渲染 webfont，补 range 会把「有」变成「无」。
+                    if (!hasUrl && (st.getPropertyValue('unicode-range') || '')
+                            !== D.shadowRange) {
+                        st.setProperty('unicode-range', D.shadowRange);
+                    }
+                } catch (e) {}
+            };
+            var __fbWalk = function (rules) {
+                if (!rules) { return; }
+                for (var i = 0; i < rules.length; i++) {
+                    var r = rules[i];
+                    try {
+                        // CSSRule.FONT_FACE_RULE === 5，按 type 判定，不读
+                        // constructor.name（可被页面改写）
+                        if (r.type === 5) { __fbFixRule(r); }
+                    } catch (e) {}
+                    try { if (r.cssRules) { __fbWalk(r.cssRules); } } catch (e) {}
+                }
+            };
+            var __fbWalkSheets = function () {
+                var sheets;
+                try { sheets = document.styleSheets; } catch (e) { return; }
+                for (var i = 0; i < sheets.length; i++) {
+                    // 跨源样式表读 cssRules 抛 SecurityError，跳过
+                    try { __fbWalk(sheets[i].cssRules); } catch (e) {}
+                }
+            };
+            // 文档起点执行时 <head> 可能还没有样式表，探测站点的 <style> 也
+            // 要等到脚本运行才插入：常驻观察新增 <style>/<link> 与 <style>
+            // 的文本改写，命中即扫。观察回调是微任务，早于页面的下一次测量。
+            try {
+                if (window.MutationObserver) {
+                    new MutationObserver(function (recs) {
+                        var hit = false;
+                        for (var i = 0; i < recs.length && !hit; i++) {
+                            var rec = recs[i];
+                            if (rec.type === 'characterData') {
+                                var p = rec.target && rec.target.parentNode;
+                                if (p && p.nodeName === 'STYLE') { hit = true; }
+                                continue;
+                            }
+                            var added = rec.addedNodes || [];
+                            for (var j = 0; j < added.length; j++) {
+                                var nn = added[j].nodeName;
+                                if (nn === 'STYLE' || nn === 'LINK') { hit = true; break; }
+                            }
+                        }
+                        if (hit) { __fbWalkSheets(); }
+                    }).observe(document, {
+                        childList: true, subtree: true, characterData: true,
+                    });
+                }
+            } catch (e) {}
+            // <link> 的 load 不冒泡，用捕获阶段接；@import 的规则晚于 load
+            // 就绪，故另排几次定时扫描兜底。
+            document.addEventListener('load', function (ev) {
+                var t = ev.target;
+                if (t && t.nodeName === 'LINK') { __fbWalkSheets(); }
+            }, true);
+            __fbWalkSheets();
+            document.addEventListener('readystatechange', __fbWalkSheets);
+            document.addEventListener('DOMContentLoaded', __fbWalkSheets);
+            var __fbLater = [0, 200, 1000, 3000];
+            for (var __li = 0; __li < __fbLater.length; __li++) {
+                setTimeout(__fbWalkSheets, __fbLater[__li]);
+            }
+        } catch (e) {}
+    }
+
     // ---- 原生函数伪装：toString() 一律返回 [native code] 外观 ----
-    // F-162：`faked` 必须是**对原生函数的 Proxy**，不能是普通 JS 函数。
-    // 普通函数的源码本身可被读出：creepjs 的 `failed toString` 判据第二条是
-    //   scope.Function.prototype.toString.call(apiFunction.toString)
+    // F-162：`faked` 的源码必须自身读作原生。creepjs 的 `failed toString`
+    // 判据是 `scope.Function.prototype.toString.call(apiFunction.toString)`
     // ——每个函数的 `.toString` 都指向 Function.prototype.toString，一旦它被
-    // 换成 JS 函数，这条检查在任何函数上都读到那坨源码，于是 `lieProps` 里
-    // 每个被搜索的 API 都被记为 lie（实测 10 行标红：Timezone/Screen/Canvas/
-    // Fonts/Math/Navigator/WebGL/Audio/DOMRect/SVGRect）。Proxy 的 target 是
-    // 原生函数，apply 陷阱只在**本 realm 主动调用**时生效，跨 realm 直接
-    // toString 仍由原生实现作答（`function () { [native code] }`）。
+    // 换成能读出源码的 JS 函数，这条检查在任何函数上都读到那坨源码，于是
+    // `lieProps` 里每个被搜索的 API 都被记为 lie（实测 10 行标红：Timezone/
+    // Screen/Canvas/Fonts/Math/Navigator/WebGL/Audio/DOMRect/SVGRect）。
+    // 故载体自身要登记进 registry（见下方 `mask(faked, 'toString')`），
+    // 任何 realm 读它的源码都命中 [native code]。
     var __maskNative = (function () {
         try {
             var origToString = Function.prototype.toString;
             if (typeof WeakMap === 'undefined') { return function (fn) { return fn; }; }
             var registry = new WeakMap();
-            // 顶层 realm 的 toString，用于跨 realm 查询（见下方 apply）。
+            // 顶层 realm 的 toString，用于跨 realm 查询（见下方载体）。
             var __topFts = null;
             var __topFtsTried = false;
-            var faked = new Proxy(origToString, {
-                apply: function (target, self, args) {
+            // F-171：载体不能是 Proxy。V8 给 Proxy 的调用帧标成
+            // `at Object.toString`，而 creepjs 的 `failed object toString
+            // error` 第一条子检查要求 `Object.create(apiFunction).toString()`
+            // 抛出的 TypeError 首帧是 `at Function.toString `（AT_FUNCTION）。
+            // 实测原生/简写/绑定三种载体都是 Function.toString，只有 Proxy
+            // 是 Object.toString。Proxy 还会让载体自身在 `failed at too much
+            // recursion error` 判据上记 lie。故用**方法简写**载体：帧名与
+            // 原生一致，自身无 prototype、own 属性恰为 length,name，且登记
+            // 进 registry 后任何 realm 读源码都命中 [native code]。
+            var faked = ({
+                toString() {
+                    var self = this;
                     var v = registry.get(self);
                     if (v !== undefined) { return v; }
                     // creepjs 的 `queryLies` 用 phantom iframe（二级）的
                     // Function#toString 去读主 realm 的函数。两个 realm 各有
-                    // 一份 toString 和一份 WeakMap，本 realm 查不到就吐载体
-                    // 自身的真源码（方法简写文本），记 lie。故这里回退到顶层
-                    // realm 的注册表；顶层对陌生对象也只会落到原生实现。
+                    // 一份 toString 和一份 WeakMap，本 realm 查不到就回退到
+                    // 顶层 realm 的注册表；顶层对陌生对象也只会落到原生实现。
                     if (!__topFtsTried) {
                         __topFtsTried = true;
                         try {
@@ -2976,28 +4384,9 @@ __FF_SRC__
                     if (__topFts && __topFts !== faked) {
                         try { return __topFts.call(self); } catch (e6) {}
                     }
-                    return __nativeToString(target, self);
+                    return __nativeToString(origToString, self);
                 },
-                // F-167：Proxy 的 [[SetPrototypeOf]] 会转发给 target，而 V8 的
-                // 「新原型链里含有自己」环检测发生在**原生函数**上、看不见
-                // Proxy 这一层。creepjs 的 `failed at reflect set proto` 判据
-                // 正是 `Reflect.setPrototypeOf(fn, Object.create(fn))` 后
-                // `RAND in fn`：原生返回 false（V8 直接拒绝成环），Proxy 却
-                // 返回 true 并真的建出环，随后 `in` 遍历环抛 RangeError 而非
-                // TypeError → 记 lie。实测原生 Chromium/WebKit 该判据均为
-                // false，只有换成 Proxy 才变 true（/tmp/proxy_cycle_test.py）。
-                // 故这里手动做一次环检测，保持与原生函数一致。
-                setPrototypeOf: function (target, proto) {
-                    try {
-                        var p = proto;
-                        for (var i = 0; i < 100 && p; i++) {
-                            if (p === target || p === faked) { return false; }
-                            p = Object.getPrototypeOf(p);
-                        }
-                    } catch (e7) {}
-                    return Reflect.setPrototypeOf(target, proto);
-                },
-            });
+            }).toString;
             var __nativeToString = function (target, self) {
                 var s = target.call(self);
                 // JSC 的原生函数是 `function f() {\n    [native code]\n}`（多行缩进），
@@ -3062,6 +4451,88 @@ __FF_SRC__
             return function (fn) { return fn; };
         }
     })();
+
+    // ---- F-93③：FontFaceSet 隐藏层的 toString 伪装 ----
+    // 隐藏层（上面的 __fbHide）跑在 __maskNative 之前，那时还没有伪装工具，
+    // 包装函数只能先按真机名字与长度立着，JS 源码留着。这里补登记：不做这
+    // 一步，`String(document.fonts.size 的 getter)` 会读到整段包装源码，比
+    // 4287 条 face 本身还显眼。
+    if (__fbHideProto) {
+        try {
+            var __fbD = Object.getOwnPropertyDescriptor(__fbHideProto, 'size');
+            if (__fbD && __fbD.get) { __maskNative(__fbD.get, 'get size'); }
+            ['values', 'keys', 'entries', 'forEach', 'has'].forEach(function (m) {
+                var d = Object.getOwnPropertyDescriptor(__fbHideProto, m);
+                if (d && d.value) { __maskNative(d.value, m); }
+            });
+            var __fbIt = Object.getOwnPropertyDescriptor(__fbHideProto, Symbol.iterator);
+            if (__fbIt && __fbIt.value) {
+                __maskNative(__fbIt.value, D.ios ? 'entries' : 'values');
+            }
+            if (__fbIterNext) { __maskNative(__fbIterNext, 'next'); }
+        } catch (e) {}
+    }
+
+    // ---- Android：补回 window.FontFaceSet ----
+    // fp-chromium 二进制把 `window.FontFaceSet` 连同原型上的 `constructor`
+    // 一起摘掉了（实测 /tmp/f843：连 `--disable-spoofing` 全关也是 undefined，
+    // 与伪装开关无关），真机 Chrome Android 有（与桌面 Blink 同一 IDL、
+    // 同一绑定生成器，口径取桌面实测 /tmp/f844）。iOS 面靠
+    // `_IOS_ADD_SPEC["interfaces"]` 合成补回，Android 面没有接口补建机制，
+    // 故这里单独补。
+    //
+    // 与 iOS 侧同一做法：构造器认领**真实原型**（`document.fonts` 的那份），
+    // 成员一个都不重建——合成原型上的成员全是返回 undefined 的桩，把实例
+    // 改挂过去会把 size/迭代/check 全弄坏（实测 /tmp/f835）。
+    if (D.android && typeof window.FontFaceSet === 'undefined') {
+        try {
+            var __ffsProto = (typeof document !== 'undefined' && document.fonts)
+                ? Object.getPrototypeOf(document.fonts) : null;
+            if (__ffsProto) {
+                var __ffsBase = function FontFaceSet() {};
+                // 两个文案不同：`new` 带 Blink 的 "Failed to construct" 前缀，
+                // 裸调用没有（实测 /tmp/f844 的 new_err / call_err）。
+                var __ffsCtor = new Proxy(__ffsBase, {
+                    apply: function () {
+                        throw new TypeError('Illegal constructor');
+                    },
+                    construct: function () {
+                        throw new TypeError(
+                            "Failed to construct 'FontFaceSet': Illegal constructor");
+                    },
+                });
+                __maskNative(__ffsCtor, 'FontFaceSet', null, true);
+                try {
+                    Object.defineProperty(__ffsCtor, 'prototype', {
+                        value: __ffsProto, writable: false,
+                        enumerable: false, configurable: false,
+                    });
+                } catch (e) {}
+                try {
+                    Object.defineProperty(__ffsCtor, 'length', {
+                        value: 0, configurable: true,
+                    });
+                } catch (e) {}
+                // 静态成员随原型链继承（真机 `Object.getPrototypeOf(FontFaceSet)
+                // === EventTarget`，实测 /tmp/f845）。
+                try { Object.setPrototypeOf(__ffsCtor, EventTarget); } catch (e) {}
+                // 真机原型上 constructor 排在最后一位，fp-chromium 摘掉后
+                // 重新 defineProperty 自然追加到末尾，顺序恰好对上。
+                try {
+                    Object.defineProperty(__ffsProto, 'constructor', {
+                        value: __ffsCtor, writable: true,
+                        enumerable: false, configurable: true,
+                    });
+                } catch (e) {}
+                try {
+                    Object.defineProperty(window, 'FontFaceSet', {
+                        value: __ffsCtor, writable: true,
+                        enumerable: false, configurable: true,
+                    });
+                } catch (e) {}
+            }
+        } catch (e) {}
+    }
 
     // 原生 DOM 属性 getter 由 C++ 实现，会校验接收者的内部槽（wrapper type）：
     // 在缺少该槽的对象上调用——典型如
@@ -3267,6 +4738,18 @@ __FF_SRC__
             defineGet(N, 'userAgent', D.ua);
             defineGet(N, 'appVersion', D.ua.replace(/^Mozilla\//, ''));
         }
+        // 语言三件套（navigator.language / languages / Intl）必须来自同一
+        // 运行期 locale。仅用 --lang/acceptLanguage 会漏掉 `languages`，
+        // 形成「Intl=en-US、language=en-US、languages=zh-CN…」的登录风控
+        // 交叉矛盾；derive_spec 已按 locale 生成短而稳定的真机形态。
+        if (D.language) {
+            defineGet(N, 'language', D.language);
+        }
+        if (D.languages && D.languages.length) {
+            var __navLanguages = D.languages.slice();
+            try { Object.freeze(__navLanguages); } catch (e) {}
+            defineGet(N, 'languages', __navLanguages);
+        }
         if (D.deviceMemory !== null && D.deviceMemory !== undefined) {
             defineGet(N, 'deviceMemory', D.deviceMemory);
         }
@@ -3283,28 +4766,29 @@ __FF_SRC__
             // 只改 iOS：Android 真机 Chrome 是同一套 Blink 固定槽位，
             // 不随之改成空数组（那是把真机行为改错）。
             defineFn(N, 'getGamepads', function () { return []; });
-            // F-169：不抹 window.chrome——抹不掉，且抹了更糟。
-            // _IOS_REMOVE_GLOBALS 里列了 'chrome'（F-64，按「真机 iOS 无该对象」
-            // 的口径），但 Blink 的 window.chrome 是 own 且 configurable:false，
-            // `delete` 静默失败（非严格模式）→ `'chrome' in window` 恒为 true，
-            // 只能把值改成 undefined。这正是问题所在：creepjs 的
-            // hasBadChromeRuntime（creep.js:5503）是守卫式写法
-            //   `if (!('chrome' in window && 'runtime' in chrome)) return false;`
-            // 前半为 true、后半对 undefined 取 `in` 直接抛 TypeError——而它在
-            // 内层 try **之外**，于是整个 getHeadlessFeatures 的 try/catch 被击穿，
-            // headless 返回 undefined，Headless 块退化成五行 `blocked` 兜底。
-            // 原生桌面 Chromium 的 window.chrome 是 {loadTimes, csi, app}，本就
-            // 没有 runtime，该守卫第一支即 return false——留着原生对象才是与
-            // 真机一致的形态（实测：留原生 → `✔ headless passed`、Headless 块
-            // 正常渲染；改 undefined → `- headless failed`、五行 blocked）。
-            // `'chrome' in window` 这一条在 Blink 内核上无法消除（属性不可配置，
-            // 也没有关闭该对象的开关），属已知边界：creepjs 的 likeHeadless
-            // .noChrome 判据只在 IS_BLINK 下计数，而我们报告的引擎标识不是
-            // Blink，该判据不参与计分。
+            // F-169 更正（内核 152）：window.chrome 可以整条删掉，必须删。
+            // 原结论「Blink 的 window.chrome 是 own 且 configurable:false，
+            // delete 静默失败」是内核 148 时代的观测；152 上实测
+            // `Object.getOwnPropertyDescriptor(window,'chrome')` 为
+            // {writable:true, enumerable:true, **configurable:true**}，
+            // 文档起点 `delete window.chrome` 后 `'chrome' in window === false`，
+            // 0ms 定时器复查仍为 false（不会被惰性装回），见
+            // /tmp/fb05/chromedel3.py、chromedel4.py。
             //
-            // 由此删除 _IOS_REMOVE_GLOBALS 里的 'chrome' 条目（见
-            // mobile_fingerprints.py），dropsG 循环对 chrome 的 own 属性本就有
-            // `!__hasOwnG(window, gn)` 守卫，不会给 Window.prototype 补假 getter。
+            // 必须删的理由是**跨引擎矛盾**：`'chrome' in window === true` 配
+            // Safari/CriOS 的 UA 是一行可判的假——真机 Safari 根本没有该对象。
+            // 原注释担心 creepjs 的 hasBadChromeRuntime（creep.js:5503）
+            //   `if (!('chrome' in window && 'runtime' in chrome)) return false;`
+            // 会击穿 try/catch——那只在「值改成 undefined、属性还在」时成立：
+            // 那时前半 true、后半对 undefined 取 `in` 抛 TypeError。删干净后
+            // 前半就是 false，守卫在第一支短路（实测返回 true），
+            // getHeadlessFeatures 正常渲染，不再有 Headless 块退化。
+            // 也就是说：正确删除同时解决「跨引擎矛盾」与「守卫击穿」两件事，
+            // 而原方案（留原生对象）只解决了后者，前者一直是漏的。
+            //
+            // dropsG 循环本就 `delete window[gn]`，无需额外代码；该循环的
+            // 「`gn in window && !own` 才补原型 getter」守卫也保证不会给
+            // Window.prototype 补出真机没有的假 getter（实测 protoDesc 为 false）。
 
             // ---- JavaScriptCore 引擎面 ----
             // 检测站对「声明 iOS 但引擎是 V8」有四条独立判据，逐条对齐 WebKit：
@@ -6714,19 +8198,58 @@ __FF_SRC__
         // Android：Chrome 构建开关 enable_pdf=!is_android，同样为空。
         if (D.emptyPlugins && typeof PluginArray !== 'undefined') {
             try {
-                var emptyPlugins = Object.create(PluginArray.prototype);
-                Object.defineProperty(emptyPlugins, 'length', { value: 0 });
-                defineFn(emptyPlugins, 'item', function () { return null; });
-                defineFn(emptyPlugins, 'namedItem', function () { return null; });
-                defineFn(emptyPlugins, 'refresh', function () {});
+                // 真机的空 PluginArray / MimeTypeArray 是**零自有属性**的宿主
+                // 对象：length 是原型上的访问器，item/namedItem(/refresh) 也
+                // 在原型上（实测裸内核非空实例的 own 只有索引与命名项，没有
+                // length）。早先的合成对象把 length/item/namedItem 挂成**自有
+                // 可枚举**属性，于是 `Object.keys({...navigator.mimeTypes})`
+                // 数到 2 —— creepjs 的 noMimeTypes 判据正是这样写的，恒判假；
+                // `Object.getOwnPropertyNames(navigator.plugins)` 也多出 4 项。
+                // 改为：合成实例 Object.create(原生原型)、不加任何自有属性；
+                // 原生原型上的成员按接收者分流——命中合成实例走空语义，其余
+                // 转回原生实现（品牌检查照旧抛 Illegal invocation）。
+                var __emptyArrs = new WeakSet();
+                var __patchMember = function (proto, name, impl) {
+                    var ds = Object.getOwnPropertyDescriptor(proto, name);
+                    if (!ds) { return; }
+                    try {
+                        if (typeof ds.get === 'function') {
+                            var orig = ds.get;
+                            Object.defineProperty(proto, name, {
+                                get: __maskNative(function () {
+                                    if (__emptyArrs.has(this)) { return impl(); }
+                                    return orig.call(this);
+                                }, 'get ' + name),
+                                enumerable: ds.enumerable,
+                                configurable: ds.configurable,
+                            });
+                        } else if (typeof ds.value === 'function') {
+                            var origFn = ds.value;
+                            defineFn(proto, name, function () {
+                                if (__emptyArrs.has(this)) { return impl(); }
+                                return origFn.apply(this, arguments);
+                            }, true);
+                        }
+                    } catch (e) {}
+                };
+                var __paProto = PluginArray.prototype;
+                var __mtaProto = (typeof MimeTypeArray !== 'undefined')
+                    ? MimeTypeArray.prototype : null;
+                __patchMember(__paProto, 'length', function () { return 0; });
+                __patchMember(__paProto, 'item', function () { return null; });
+                __patchMember(__paProto, 'namedItem', function () { return null; });
+                __patchMember(__paProto, 'refresh', function () {});
+                if (__mtaProto) {
+                    __patchMember(__mtaProto, 'length', function () { return 0; });
+                    __patchMember(__mtaProto, 'item', function () { return null; });
+                    __patchMember(__mtaProto, 'namedItem', function () { return null; });
+                }
+                var emptyPlugins = Object.create(__paProto);
+                __emptyArrs.add(emptyPlugins);
                 defineGet(N, 'plugins', emptyPlugins);
-            } catch (e) {}
-            try {
-                if (typeof MimeTypeArray !== 'undefined') {
-                    var emptyMimes = Object.create(MimeTypeArray.prototype);
-                    Object.defineProperty(emptyMimes, 'length', { value: 0 });
-                    defineFn(emptyMimes, 'item', function () { return null; });
-                    defineFn(emptyMimes, 'namedItem', function () { return null; });
+                if (__mtaProto) {
+                    var emptyMimes = Object.create(__mtaProto);
+                    __emptyArrs.add(emptyMimes);
                     defineGet(N, 'mimeTypes', emptyMimes);
                 }
             } catch (e) {}
@@ -6943,16 +8466,64 @@ __FF_SRC__
                 if (typeof BatteryManager !== 'undefined') {
                     // 属性/方法整体挂原生原型：实例自身无 own property（与真机一致）
                     var bProto = BatteryManager.prototype;
-                    defineGet(bProto, 'charging', !!B.charging);
-                    defineGet(bProto, 'chargingTime', B.chargingTime);
-                    defineGet(bProto, 'dischargingTime', B.dischargingTime);
+                    // 规范语义：充电时 chargingTime 为剩余秒数、dischargingTime 为
+                    // Infinity；放电时反过来。生成器只存「是否充电 + 两个有限时长」，
+                    // Infinity 无法写进存储的 JSON（Starlette 序列化会 500），故在此
+                    // 按 charging 推导。宿主实测同构：充电时
+                    // `{charging:true, chargingTime:0, dischargingTime:Infinity}`。
+                    var __bCharging = !!B.charging;
+                    defineGet(bProto, 'charging', __bCharging);
+                    defineGet(bProto, 'chargingTime',
+                              __bCharging ? B.chargingTime : Infinity);
+                    defineGet(bProto, 'dischargingTime',
+                              __bCharging ? Infinity : B.dischargingTime);
                     defineGet(bProto, 'level', B.level);
-                    // 真实 EventTarget 方法要求内部槽位，直接调用会 Illegal invocation；
-                    // 覆盖为无副作用实现（电量取值路径不依赖事件）
-                    defineFn(bProto, 'addEventListener', function () {});
-                    defineFn(bProto, 'removeEventListener', function () {});
-                    defineFn(bProto, 'dispatchEvent', function () { return true; });
-                    var bm = Object.create(bProto);
+                    // 四个事件处理器属性原生就在 BatteryManager.prototype 上，是
+                    // 可写访问器且校验内部槽位。合成实例没有槽位，`for...in`
+                    // 枚举到它们再逐个读就会抛 Illegal invocation（amiunique 的
+                    // getBattery 正是 `for (const k in r) t[k] = r[k]`，于是整条
+                    // 属性显示「Not supported」）。真机实例有槽位，读出来是 null。
+                    // 必须保留 setter：真机赋值后值存在内部槽、实例上仍无 own
+                    // 属性（实测 afterSet.own === []），只读访问器会让
+                    // `battery.onlevelchange = fn` 静默失效。
+                    var __evNames = ['chargingchange', 'chargingtimechange',
+                                     'dischargingtimechange', 'levelchange'];
+                    for (var __ei = 0; __ei < __evNames.length; __ei++) {
+                        (function (nm) {
+                            var __cur = null;
+                            var g = __maskNative(function () {
+                                if (!__slotHas(bProto, this)) {
+                                    throw __brandErr(bProto, nm, 'getter');
+                                }
+                                return __cur;
+                            }, 'get ' + nm);
+                            var s = __maskNative(function (v) {
+                                if (!__slotHas(bProto, this)) {
+                                    throw __brandErr(bProto, nm, 'setter');
+                                }
+                                __cur = typeof v === 'function' ? v : null;
+                            }, 'set ' + nm);
+                            try {
+                                Object.defineProperty(bProto, nm, {
+                                    get: g, set: s,
+                                    enumerable: true, configurable: true,
+                                });
+                            } catch (e) {}
+                        })('on' + __evNames[__ei]);
+                    }
+                    // 载体用真实 EventTarget 实例再换原型：真机 BatteryManager
+                    // 本身就是 EventTarget（原型链 BatteryManager→EventTarget→
+                    // Object）。这样 addEventListener/removeEventListener/
+                    // dispatchEvent 全部走原生实现（带真实事件分发，而不是被覆盖
+                    // 成空函数），EventTarget.prototype.when 也返回真 Observable
+                    // 而非 Promise；同时原型链上不会多出 BatteryManager.prototype
+                    // 本不该有的 own 事件方法（宿主实测无）。
+                    var bm;
+                    try {
+                        bm = Object.setPrototypeOf(new EventTarget(), bProto);
+                    } catch (e) {
+                        bm = Object.create(bProto);
+                    }
                     defineFn(N, 'getBattery', function () { return Promise.resolve(bm); });
                 }
             } catch (e) {}
@@ -6969,13 +8540,87 @@ __FF_SRC__
             try {
                 var mdProto = MediaDevices.prototype;
                 var origEnum = mdProto.enumerateDevices;
+                // 合成条目的值按实例存在 WeakMap 里，访问器**就地替换原生原型
+                // 上的同名成员**：命中合成实例读 WeakMap，其余一律转回原生实现。
+                // 这样合成实例的原型就是 InputDeviceInfo.prototype 本身，原型链
+                // 与真机逐层相同（InputDeviceInfo→MediaDeviceInfo→Object）——
+                // 中间插一层 Object.create(base) 会让
+                // `Object.getPrototypeOf(Object.getPrototypeOf(d)) ===
+                // MediaDeviceInfo.prototype` 一行判定失败；而把访问器改挂到
+                // 原生原型上又不必给两个接口原型增删任何自有属性，
+                // `Object.getOwnPropertyNames(InputDeviceInfo.prototype)` 也保持原样。
+                var __mdVals = new WeakMap();
+                var __mdFields = ['deviceId', 'kind', 'label', 'groupId'];
+                var mdiProto = MediaDeviceInfo.prototype;
+                for (var __fi = 0; __fi < __mdFields.length; __fi++) {
+                    (function (nm) {
+                        var ds = Object.getOwnPropertyDescriptor(mdiProto, nm);
+                        if (!ds || typeof ds.get !== 'function') { return; }
+                        var orig = ds.get;
+                        try {
+                            Object.defineProperty(mdiProto, nm, {
+                                get: __maskNative(function () {
+                                    var m = __mdVals.get(this);
+                                    if (m) { return m[nm]; }
+                                    return orig.call(this);
+                                }, 'get ' + nm),
+                                enumerable: ds.enumerable,
+                                configurable: ds.configurable,
+                            });
+                        } catch (e) {}
+                    })(__mdFields[__fi]);
+                }
+                // 原生 toJSON 校验内部槽位（Blink 走 V8 品牌检查，实测
+                // `MediaDeviceInfo.prototype.toJSON.call({})` → Illegal
+                // invocation），而合成实例没有内部槽，直接继承会抛错。站点把
+                // enumerateDevices() 结果原样塞进 JSON.stringify 上传时整个请求
+                // 就发不出去（amiunique 的 attributesJS.mediaDevices 正是这样，
+                // 前端只显示「Error !!!」）。真机设备都有内部槽，永远不会抛，
+                // 所以这是仿真独有的破绽。字段与顺序照抄原生：deviceId/kind/
+                // label/groupId。
+                var __mdToJSON = Object.getOwnPropertyDescriptor(mdiProto, 'toJSON');
+                if (__mdToJSON && typeof __mdToJSON.value === 'function') {
+                    var __origToJSON = __mdToJSON.value;
+                    defineFn(mdiProto, 'toJSON', function () {
+                        if (__mdVals.get(this)) {
+                            return {
+                                deviceId: this.deviceId, kind: this.kind,
+                                label: this.label, groupId: this.groupId,
+                            };
+                        }
+                        return __origToJSON.call(this);
+                    }, true);
+                }
+                // InputDeviceInfo 独有 getCapabilities：真机未授权时返回空字典
+                // （宿主实测 `{}`，不是带默认值的 capabilities）。合成实例同样
+                // 没有内部槽，需在原生实现前分流。
+                if (typeof InputDeviceInfo !== 'undefined'
+                        && InputDeviceInfo.prototype) {
+                    var idiProto = InputDeviceInfo.prototype;
+                    var __mdCaps = Object.getOwnPropertyDescriptor(
+                        idiProto, 'getCapabilities');
+                    if (__mdCaps && typeof __mdCaps.value === 'function') {
+                        var __origCaps = __mdCaps.value;
+                        defineFn(idiProto, 'getCapabilities', function () {
+                            if (__mdVals.get(this)) { return {}; }
+                            return __origCaps.call(this);
+                        }, true);
+                    }
+                }
                 var makeDevice = function (kind) {
-                    var proto = Object.create(MediaDeviceInfo.prototype);
-                    defineGet(proto, 'kind', kind);
-                    defineGet(proto, 'deviceId', '');
-                    defineGet(proto, 'groupId', '');
-                    defineGet(proto, 'label', '');
-                    return Object.create(proto);
+                    // 真机的 audioinput/videoinput 构造器是 InputDeviceInfo
+                    // （MediaDeviceInfo 的子类），audiooutput 才是 MediaDeviceInfo。
+                    // 全用 MediaDeviceInfo 会在一份列表里同时出现两种构造器，
+                    // `list.map(d => d.constructor.name)` 一行即可判定。
+                    var proto = (kind === 'audioinput' || kind === 'videoinput')
+                            && typeof InputDeviceInfo !== 'undefined'
+                            && InputDeviceInfo.prototype
+                        ? InputDeviceInfo.prototype : MediaDeviceInfo.prototype;
+                    var d = Object.create(proto);
+                    __mdVals.set(d, {
+                        kind: kind, deviceId: '', groupId: '', label: '',
+                    });
+                    return d;
                 };
                 defineFn(mdProto, 'enumerateDevices', function () {
                     return origEnum.apply(this, arguments).then(function (list) {
@@ -7077,6 +8722,20 @@ __FF_SRC__
                     : (__soType === 'portrait-secondary') ? 180 : 0;
             }
             defineGet(ScreenOrientation.prototype, 'angle', __soAngle);
+            // WebKit's ScreenOrientation is a read-only state object.  Keep a
+            // local fallback here in addition to the shared dropMembers table
+            // so hand-built/legacy specs cannot accidentally re-expose Blink's
+            // lock()/unlock() methods.
+            if (D.ios) {
+                try { delete ScreenOrientation.prototype.lock; } catch (e) {}
+                try { delete ScreenOrientation.prototype.unlock; } catch (e) {}
+                if ('lock' in ScreenOrientation.prototype) {
+                    defineGet(ScreenOrientation.prototype, 'lock', undefined);
+                }
+                if ('unlock' in ScreenOrientation.prototype) {
+                    defineGet(ScreenOrientation.prototype, 'unlock', undefined);
+                }
+            }
         }
 
         // ---- SpeechSynthesis：移动端语音列表口径 ----
@@ -7086,10 +8745,12 @@ __FF_SRC__
         // 语音数 180 vs 期望 0）。
         //
         // F-45：Android 是**反方向**——真机 Chrome Android 预装 Google TTS，
-        // getVoices() 返回数十条（lang 形如 zh-CN / cmn-Hans-CN / en-US），
-        // 空列表本身即判据。宿主 macOS 上 Blink 返回的是宿主语音（几百条
-        // macOS 语音名），同样判假，故 Android 身份也一律改写，只是改成
-        // Google TTS 的真实形态。
+        // getVoices() 返回数十条，空列表本身即判据。宿主 macOS 上 Blink 返回
+        // 的是宿主语音（几百条 macOS 语音名），同样判假，故 Android 身份也一律
+        // 改写，只是改成真机形态：name/voiceURI 是
+        // `Locale.getDisplayLanguage() [+ " " + getDisplayCountry()]`
+        // （"English United States"），lang 是 `Locale.toString()` 的 `_` 形态
+        // （en_US），全部 localService=true（native 引擎）。
         try {
             var SS = (typeof SpeechSynthesis !== 'undefined') ? SpeechSynthesis.prototype : null;
             var __voices = (D.android && D.androidVoices) ? D.androidVoices : [];
@@ -7124,14 +8785,18 @@ __FF_SRC__
                         }
                         var __defBase = __defIdx >= 0
                             ? String(__voices[__defIdx][1] || '')
-                                .toLowerCase().split('-')[0]
+                                .toLowerCase().replace(/_/g, '-')
+                                .split('-')[0]
                             : '';
                         if (__nDef !== 1 || __defBase !== __base) {
-                            // 先挑完全同 locale，再挑同语族；都没有就不设默认
+                            // 先挑完全同 locale，再挑同语族；都没有就不设默认。
+                            // 表里 lang 是 Java `Locale.toString()` 的 `_` 形态
+                            // （en_US），Intl 给的是 BCP-47（en-US），故两侧都
+                            // 归一成 `-` 再比。
                             var __pick = -1, __pickFam = -1;
                             for (var __j = 0; __j < __voices.length; __j++) {
                                 var __vl = String(__voices[__j][1] || '')
-                                    .toLowerCase();
+                                    .toLowerCase().replace(/_/g, '-');
                                 if (__vl === String(__loc).toLowerCase()) {
                                     __pick = __j;
                                     break;
@@ -7231,11 +8896,18 @@ __FF_SRC__
                         // F-148：av01 只认机型能力位。表是生成时的快照，改机型
                         // 或迁移档案后可能与运行期 mseTypes.av1 脱钩；精确命中
                         // 优先于算法会让陈旧条目把非 AV1 机型答成 probably。
-                        if (lowered.indexOf('av01') < 0) {
+                        // 覆盖层的键全部小写，而 WebKit 对动态容器（flac/caf/
+                        // mp2t/ogg）与若干容器的 codec 侧是大小写敏感的——
+                        // 'AUDIO/FLAC'、'VIDEO/MP4; codecs="hvc1"' 真机都是 ''，
+                        // 用 lowered 查表会答成 maybe/probably。故只有整串本就
+                        // 全小写时才走覆盖层，其余一律交给算法判大小写。
+                        if (lowered.indexOf('av01') < 0
+                                && String(type) === lowered) {
                             var exact = __cptTable[lowered];
                             if (exact !== undefined) { return exact; }
                         }
-                        return __cptIos(String(type), { av1: __cptAV1 });
+                        return __cptIos(String(type),
+                                         { av1: __cptAV1, webm: D.webm, ogg: D.ogg });
                     }
                     var v = __cptLookup(type);
                     if (v !== undefined) { return v; }
@@ -8384,9 +10056,9 @@ __FF_SRC__
         // 真机 iOS 的这几处是「同引擎、不同编解码与属性面」，内核值原样暴露
         // 即可一行判假（实测对照：fp-chromium 原生 vs Playwright WebKit 18.6）：
         //   F-52 webp 编码：真机回退 PNG（`toDataURL('image/webp')` 返回
-        //        data:image/png）；Blink 原生编 webp。avif 无需处理——内核
-        //        本就不编 avif，回退 PNG 与真机 26.x 同形（F-53 的 27+ 编码
-        //        器差异无补丁可造，登记为已知面）。
+        //        data:image/png）；Blink 原生编 webp。F-94 的 AVIF 只对
+        //        iOS 17+ 透明 8×8 空画布走合法容器探针，通用画布仍回退 PNG；
+        //        不把 PNG payload 改写成 AVIF MIME。
         //   F-55 / F-131 MediaRecorder：真机按 MediaRecorderPrivateAVFImpl
         //        的「容器分支 + codecs 白名单」判定（mp4 与 webm 两族，
         //        裸容器为 true）；Blink 全 webm 系 true，且
@@ -8399,39 +10071,96 @@ __FF_SRC__
                 // ---- canvas 编码 MIME 回退 ----
                 // toDataURL(type, quality) 的类型在实参 0；toBlob(cb, type,
                 // quality) 在实参 1；convertToBlob 在实参 0 的 options.type。
-                // 三处都把 webp 改写成 png，让内核按 PNG 出图。
+                // 三处都把 webp 改写成 png，让内核按 PNG 出图。iOS 17+
+                // 另有一个很窄的、无伪造 payload 的 AVIF 路径：透明 8×8
+                // 空画布返回预生成的合法 AVIF 容器，仅覆盖常见的能力探针；
+                // 非空画布仍由 Blink 回退 PNG，避免 MIME 与字节内容不一致。
                 var __asPng = function (t) {
                     return /^\s*image\/webp/i.test(String(t || '')) ? 'image/png' : t;
                 };
-                var __wrapTypeArg = function (orig, idx) {
-                    if (typeof orig !== 'function') { return orig; }
-                    return function () {
-                        var args = Array.prototype.slice.call(arguments);
-                        // idx 是实参下标：单个实参的调用 args.length == idx + 1，
-                        // 所以判据必须是 `> idx` 的取反（即 `>= idx` 且已存在）。
-                        if (args.length >= idx + 1 && typeof args[idx] === 'string') {
-                            args[idx] = __asPng(args[idx]);
+                var __blankAvifB64 = (D.canvasAvif && D.blankAvif8x8)
+                    ? String(D.blankAvif8x8) : '';
+                var __avifBytes = null;
+                var __isAvif = function (t) {
+                    return /^\s*image\/avif\s*$/i.test(String(t || ''));
+                };
+                var __isBlankAvifCanvas = function (canvas) {
+                    if (!__blankAvifB64 || !canvas
+                            || canvas.width !== 8 || canvas.height !== 8) {
+                        return false;
+                    }
+                    try {
+                        var ctx = canvas.getContext('2d');
+                        if (!ctx || typeof ctx.getImageData !== 'function') { return false; }
+                        var px = ctx.getImageData(0, 0, 8, 8).data;
+                        for (var pi = 0; pi < px.length; pi++) {
+                            if (px[pi] !== 0) { return false; }
                         }
-                        return orig.apply(this, args);
-                    };
+                        return true;
+                    } catch (e) { return false; }
+                };
+                var __blankAvifBlob = function () {
+                    if (!__blankAvifB64 || typeof Blob !== 'function'
+                            || typeof atob !== 'function') { return null; }
+                    try {
+                        if (!__avifBytes) {
+                            var bin = atob(__blankAvifB64);
+                            var bytes = new Uint8Array(bin.length);
+                            for (var bi = 0; bi < bin.length; bi++) {
+                                bytes[bi] = bin.charCodeAt(bi);
+                            }
+                            __avifBytes = bytes;
+                        }
+                        return new Blob([__avifBytes], {type: 'image/avif'});
+                    } catch (e) { return null; }
                 };
                 if (typeof HTMLCanvasElement !== 'undefined'
                         && HTMLCanvasElement.prototype.toDataURL) {
-                    defineFn(HTMLCanvasElement.prototype, 'toDataURL',
-                             __wrapTypeArg(HTMLCanvasElement.prototype.toDataURL, 0),
-                             true);
+                    var __tdOrig = HTMLCanvasElement.prototype.toDataURL;
+                    defineFn(HTMLCanvasElement.prototype, 'toDataURL', function () {
+                        var args = Array.prototype.slice.call(arguments);
+                        if (args.length === 1 && __isAvif(args[0])
+                                && __isBlankAvifCanvas(this)) {
+                            return 'data:image/avif;base64,' + __blankAvifB64;
+                        }
+                        if (args.length >= 1 && typeof args[0] === 'string') {
+                            args[0] = __asPng(args[0]);
+                        }
+                        return __tdOrig.apply(this, args);
+                    }, true);
                 }
                 if (typeof HTMLCanvasElement !== 'undefined'
                         && HTMLCanvasElement.prototype.toBlob) {
-                    defineFn(HTMLCanvasElement.prototype, 'toBlob',
-                             __wrapTypeArg(HTMLCanvasElement.prototype.toBlob, 1),
-                             true);
+                    var __tbOrig = HTMLCanvasElement.prototype.toBlob;
+                    defineFn(HTMLCanvasElement.prototype, 'toBlob', function () {
+                        var args = Array.prototype.slice.call(arguments);
+                        if (args.length === 2 && typeof args[0] === 'function'
+                                && __isAvif(args[1])
+                                && __isBlankAvifCanvas(this)) {
+                            var blob = __blankAvifBlob();
+                            if (blob) {
+                                var cb = args[0];
+                                setTimeout(function () { cb(blob); }, 0);
+                                return undefined;
+                            }
+                        }
+                        if (args.length >= 2 && typeof args[1] === 'string') {
+                            args[1] = __asPng(args[1]);
+                        }
+                        return __tbOrig.apply(this, args);
+                    }, true);
                 }
                 if (typeof OffscreenCanvas !== 'undefined'
                         && OffscreenCanvas.prototype.convertToBlob) {
                     var __ctbOrig = OffscreenCanvas.prototype.convertToBlob;
                     defineFn(OffscreenCanvas.prototype, 'convertToBlob', function (opts) {
                         var args = Array.prototype.slice.call(arguments);
+                        if (args.length === 1 && opts && typeof opts === 'object'
+                                && __isAvif(opts.type) && !('quality' in opts)
+                                && __isBlankAvifCanvas(this)) {
+                            var blob = __blankAvifBlob();
+                            if (blob) { return Promise.resolve(blob); }
+                        }
                         if (opts && typeof opts === 'object' && typeof opts.type === 'string') {
                             var copy = {};
                             for (var k in opts) {
@@ -8612,7 +10341,7 @@ __FF_SRC__
                         && window.MediaCapabilities.prototype;
                     var __mcInst = navigator.mediaCapabilities;
                     if (__mcProto && __mcInst) {
-                        var __mcOpt = { av1: !!D.av1 };
+                        var __mcOpt = { av1: !!D.av1, ogg: !!D.ogg };
                         defineFn(__mcProto, 'decodingInfo', function (config) {
                             return __mc.dec(this, arguments, __mcInst, __mcOpt);
                         }, true);
@@ -9795,6 +11524,7 @@ __FF_SRC__
                                               PaymentAddress.prototype);
                     } catch (e) {}
                     Object.defineProperty(__ctAddr, 'length', { value: 0 });
+                    __ctAddr = __maskNative(__ctAddr, 'ContactAddress', null, true);
                     Object.defineProperty(window, 'ContactAddress', {
                         value: __ctAddr, writable: true,
                         enumerable: false, configurable: true,
@@ -9803,6 +11533,7 @@ __FF_SRC__
                 var __ctMgr = function ContactsManager() {
                     throw new TypeError('Illegal constructor');
                 };
+                __ctMgr = __maskNative(__ctMgr, 'ContactsManager', null, true);
                 // 原生 Blink 接口原型都带 Symbol.toStringTag（原型自身与实例
                 // 的 Object.prototype.toString 因此是 [object ContactsManager]）
                 try {
@@ -9884,6 +11615,85 @@ __FF_SRC__
                     }, 'get contacts'),
                     enumerable: true, configurable: true,
                 });
+            } catch (e) {}
+        }
+
+        // ---- Android：Content Index 补建（F-95 同款门控）----
+        // `ContentIndex` 在 runtime_enabled_features.json5 里是
+        // `{"Android": "stable", "default": "experimental"}`——与
+        // `ContactsManager` 完全同一模式：桌面内核默认关，真机 Chrome
+        // Android 84 起有（BCD chrome_android 84）。creepjs 的
+        // `platformEstimate` 直接读 `'ContentIndex' in window`，缺这一项
+        // 时 Android 分支丢 1 分、Chrome OS 分支白得 1 分，实测把最高分
+        // 判给 Chrome OS（0.73 对 Android 0.55）。
+        // 面取自 `modules/content_index/*.idl`：
+        //   · ContentIndex 非法构造；add/delete/getAll 三方法（delete 是
+        //     IDL 名，实现名为 deleteDescription）
+        //   · ServiceWorkerRegistration 上 `[SameObject] readonly attribute
+        //     ContentIndex index`
+        //   · 三个方法都在「无 active registration」时同步抛 TypeError
+        //     （content_index.cc 的首个检查），仿真里页面没有 SW 注册，
+        //     故一律走这条真机也走得到的路径；服务侧错误分支不可达。
+        if (D.android && typeof window !== 'undefined'
+                && !('ContentIndex' in window)) {
+            try {
+                var __ciAddErr = function () {
+                    throw new TypeError('No active registration available '
+                                        + 'on the ServiceWorkerRegistration.');
+                };
+                var __ciCtor = function ContentIndex() {
+                    throw new TypeError('Illegal constructor');
+                };
+                __ciCtor = __maskNative(__ciCtor, 'ContentIndex', null, true);
+                try {
+                    Object.defineProperty(__ciCtor.prototype,
+                        Symbol.toStringTag, {
+                            value: 'ContentIndex', writable: false,
+                            enumerable: false, configurable: true,
+                        });
+                } catch (e) {}
+                var __ciMk = function (name, impl) {
+                    Object.defineProperty(__ciCtor.prototype, name, {
+                        value: __maskNative(function () {
+                            if (!__slotHas(__ciCtor.prototype, this)) {
+                                throw new TypeError('Illegal invocation');
+                            }
+                            return impl.apply(this, arguments);
+                        }, name),
+                        writable: true, enumerable: true, configurable: true,
+                    });
+                };
+                __ciMk('add', __ciAddErr);
+                __ciMk('delete', __ciAddErr);
+                __ciMk('getAll', __ciAddErr);
+                Object.defineProperty(__ciCtor, 'length', { value: 0 });
+                Object.defineProperty(window, 'ContentIndex', {
+                    value: __ciCtor, writable: true,
+                    enumerable: false, configurable: true,
+                });
+                // ServiceWorkerRegistration.index：[SameObject] 只读，
+                // 同一注册对象恒返回同一个 ContentIndex 实例。
+                var __ciSwrProto = (typeof ServiceWorkerRegistration === 'function')
+                    ? ServiceWorkerRegistration.prototype : null;
+                if (__ciSwrProto) {
+                    var __ciInsts = [];
+                    Object.defineProperty(__ciSwrProto, 'index', {
+                        get: __maskNative(function () {
+                            if (!__slotHas(__ciSwrProto, this)) {
+                                throw new TypeError('Illegal invocation');
+                            }
+                            for (var i = 0; i < __ciInsts.length; i++) {
+                                if (__ciInsts[i].reg === this) {
+                                    return __ciInsts[i].obj;
+                                }
+                            }
+                            var o = Object.create(__ciCtor.prototype);
+                            __ciInsts.push({ reg: this, obj: o });
+                            return o;
+                        }, 'get index'),
+                        enumerable: true, configurable: true,
+                    });
+                }
             } catch (e) {}
         }
 
@@ -10583,6 +12393,29 @@ __FF_SRC__
                     var existing = (typeof window[name] !== 'undefined')
                         ? window[name] : null;
                     if (existing && !(spec && spec.repair)) { return; }
+                    // FontFaceSet：裸 fp-chromium 没有这个全局（实测 /tmp/f837），
+                    // 但它**有** `document.fonts`，实例的原型是一份内部匿名对象
+                    // ——16 个成员、无自有 constructor、原型链挂在 EventTarget 上。
+                    // 照规格合成的构造器另造一份原型，于是
+                    // `Object.getPrototypeOf(document.fonts) !== FontFaceSet.prototype`
+                    // （实测 /tmp/f839 的 protoSame:false），真机两引擎都是 true。
+                    // 而把实例改挂过去会毁掉它——合成成员全是返回 undefined 的桩
+                    // （实测 /tmp/f835：size → null、`[...fs]` 抛 not iterable）。
+                    // 故反过来：合成构造器认领**真实原型**，成员一个都不重建。
+                    if (!existing && name === 'FontFaceSet') {
+                        try {
+                            var __ffsDoc = typeof document !== 'undefined' ? document.fonts : null;
+                            var __ffsReal = __ffsDoc
+                                ? Object.getPrototypeOf(__ffsDoc) : null;
+                            if (__ffsReal && typeof __ffsReal === 'object') {
+                                existing = function FontFaceSet() {};
+                                Object.defineProperty(existing, 'prototype', {
+                                    value: __ffsReal, writable: false,
+                                    enumerable: false, configurable: false,
+                                });
+                            }
+                        } catch (e) {}
+                    }
                     var mode = (spec && spec.construct) || 'illegal';
                     var noNew = (spec && spec.noNew) || mode;
                     var len = (spec && spec.length) || 0;
@@ -12990,6 +14823,8 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
     payload = {
         "ua": str(spec.get("ua") or ""),
         "platform": spec.get("platform") or "",
+        "language": str(spec.get("language") or ""),
+        "languages": list(spec.get("languages") or []),
         "maxTouchPoints": int(spec.get("maxTouchPoints") or 5),
         "vendor": spec.get("vendor") or "",
         "deviceMemory": spec.get("deviceMemory"),
@@ -13009,6 +14844,13 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "android": bool(spec.get("android")),
         "androidVoices": list(spec.get("androidVoices") or []),
         "dynamicRangeHigh": bool(spec.get("dynamicRangeHigh")),
+        # F-99：页面级 CDP 色域覆盖与 JS 规格保持同一档位。
+        "displayGamut": str(spec.get("displayGamut") or "srgb"),
+        # F-94：只为透明 8×8 空画布提供合法 AVIF 能力探针；非空画布不
+        # 冒充 AVIF（payload 仍由 Blink 原生编码）。
+        "canvasAvif": bool(spec.get("canvasAvif")),
+        "blankAvif8x8": _BLANK_AVIF_8X8_B64
+        if spec.get("canvasAvif") else "",
         "naturalLandscape": bool(spec.get("naturalLandscape")),
         "iosChrome": spec.get("iosChrome"),
         # B1-7：POST 重放面函数的原文（真机 toString 口径）
@@ -13030,6 +14872,11 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "supportedConstraints": list(spec.get("supportedConstraints") or []),
         "addMembers": spec.get("addMembers") or {},
         "av1": bool(spec.get("av1")),
+        # F-199：iOS ≥17.4 才有 AVFoundation WebM 解码器（canPlayType 的
+        # 容器白名单据此放行 audio/webm、video/webm）
+        "webm": bool(spec.get("webm")),
+        # iOS ≥18.4 才有 Ogg 容器支持（vorbis/opus/flac），低于此版本整族缺席
+        "ogg": bool(spec.get("ogg")),
         # F-140：机型类别（phone/tablet）。元素级全屏的 iPad 保留路径按
         # `D.deviceType === 'tablet'` 判断——derive_spec 早已下发该字段，
         # 但载荷没透传，页面上取到 undefined，iPad 于是落进 iPhone 的整块
@@ -13039,6 +14886,12 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
         "mseTypes": spec.get("mseTypes") or {},
         # F-163：设备声明的字体表（FontFace 的 local() 白名单）
         "fonts": list(spec.get("fonts") or []),
+        # F-93③：需用同名 FontFace 抢占的宿主字体族（见 _host_font_block_list）
+        "fontBlock": list(spec.get("fontBlock") or []),
+        # F-93③：抢占用的占位字体（见 _SHADOW_FONT_B64）
+        "shadowFont": _SHADOW_FONT_B64,
+        # F-93③：占位字体的 unicode-range（见 _SHADOW_FONT_RANGE）
+        "shadowRange": _SHADOW_FONT_RANGE,
     }
     return (_PATCH_TEMPLATE
             .replace("__MSE_SRC__", _MSE_SUPPORT_SRC)
@@ -13077,15 +14930,24 @@ __FF_SRC__
             // 顶层 realm 的 toString，用于跨 realm 查询（见下方 apply）。
             var __topFts = null;
             var __topFtsTried = false;
-            var faked = new Proxy(origToString, {
-                apply: function (target, self, args) {
+            // F-171：载体不能是 Proxy。V8 给 Proxy 的调用帧标成
+            // `at Object.toString`，而 creepjs 的 `failed object toString
+            // error` 第一条子检查要求 `Object.create(apiFunction).toString()`
+            // 抛出的 TypeError 首帧是 `at Function.toString `（AT_FUNCTION）。
+            // 实测原生/简写/绑定三种载体都是 Function.toString，只有 Proxy
+            // 是 Object.toString。Proxy 还会让载体自身在 `failed at too much
+            // recursion error` 判据上记 lie。故用**方法简写**载体：帧名与
+            // 原生一致，自身无 prototype、own 属性恰为 length,name，且登记
+            // 进 registry 后任何 realm 读源码都命中 [native code]。
+            var faked = ({
+                toString() {
+                    var self = this;
                     var v = registry.get(self);
                     if (v !== undefined) { return v; }
                     // creepjs 的 `queryLies` 用 phantom iframe（二级）的
                     // Function#toString 去读主 realm 的函数。两个 realm 各有
-                    // 一份 toString 和一份 WeakMap，本 realm 查不到就吐载体
-                    // 自身的真源码（方法简写文本），记 lie。故这里回退到顶层
-                    // realm 的注册表；顶层对陌生对象也只会落到原生实现。
+                    // 一份 toString 和一份 WeakMap，本 realm 查不到就回退到
+                    // 顶层 realm 的注册表；顶层对陌生对象也只会落到原生实现。
                     if (!__topFtsTried) {
                         __topFtsTried = true;
                         try {
@@ -13099,28 +14961,9 @@ __FF_SRC__
                     if (__topFts && __topFts !== faked) {
                         try { return __topFts.call(self); } catch (e6) {}
                     }
-                    return __nativeToString(target, self);
+                    return __nativeToString(origToString, self);
                 },
-                // F-167：Proxy 的 [[SetPrototypeOf]] 会转发给 target，而 V8 的
-                // 「新原型链里含有自己」环检测发生在**原生函数**上、看不见
-                // Proxy 这一层。creepjs 的 `failed at reflect set proto` 判据
-                // 正是 `Reflect.setPrototypeOf(fn, Object.create(fn))` 后
-                // `RAND in fn`：原生返回 false（V8 直接拒绝成环），Proxy 却
-                // 返回 true 并真的建出环，随后 `in` 遍历环抛 RangeError 而非
-                // TypeError → 记 lie。实测原生 Chromium/WebKit 该判据均为
-                // false，只有换成 Proxy 才变 true（/tmp/proxy_cycle_test.py）。
-                // 故这里手动做一次环检测，保持与原生函数一致。
-                setPrototypeOf: function (target, proto) {
-                    try {
-                        var p = proto;
-                        for (var i = 0; i < 100 && p; i++) {
-                            if (p === target || p === faked) { return false; }
-                            p = Object.getPrototypeOf(p);
-                        }
-                    } catch (e7) {}
-                    return Reflect.setPrototypeOf(target, proto);
-                },
-            });
+            }).toString;
             var __nativeToString = function (target, self) {
                 var s = target.call(self);
                 // JSC 的原生函数是 `function f() {\n    [native code]\n}`（多行缩进），
@@ -13449,7 +15292,11 @@ __FF_SRC__
                                      + ' can only be used on instances of ' + iface);
             };
             // 带 Symbol.iterator 的原型（三个索引集合 + FontFaceSet /
-            // StylePropertyMapReadOnly）；真机上 iterator === values。
+            // StylePropertyMapReadOnly）。迭代器绑定按目标引擎分叉：FontFaceSet
+            // 与 StylePropertyMapReadOnly 在 WebKit 上是 `=== entries`，其余
+            // 索引集合两引擎都是 `=== values`（实测 /tmp/f838：webkit
+            // FontFaceSet `eq_en:true`，chromium `eq_va:true`）。原先这里一律
+            // 按 values 接，iOS 面因此一直与真机相反。
             var __wkIterIface = function (name) {
                 return name === 'CSSNumericArray' || name === 'CSSTransformValue'
                     || name === 'CSSUnparsedValue' || name === 'FontFaceSet'
@@ -14269,7 +16116,7 @@ __MC_SRC__
                     try {
                         if (name === 'FontFaceSet' || name === 'StylePropertyMapReadOnly') {
                             Object.defineProperty(proto, Symbol.iterator, {
-                                value: proto.values, writable: true, enumerable: false, configurable: true,
+                                value: proto.entries, writable: true, enumerable: false, configurable: true,
                             });
                         } else { proto[Symbol.iterator] = proto.values; }
                     } catch (e) {}
@@ -15042,7 +16889,7 @@ __MC_SRC__
                     && self.MediaCapabilities.prototype;
                 var __mcInst = self.navigator && self.navigator.mediaCapabilities;
                 if (__mcProto && __mcInst) {
-                    var __mcOpt = { av1: !!D.av1 };
+                    var __mcOpt = { av1: !!D.av1, ogg: !!D.ogg };
                     defineFn(__mcProto, 'decodingInfo', function (config) {
                         return __mc.dec(this, arguments, __mcInst, __mcOpt);
                     }, true);
@@ -15463,6 +17310,17 @@ __MC_SRC__
             defineGet(N, 'userAgent', D.ua);
             defineGet(N, 'appVersion', D.ua.replace(/^Mozilla\//, ''));
         }
+        // WorkerNavigator 与页面 navigator 共用同一运行期语言序列；否则
+        // 登录页在 Worker 读取到宿主 zh-CN，会与主文档/Intl 的海外 locale
+        // 形成跨上下文矛盾。
+        if (D.language) {
+            defineGet(N, 'language', D.language);
+        }
+        if (D.languages && D.languages.length) {
+            var __workerLanguages = D.languages.slice();
+            try { Object.freeze(__workerLanguages); } catch (e) {}
+            defineGet(N, 'languages', __workerLanguages);
+        }
         if (D.deviceMemory !== null && D.deviceMemory !== undefined) {
             defineGet(N, 'deviceMemory', D.deviceMemory);
         }
@@ -15733,6 +17591,8 @@ def build_worker_patch(spec: Dict[str, Any]) -> str:
     payload = {
         "ua": str(spec.get("ua") or ""),
         "platform": spec.get("platform") or "",
+        "language": str(spec.get("language") or ""),
+        "languages": list(spec.get("languages") or []),
         "deviceMemory": spec.get("deviceMemory"),
         "uaCh": spec.get("uaCh"),
         "removeProps": list(spec.get("removeProps") or []),
@@ -15755,6 +17615,9 @@ def build_worker_patch(spec: Dict[str, Any]) -> str:
         "mseTypes": spec.get("mseTypes") or {},
         # F-163：Worker 全局同样暴露 FontFace，local() 源泄漏同一批宿主字体
         "fonts": list(spec.get("fonts") or []),
+        # F-163：设备声明字体改成可加载源时用的占位字体（见 _SHADOW_FONT_B64）
+        "shadowFont": _SHADOW_FONT_B64,
+        "shadowRange": _SHADOW_FONT_RANGE,
     }
     return (_WORKER_PATCH_TEMPLATE
             .replace("__MSE_SRC__", _MSE_SUPPORT_SRC)
@@ -15804,6 +17667,45 @@ def build_worker_drop_patch(drops: List[str]) -> str:
     )
 
 
+def build_worker_merged_patch(spec: Dict[str, Any], drops: List[str],
+                              *, defer: bool = False) -> str:
+    """Service Worker 一次性合并补丁：主补丁 + 全局差集 + 晚层。
+
+    SW 的暂停态落在「首脚本尚未开始执行」与「全局接口对象尚未安装」之间
+    （实测暂停态 `typeof self.StorageManager === 'undefined'`、脚本自身的
+    首行读到的却已是 function）。此刻求值只有导航器那一段能落地，差集与
+    晚层会整段跳过；而暂停态**只能发一条命令**（第二条会让本会话整条
+    CDP 连接断开），放行后再补又赶不上 SW 的事件回调。
+
+    `defer=True` 把三段包成「立即试跑一次 + 定时器重试到接口就位」的
+    安装器：定时器在放行后先于任何 message/install 回调触发，因此晚层
+    总能在 SW 处理业务事件之前完成。
+    """
+    parts = [build_worker_patch(spec)]
+    if drops:
+        parts.append(build_worker_drop_patch(drops))
+    late = build_worker_late_patch(spec)
+    if late:
+        parts.append(late)
+    body = "\n".join(parts)
+    if not defer:
+        return body
+    return (
+        "(function () {\n"
+        "    var tries = 0;\n"
+        "    var install = function () {\n"
+        + body + "\n"
+        "        return !!(self.StorageManager && self.VideoDecoder);\n"
+        "    };\n"
+        "    var tick = function () {\n"
+        "        if (install() || tries++ > 200) { return; }\n"
+        "        setTimeout(tick, 1);\n"
+        "    };\n"
+        "    tick();\n"
+        "})();\n"
+    )
+
+
 _WORKER_LATE_TEMPLATE = r"""
 (function () {
     var D = __SPEC__;
@@ -15811,33 +17713,17 @@ _WORKER_LATE_TEMPLATE = r"""
         try {
             var origToString = Function.prototype.toString;
             var registry = new WeakMap();
-            // F-162：必须是**对原生函数的 Proxy**（理由见页面补丁同名处）。
-            var faked = new Proxy(origToString, {
-                apply: function (target, self, args) {
+            // F-171：载体不能是 Proxy（帧名会变成 Object.toString，见页面补丁
+            // 同名处的完整理由）。worker 里没有 phantom iframe 的跨 realm
+            // 读取，故不需要顶层回退，只用本 realm 注册表。
+            var faked = ({
+                toString() {
+                    var self = this;
                     var v = registry.get(self);
                     if (v !== undefined) { return v; }
-                    return __nativeToString(target, self);
+                    return __nativeToString(origToString, self);
                 },
-                // F-167：Proxy 的 [[SetPrototypeOf]] 会转发给 target，而 V8 的
-                // 「新原型链里含有自己」环检测发生在**原生函数**上、看不见
-                // Proxy 这一层。creepjs 的 `failed at reflect set proto` 判据
-                // 正是 `Reflect.setPrototypeOf(fn, Object.create(fn))` 后
-                // `RAND in fn`：原生返回 false（V8 直接拒绝成环），Proxy 却
-                // 返回 true 并真的建出环，随后 `in` 遍历环抛 RangeError 而非
-                // TypeError → 记 lie。实测原生 Chromium/WebKit 该判据均为
-                // false，只有换成 Proxy 才变 true（/tmp/proxy_cycle_test.py）。
-                // 故这里手动做一次环检测，保持与原生函数一致。
-                setPrototypeOf: function (target, proto) {
-                    try {
-                        var p = proto;
-                        for (var i = 0; i < 100 && p; i++) {
-                            if (p === target || p === faked) { return false; }
-                            p = Object.getPrototypeOf(p);
-                        }
-                    } catch (e7) {}
-                    return Reflect.setPrototypeOf(target, proto);
-                },
-            });
+            }).toString;
             var __nativeToString = function (target, self) {
                 var s = target.call(self);
                 if (D.ios && typeof s === 'string'
@@ -15905,13 +17791,43 @@ __MC_SRC__
                           __wcIcsImpl(name, __wcIcsKind(name)), 1);
             } catch (e) {}
         });
+    // ---- WebGPU：Worker 内 GPUAdapterInfo 与主文档同口径 ----
+    // GPUAdapterInfo 与 WebCodecs 同理，是内核在 Worker 首脚本开始时才安装
+    // 的接口对象——暂停态 Runtime.evaluate 里 `typeof GPUAdapterInfo` 恒为
+    // undefined，所以 _WORKER_PATCH_TEMPLATE 那一段永远落空，Worker 报的是
+    // 宿主真实的 apple/metal-3。而同一个 Worker 的 WebGL 已被抹成机型口径
+    // （qualcomm/adreno-Nxx），跨 API 对照即自相矛盾，检测站直接判不一致。
+    // 这里在「首行执行前」的断点窗口里补一次。
+    if (D.webgpu) {
+        try {
+            var __gai = self.GPUAdapterInfo;
+            if (__gai && __gai.prototype) {
+                var __wDefineGet = function (proto, name, value) {
+                    try {
+                        Object.defineProperty(proto, name, {
+                            get: __maskNative(function () { return value; },
+                                              'get ' + name),
+                            enumerable: true,
+                            configurable: true,
+                        });
+                    } catch (e) {}
+                };
+                __wDefineGet(__gai.prototype, 'vendor', D.webgpu.vendor);
+                __wDefineGet(__gai.prototype, 'architecture', D.webgpu.architecture);
+                if (D.webgpu.device !== undefined) {
+                    __wDefineGet(__gai.prototype, 'device', D.webgpu.device);
+                    __wDefineGet(__gai.prototype, 'description', D.webgpu.description);
+                }
+            }
+        } catch (e) {}
+    }
     // mediaCapabilities 原型方法（F-135）：MediaCapabilities 在
     // `Exposed=(Window,DedicatedWorker)` 里，WorkerNavigator 也有该属性。
     try {
         var __mcProto = self.MediaCapabilities && self.MediaCapabilities.prototype;
         var __mcInst = self.navigator && self.navigator.mediaCapabilities;
         if (__mcProto && __mcInst) {
-            var __mcOpt = { av1: !!D.av1 };
+            var __mcOpt = { av1: !!D.av1, ogg: !!D.ogg };
             var __mcFn = function (kind) {
                 var fn = function (config) {
                     return __mc[kind](this, arguments, __mcInst, __mcOpt);
@@ -15931,6 +17847,78 @@ __MC_SRC__
             });
         }
     } catch (e) {}
+    // ---- F-31：Worker 侧 storage.estimate().quota 与页面同口径 ----
+    // 页面补丁把 quota 固定为 1 GiB（真机 WebKit 的 per-origin 配额），但
+    // StorageManager 在 Worker 里同样是「首脚本开始时才安装」的接口对象，
+    // 暂停态读不到；不打这一层，同源 Worker 报 Chromium 的宿主磁盘配额
+    // （10 GiB 级），与页面的 1 GiB 构成跨作用域不一致。真机 WebKit 实测
+    // Window 与 Worker 两侧都是 1048576000（/tmp/fa01/wkgb.py）。
+    if (D.ios) {
+        try {
+            var __wSM = self.StorageManager;
+            if (__wSM && __wSM.prototype
+                    && typeof __wSM.prototype.estimate === 'function') {
+                var __wEstOrig = __wSM.prototype.estimate;
+                Object.defineProperty(__wSM.prototype, 'estimate', {
+                    value: __maskNative(function () {
+                        return __wEstOrig.apply(this, arguments).then(function (r) {
+                            var usage = (r && typeof r.usage === 'number') ? r.usage : 0;
+                            return { quota: 1048576000, usage: usage };
+                        });
+                    }, 'estimate'),
+                    writable: true, enumerable: true, configurable: true,
+                });
+            }
+        } catch (e) {}
+    }
+    // F-94：Worker 侧没有 HTMLCanvasElement，但 OffscreenCanvas 的异步
+    // convertToBlob 仍可被能力探针调用。与页面侧一样，只对透明 8×8 空画布
+    // 返回真实 AVIF；任意绘制内容保留内核 PNG 回退，避免伪造字节。
+    if (D.ios && D.canvasAvif && D.blankAvif8x8
+            && typeof OffscreenCanvas !== 'undefined'
+            && OffscreenCanvas.prototype
+            && typeof OffscreenCanvas.prototype.convertToBlob === 'function') {
+        try {
+            var __wAvifOrig = OffscreenCanvas.prototype.convertToBlob;
+            var __wAvifBytes = null;
+            var __wAvifBlank = function (canvas) {
+                if (!canvas || canvas.width !== 8 || canvas.height !== 8) { return false; }
+                try {
+                    var ctx = canvas.getContext('2d');
+                    if (!ctx || typeof ctx.getImageData !== 'function') { return false; }
+                    var px = ctx.getImageData(0, 0, 8, 8).data;
+                    for (var i = 0; i < px.length; i++) {
+                        if (px[i] !== 0) { return false; }
+                    }
+                    return true;
+                } catch (e) { return false; }
+            };
+            var __wAvifBlob = function () {
+                if (typeof Blob !== 'function' || typeof atob !== 'function') { return null; }
+                try {
+                    if (!__wAvifBytes) {
+                        var bin = atob(String(D.blankAvif8x8));
+                        var bytes = new Uint8Array(bin.length);
+                        for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
+                        __wAvifBytes = bytes;
+                    }
+                    return new Blob([__wAvifBytes], {type: 'image/avif'});
+                } catch (e) { return null; }
+            };
+            Object.defineProperty(OffscreenCanvas.prototype, 'convertToBlob', {
+                value: __maskNative(function (opts) {
+                    if (arguments.length === 1 && opts && typeof opts === 'object'
+                            && /^\s*image\/avif\s*$/i.test(String(opts.type || ''))
+                            && !('quality' in opts) && __wAvifBlank(this)) {
+                        var blob = __wAvifBlob();
+                        if (blob) { return Promise.resolve(blob); }
+                    }
+                    return __wAvifOrig.apply(this, arguments);
+                }, 'convertToBlob'),
+                writable: true, enumerable: true, configurable: true,
+            });
+        } catch (e) {}
+    }
 })();
 """
 
@@ -15942,7 +17930,15 @@ def build_worker_late_patch(spec: Dict[str, Any]) -> str:
     `Runtime.evaluate` 读不到，所以静态 `isConfigSupported` 的包装只能
     放在「首行执行前」的断点窗口里（与全局差集补删同一时机）。
     """
-    payload = {"ios": bool(spec.get("ios")), "av1": bool(spec.get("av1"))}
+    payload = {
+        "ios": bool(spec.get("ios")),
+        "av1": bool(spec.get("av1")),
+        "webgpu": spec.get("webgpu"),
+        # F-94：Worker OffscreenCanvas 的窄 AVIF 能力探针覆盖。
+        "canvasAvif": bool(spec.get("canvasAvif")),
+        "blankAvif8x8": _BLANK_AVIF_8X8_B64
+        if spec.get("canvasAvif") else "",
+    }
     return (_WORKER_LATE_TEMPLATE
             .replace("__WC_SRC__", _WEBCODECS_ICS_SRC)
             .replace("__MC_SRC__", _MC_SRC)
@@ -15979,12 +17975,14 @@ class MobileEmulationSession:
     ) -> None:
         self.ws_endpoint = ws_endpoint
         self.target_os = target_os
-        self.locale = locale
+        # locale 由 geoip/管理端输入，先统一成 BCP-47；同一规范值同时用于
+        # CDP Intl、Accept-Language、Navigator 与 TTS，避免四套语言口径漂移。
+        self.locale = _normalize_locale(locale)
         self.timezone = (timezone or "").strip()
         self.start_url = start_url or ""
 
         if fingerprint:
-            spec = derive_spec(fingerprint, target_os, locale)
+            spec = derive_spec(fingerprint, target_os, self.locale)
         else:
             # 旧调用方式：仅视口 / UA / platform
             phys = viewport or {}
@@ -15993,8 +17991,14 @@ class MobileEmulationSession:
             css_h = round((phys.get("height") or 0) / scale)
             if not (css_w and css_h):
                 raise ValueError("移动端仿真缺少有效屏幕尺寸")
+            # 旧调用方式没有 mobileExtra，版本只能从 UA 回推（与 derive_spec
+            # 的 F-140 同口径）。拿不到版本时按最低版本处理——宁可少放行。
+            _preset_ver = (_ua_ios_version(ua) if target_os == "ios" else None)
             spec = {
                 "ua": ua, "platform": platform, "vendor": "",
+                "locale": self.locale,
+                "language": self.locale,
+                "languages": _locale_languages(self.locale),
                 "maxTouchPoints": int(max_touch_points or 5),
                 "deviceMemory": None, "colorDepth": None, "uaCh": None,
                 "battery": None,
@@ -16015,17 +18019,22 @@ class MobileEmulationSession:
                 "codecCapability": _codec_capability(target_os),
                 # F-142：MSE 真值表开关。旧调用方式拿不到机型，av1 取 false
                 # （与 derive_spec 的非 AV1 机型同口径）。
-                "mseTypes": {"ios": target_os == "ios", "av1": False},
+                "mseTypes": {"ios": target_os == "ios", "av1": False,
+                             "ogg": (_preset_ver is not None
+                                     and _preset_ver >= (18, 4))},
+                "webm": (_preset_ver is not None and _preset_ver >= (17, 4)),
+                "ogg": (_preset_ver is not None and _preset_ver >= (18, 4)),
                 "webglProfile": _webgl_profile(target_os),
                 "ios": target_os == "ios", "android": target_os == "android",
                 # F-161：与 derive_spec 同口径，默认语音按 locale 选语族
-                "androidVoices": _android_tts_voices(target_os, locale),
+                "androidVoices": _android_tts_voices(target_os, self.locale),
                 "iosChrome": None, "webgl": None, "webgpu": None,
                 "mediaVideoInputs": 0,
                 "cssWidth": css_w, "cssHeight": css_h,
                 "viewportHeight": css_h, "dpr": scale,
                 "safeArea": None,
                 "dynamicRangeHigh": False,
+                "displayGamut": "p3" if target_os == "ios" else "srgb",
                 "naturalLandscape": target_os != "ios",
                 # F-163：旧调用方式没有指纹，按平台给完整字体表（与
                 # _generate_mobile_font_subset(full=True) 同口径）
@@ -16037,6 +18046,9 @@ class MobileEmulationSession:
         self.platform = spec["platform"]
         self.max_touch_points = spec["maxTouchPoints"]
         self.ios = bool(spec.get("ios"))
+        # F-99：媒体查询的色域覆盖按 profile 的显示面板能力下发；iOS
+        # 规格固定为 p3，Android 默认为 srgb，仅显式 P3 机型改写为 p3。
+        self.display_gamut = str(spec.get("displayGamut") or "srgb").lower()
         self.css_w = spec["cssWidth"]
         self.css_h = spec["cssHeight"]
         self.viewport_h = spec["viewportHeight"]
@@ -16059,6 +18071,11 @@ class MobileEmulationSession:
         self._safe_sessions: set[str] = set()
         # Accept-CH：CDP session → {源: 该源已声明的高熵提示}（Fetch 域回送）
         self._accept_ch: dict[str, dict[str, set]] = {}
+        # 开了 Fetch 拦截的页面会话（Accept-CH 与 Safari 档改写共用一套规则，
+        # 任一方需要就保持开启）
+        self._fetch_sessions: set[str] = set()
+        # Safari 档请求头改写已挂载的页面会话（见 _enable_wire_headers）
+        self._wire_sessions: set[str] = set()
         # iOS Chrome POST 导航面（B1-7）：标记 cookie 的序号，见
         # _CRIOS_POST_REQUEST_JS。
         self._crios_post_seq = 0
@@ -16125,6 +18142,8 @@ class MobileEmulationSession:
             self._sensor_task = None
         self._applied_targets.clear()
         self._accept_ch.clear()
+        self._fetch_sessions.clear()
+        self._wire_sessions.clear()
         self._worker_drop_waiters.clear()
         self._safe_sessions.clear()
         self._sensor_supported = None
@@ -16143,6 +18162,21 @@ class MobileEmulationSession:
             proxy=None,
         )
         self._reader = asyncio.create_task(self._read_loop())
+
+        # Chromium can restore tabs from the profile's last session even when
+        # the launcher passes ``--restore-last-session=false``.  Mobile
+        # startup intentionally passes ``about:blank`` and navigates only
+        # after this CDP session has installed the device emulation.  If a
+        # restored tab wins the target ordering, the first page/session would
+        # instead be the stale page (often an OAuth verification step), and
+        # ``page_info``/navigation callers would keep operating on it.
+        #
+        # Only do this on the initial connect.  Reconnects must preserve every
+        # user-opened tab.  Closing a target is deliberately limited to the
+        # page target; it does not touch the profile's cookies,
+        # localStorage, IndexedDB, or any other persisted data.
+        if navigate:
+            await self._prepare_startup_pages()
 
         # 监听后续新开的标签页 / 页面。
         # waitForDebuggerOnStart：新目标先在调试器处暂停，等本会话把
@@ -16172,8 +18206,81 @@ class MobileEmulationSession:
 
         # 应用完成后导航到目标页（首个真实页面加载前指纹已生效）
         if navigate and self.start_url and self.start_url != "about:blank":
+            # Chromium 在一个刚建立的移动仿真会话上会先保留默认的
+            # 980px layout viewport，直到某个带有 viewport meta 的文档完成
+            # 一次布局。若直接把 start_url 发出去，页面的第一个 inline
+            # script 可能在这段窗口里读到桌面尺寸，而稍后才收敛到设备
+            # CSS 尺寸（页面的检测脚本通常只采样首行）。先在同一个 target
+            # 打开一个受控的 bootstrap 文档，等待布局、视觉视口和媒体查询
+            # 同时收敛，再导航到用户页面。bootstrap 不读取或写入用户数据，
+            # 只用于让 CDP 的设备度量完成一次真实的文档布局。
+            # Do not let the real page run if the bootstrap did not converge.
+            # A best-effort warmup followed by navigation re-opens the exact
+            # race this guard is meant to close: the first inline script can
+            # record the host 980px layout viewport before Blink applies the
+            # mobile CSS metrics.  Fail the startup instead and let the caller
+            # retry/reconnect with an observable degraded state.
+            if not await self._warmup_viewport(self._first_page_session):
+                self._emu_ok = False
+                raise RuntimeError(
+                    "移动端首屏视口未收敛，已阻止 start_url 导航")
             await self._navigate_start_url()
         self._emu_ok = True
+
+    async def _prepare_startup_pages(self) -> None:
+        """Keep one clean blank page and close pages restored at startup.
+
+        The fp-chromium build used by the workbench has been observed to
+        restore ``Default/Sessions`` despite the command-line restore switch.
+        At this point the browser was launched with ``about:blank`` and no
+        user navigation can have happened yet, so a non-blank page is by
+        definition restored state from an earlier run.  We remove only those
+        page targets and retain the storage profile itself.
+
+        A short second pass covers tabs which Chromium finishes restoring just
+        after the remote-debugging endpoint becomes ready.  If the restore
+        set contains no blank target, create one so the normal attach path
+        always has a deterministic first page.  The launcher waits for this
+        initial session before returning its start response, so external CDP
+        clients cannot have created a target that this cleanup would close.
+        """
+        keep_target: Optional[str] = None
+        try:
+            for pass_index in range(3):
+                if pass_index:
+                    await asyncio.sleep(0.08)
+                result = await self._send("Target.getTargets", timeout=5.0)
+                targets = result.get("targetInfos", [])
+                for info in targets:
+                    if info.get("type") != "page":
+                        continue
+                    target_id = str(info.get("targetId") or "")
+                    if not target_id:
+                        continue
+                    url = str(info.get("url") or "")
+                    if url == "about:blank" and keep_target is None:
+                        keep_target = target_id
+                        continue
+                    if target_id == keep_target:
+                        continue
+                    with contextlib.suppress(CDPError):
+                        await self._send("Target.closeTarget",
+                                         {"targetId": target_id}, timeout=5.0)
+
+            if keep_target is None:
+                with contextlib.suppress(CDPError):
+                    created = await self._send("Target.createTarget",
+                                               {"url": "about:blank"},
+                                               timeout=5.0)
+                    keep_target = str(created.get("targetId") or "")
+            if keep_target:
+                log.info("移动端启动页已清理：保留 about:blank 目标 %s",
+                         keep_target[:12])
+        except Exception as exc:  # noqa: BLE001 - best-effort startup cleanup
+            # Failure to clean stale tabs must not prevent the browser from
+            # starting; the attach path below still applies emulation to all
+            # targets and the diagnostic is visible in the server log.
+            log.warning("移动端启动页清理失败，将继续应用仿真：%s", exc)
 
     async def close(self) -> None:
         self._closed = True
@@ -16367,7 +18474,8 @@ class MobileEmulationSession:
                     elif ttype in ("worker", "shared_worker", "service_worker"):
                         # 独立 JS 全局：WorkerNavigator 补丁后放行
                         asyncio.create_task(self._attach_worker(
-                            info.get("targetId", ""), session_id=sid))
+                            info.get("targetId", ""), session_id=sid,
+                            target_type=ttype))
                     else:
                         # 其他被暂停的目标（auction worklet 等）：本层不处理，直接放行
                         asyncio.create_task(self._resume(sid))
@@ -16430,10 +18538,13 @@ class MobileEmulationSession:
     async def _attach_tab(self, tab_session_id: str) -> None:
         """新标签页（page 的父 target）：设定其子页面自动挂载策略并放行自身。"""
         with contextlib.suppress(Exception):
+            # 与页面级同一套过滤：Service/Shared Worker 另由根会话投递，
+            # 两路重复会让目标域挂死（见 _PAGE_AUTO_ATTACH_FILTER）。
             await self._send("Target.setAutoAttach", {
                 "autoAttach": True,
                 "waitForDebuggerOnStart": True,
                 "flatten": True,
+                "filter": _PAGE_AUTO_ATTACH_FILTER,
             }, session_id=tab_session_id)
         await self._resume(tab_session_id)
 
@@ -16476,11 +18587,14 @@ class MobileEmulationSession:
             # 补丁再放行。OOPIF 在 Chromium 中同样受 waitForDebuggerOnStart
             # 门控（暂停于上下文创建前，故暂停态不能 evaluate、只需 addScript）；
             # 若该投递被其他客户端抢占，Target.targetCreated 兜底路径仍会覆盖。
+            # 过滤掉 Service Worker：它与根会话重复投递会让目标域挂死，
+            # 见 _PAGE_AUTO_ATTACH_FILTER。
             with contextlib.suppress(CDPError):
                 await self._send("Target.setAutoAttach", {
                     "autoAttach": True,
                     "waitForDebuggerOnStart": True,
                     "flatten": True,
+                    "filter": _PAGE_AUTO_ATTACH_FILTER,
                 }, session_id=session_id)
         except Exception as e:
             log.debug("移动端仿真挂载页面失败: %s", e)
@@ -16512,13 +18626,13 @@ class MobileEmulationSession:
         是宿主窗口 500）。此时页面照常渲染、面板照常显示健康，视口穿帮要
         等到检测脚本量 innerWidth 才暴露。故必须同时校验几何。
 
-        几何用 visualViewport.width * visualViewport.scale == css_w，而**不能**
-        用 innerWidth == css_w：本函数在挂载时于 about:blank 上执行，该页无
-        <meta viewport>，度量覆盖生效时 innerWidth 恒为默认 980 布局视口
-        （此时 scale = css_w/980）。乘上 scale 的乘积与页面是否声明 viewport
-        无关，在 about:blank / 真实页面、Android / iOS 下都等于 css_w。
-        iOS 侧补丁只改 visualViewport.height（F-48 工具栏 inset），width 与
-        scale 未动，乘积同样成立。
+        几何用 visualViewport.width * visualViewport.scale == css_w，同时检查
+        screen/DPR。**不能**无条件用 innerWidth == css_w：本函数通常在
+        about:blank 上执行，该页无 <meta viewport>，度量覆盖生效时 innerWidth
+        恒为默认 980 布局视口（此时 scale = css_w/980）。对已经声明 viewport
+        的文档则要求 innerWidth/visualViewport 都收敛到设备 CSS 宽度；初次
+        start_url 导航前还会经过 _warmup_viewport，避免把这段 980 窗口带给
+        用户页面的首个脚本。
         """
         want_w = float(self.css_w)
         expr = ("(function(){var v=window.visualViewport;return {"
@@ -16526,7 +18640,10 @@ class MobileEmulationSession:
                 " coarse: matchMedia('(pointer: coarse)').matches,"
                 " vvW: v?v.width:null, vvScale: v?v.scale:null,"
                 " iw: innerWidth, ih: innerHeight,"
-                " sw: screen.width, sh: screen.height};})()")
+                " sw: screen.width, sh: screen.height,"
+                " dpr: devicePixelRatio,"
+                " hasMeta: !!document.querySelector('meta[name=viewport]')"
+                "};})()")
         try:
             res = await self._send("Runtime.evaluate", {
                 "expression": expr, "returnByValue": True,
@@ -16541,8 +18658,27 @@ class MobileEmulationSession:
                     prod = float(val["vvW"]) * float(val["vvScale"])
                 except (TypeError, ValueError, KeyError):
                     prod = None
-                if prod is None or abs(prod - want_w) > 1.5:
+                def _near(value: Any, expected: float) -> bool:
+                    try:
+                        return abs(float(value) - expected) <= 1.5
+                    except (TypeError, ValueError):
+                        return False
+
+                # screen/DPR 是 CDP 的直接度量结果；若它们不对，即使
+                # visualViewport 的乘积碰巧等于 css_w 也可能只是宿主窗口
+                # 缩放造成的假阳性。
+                if (prod is None or abs(prod - want_w) > 1.5
+                        or not _near(val.get("sw"), self.css_w)
+                        or not _near(val.get("sh"), self.css_h)
+                        or not _near(val.get("dpr"), self.dpr)):
                     ok = False
+                # 真实页面已声明 viewport 时，980 layout viewport 就是竞态
+                # 证据；about:blank/无 meta 页面保留原生 980 语义。
+                if ok and val.get("hasMeta"):
+                    if (not _near(val.get("iw"), self.css_w)
+                            or not _near(val.get("vvW"), self.css_w)
+                            or not _near(val.get("vvScale"), 1.0)):
+                        ok = False
         except Exception as e:  # noqa: BLE001
             # 读不到（文档处于暂停态 / 命令超时）不等于仿真失效：保持未校验，
             # 留给下一个页面挂载时重试，避免瞬态误报 degraded。
@@ -16556,6 +18692,88 @@ class MobileEmulationSession:
                       "期望 css_w=%s viewport_h=%s dpr=%s [%s]",
                       val, self.css_w, self.viewport_h, self.dpr,
                       self.profile_name or self.profile_id or "?")
+
+    async def _warmup_viewport(self, session_id: Optional[str]) -> bool:
+        """让移动布局在首个用户文档前完成一次收敛。
+
+        ``setDeviceMetricsOverride`` 本身返回成功并不代表 Blink 已经完成
+        layout viewport 的重算；在 about:blank 上尤其容易看到
+        ``innerWidth=980``，而 ``screen.width``/DPR 已经是移动值。一个最小
+        的 data 文档（带标准 width=device-width meta）能触发布局路径而不
+        依赖网络、服务端或用户页面内容。只在初次导航调用，重连不会打断
+        用户当前页面。
+
+        返回 False 表示在超时内未达到目标几何；调用方必须阻止真实
+        ``start_url`` 导航。这样不会把“在线但首屏未验证”的页面交给用户，
+        也不会让首个 inline script 采集宿主视口后再看到后续修正值。
+        """
+        if not session_id or not self.css_w:
+            return False
+        warmup_url = (
+            "data:text/html;charset=utf-8,"
+            "%3C!doctype%20html%3E%3Cmeta%20name%3D%22viewport%22%20"
+            "content%3D%22width%3Ddevice-width%2Cinitial-scale%3D1%22%3E"
+            "%3Ctitle%3Efpwb-bootstrap%3C%2Ftitle%3E"
+        )
+        try:
+            await self._send("Page.navigate", {"url": warmup_url},
+                             session_id=session_id, timeout=5.0)
+        except Exception as exc:  # noqa: BLE001 - fail closed before user page
+            log.warning("移动端视口 bootstrap 导航失败，已阻止进入目标页：%s", exc)
+            self._emu_verified = False
+            self._last_error = f"视口 bootstrap 导航失败: {exc}"
+            return False
+
+        # 页面级状态：innerWidth/innerHeight 必须已经脱离 980 默认布局，
+        # visualViewport 必须是 1:1，screen/DPR 与规格一致，且 coarse 媒体
+        # 查询已切到触屏档。允许 1.5px 的四舍五入误差。
+        expression = ("(function(){var v=window.visualViewport;return {"
+                      "iw:innerWidth,ih:innerHeight,"
+                      "vvw:v?v.width:null,vvh:v?v.height:null,"
+                      "scale:v?v.scale:null,dpr:devicePixelRatio,"
+                      "sw:screen.width,sh:screen.height,"
+                      "coarse:matchMedia('(pointer: coarse)').matches,"
+                      "mtp:navigator.maxTouchPoints};})()")
+        deadline = asyncio.get_running_loop().time() + 2.0
+        last: Any = None
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                result = await self._send("Runtime.evaluate", {
+                    "expression": expression, "returnByValue": True,
+                }, session_id=session_id, timeout=1.0)
+                last = ((result.get("result") or {}).get("value"))
+                if isinstance(last, dict):
+                    near = lambda a, b: (  # noqa: E731
+                        isinstance(a, (int, float)) and abs(float(a) - float(b)) <= 1.5)
+                    settled = (
+                        near(last.get("iw"), self.css_w)
+                        and near(last.get("ih"), self.viewport_h)
+                        and near(last.get("vvw"), self.css_w)
+                        and near(last.get("scale"), 1.0)
+                        and near(last.get("dpr"), self.dpr)
+                        and near(last.get("sw"), self.css_w)
+                        and near(last.get("sh"), self.css_h)
+                        and last.get("coarse") is True
+                        and int(last.get("mtp") or 0) > 0
+                    )
+                    if settled:
+                        log.debug("移动端视口 bootstrap 已收敛：%s", last)
+                        # _attach_page 可能已经在 about:blank 上完成了宽松
+                        # 的通道校验；bootstrap 是首个可验证 layout viewport
+                        # 的文档，成功后把最终状态提升为已验证。
+                        self._emu_verified = True
+                        return True
+            except Exception:
+                # 导航尚未生成执行上下文时 Runtime.evaluate 会短暂失败；
+                # 下一轮重试即可，不把这种正常瞬态记作仿真错误。
+                pass
+            await asyncio.sleep(0.05)
+
+        self._emu_verified = False
+        self._last_error = f"视口 bootstrap 未在超时内收敛: {last!r}"
+        log.warning("移动端视口 bootstrap 未在超时内收敛：%s（期望 %sx%s @%s）",
+                    last, self.css_w, self.viewport_h, self.dpr)
+        return False
 
     async def _attach_frame(self, target_id: str, session_id: Optional[str] = None,
                             *, paused: bool = False) -> None:
@@ -16610,7 +18828,13 @@ class MobileEmulationSession:
                 await self._send("Page.enable", {}, session_id=session_id)
             with contextlib.suppress(CDPError):
                 await self._send("Page.addScriptToEvaluateOnNewDocument",
-                                 {"source": patch}, session_id=session_id)
+                                 {"source": patch, "runImmediately": True},
+                                 session_id=session_id)
+            with contextlib.suppress(CDPError):
+                await self._send("Page.addScriptToEvaluateOnNewDocument", {
+                    "source": _ACCOUNT_INTENT_FALLBACK_JS,
+                    "runImmediately": True,
+                }, session_id=session_id)
             # WebAuthn 平台认证器：内核在没有生物识别硬件时
             # `PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()`
             # 恒返回 false，`getClientCapabilities().userVerifyingPlatformAuthenticator`
@@ -16637,11 +18861,11 @@ class MobileEmulationSession:
                 }, session_id=session_id)
             # 色域：与页面路径同口径（setEmulatedMedia 按目标生效，OOPIF 是
             # 独立目标，不继承主文档的媒体特性覆盖）。
-            if self.ios:
+            if self.display_gamut in ("srgb", "p3", "rec2020"):
                 with contextlib.suppress(CDPError):
                     await self._send("Emulation.setEmulatedMedia", {
                         "media": "screen",
-                        "features": [{"name": "color-gamut", "value": "p3"}],
+                        "features": [{"name": "color-gamut", "value": self.display_gamut}],
                     }, session_id=session_id)
             # 不启用 Emulation.setEmitTouchEventsForMouse：实测（fp-chromium 148）
             # 该转换会吞掉 mousePressed/Released 的 CDP 应答 → Playwright 点击
@@ -16654,15 +18878,20 @@ class MobileEmulationSession:
             # OOPIF 目标不单独启用传感器：虚拟传感器是浏览器级全局对象，
             # 页面目标的覆盖对所有帧一并生效；跨域子帧能否收到由 Permissions
             # Policy 决定（未声明 allow 的跨域子帧真机同样零事件）。
-            # UA-CH 低熵请求头：iframe 发出的请求与主文档一致
-            # （真机 Chrome 对全站发送；内核不发送任何 Sec-CH-UA* 头）
+            # UA-CH 低熵请求头 + Accept-Language：iframe 发出的请求与主文档
+            # 一致（真机 Chrome 对全站发送；内核不发送任何 Sec-CH-UA* 头）。
+            # 整组替换的语义同上：两个头必须一次下发。
             ua_ch = self.spec.get("uaCh")
-            if ua_ch:
+            oopif_headers: dict[str, str] = (
+                dict(sec_ch_headers(ua_ch)) if ua_ch else {})
+            if self.locale and not self.spec.get("ios"):
+                oopif_headers["Accept-Language"] = accept_language_header(self.locale)
+            if oopif_headers:
                 with contextlib.suppress(CDPError):
                     await self._send("Network.enable", {}, session_id=session_id)
                 with contextlib.suppress(CDPError):
                     await self._send("Network.setExtraHTTPHeaders",
-                                     {"headers": sec_ch_headers(ua_ch)},
+                                     {"headers": oopif_headers},
                                      session_id=session_id)
         except Exception as e:
             log.debug("移动端仿真挂载 iframe 失败: %s", e)
@@ -16676,7 +18905,8 @@ class MobileEmulationSession:
             if current is not None and self._attach_tasks.get(target_id) is current:
                 self._attach_tasks.pop(target_id, None)
 
-    async def _attach_worker(self, target_id: str, session_id: str) -> None:
+    async def _attach_worker(self, target_id: str, session_id: str,
+                             target_type: str = "worker") -> None:
         """Dedicated/Shared/Service Worker 补丁：WorkerNavigator 与主文档同源。
 
         Worker 是独立 JS 全局：platform（Linux x86_64）、deviceMemory（宿主
@@ -16689,13 +18919,45 @@ class MobileEmulationSession:
         都读不到），暂停态删除会落空、随后被装回。因此额外挂
         beforeScriptExecution 插桩断点，断点在脚本首行前命中时补删（见
         build_worker_drop_patch），补删完成后立即关闭 Debugger 并放行。
+
+        Service Worker 例外：它的首脚本在目标创建前就已执行，auto-attach 的
+        暂停发生在脚本跑完之后——beforeScriptExecution 断点实测永不命中
+        （rawsw16：暂停态挂断点、放行、轮询 10s 零命中），且它本就不需要
+        「首行前」窗口：接口对象此刻已全部就位。故 SW 走「暂停态一次性合并
+        补丁」：patch + 差集 + 晚层合成一条表达式，作为该会话的**第一条**
+        Runtime 命令发出。该会话首条命令会被吞掉应答（实测 rawsw10：超时但
+        确实执行），故按超时即视为已应用，随后直接放行。
         """
         if not target_id or not session_id:
             return
-        if target_id in self._applied_targets:
-            await self._resume(session_id)
+        # 同一 Worker 目标会被多个会话重复 auto-attach（实测 Shared/Service
+        # Worker 各收到两次 attachedToTarget）。这里**不做跨会话去重**：
+        # 实测 Service Worker 的首个 attachedToTarget 会话整条 CDP 通道
+        # 无响应（Runtime.evaluate / Debugger.enable / runIfWaitingForDebugger
+        # 全部超时 20s），若后到者等先到者或直接让位，晚补丁就整条落空——
+        # 表现为 storage.estimate().quota 报宿主 10 GiB，而 Window/
+        # Dedicated/Shared 都已是 1 GiB。Worker 补丁幂等（重复 apply 无
+        # 副作用），且暂停门控是会话级的，每个会话都必须自己放行，因此
+        # 各会话独立跑完整流程，谁通谁生效。
+        key = f"{target_id}|{session_id}"
+        existing = self._attach_tasks.get(key)
+        if existing is not None and existing is not asyncio.current_task():
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await existing
             return
+        current = asyncio.current_task()
+        self._attach_tasks[key] = current
         self._applied_targets.add(target_id)
+        try:
+            await self._attach_worker_body(target_id, session_id, target_type)
+        except (CDPError, asyncio.TimeoutError) as e:
+            log.debug("Worker 挂载未完成（该会话通道无响应）: %s", e)
+        finally:
+            if self._attach_tasks.get(key) is current:
+                self._attach_tasks.pop(key, None)
+
+    async def _attach_worker_body(self, target_id: str, session_id: str,
+                                  target_type: str) -> None:
         patch = build_worker_patch(self.spec)
         drops = list(self.spec.get("removeWorkerGlobals") or [])
         # Intl 成员（v8BreakIterator）在页面表 removeGlobals 里，但 Worker 首
@@ -16707,6 +18969,26 @@ class MobileEmulationSession:
             if _n == "v8BreakIterator" and _n not in drops:
                 drops.append(_n)
         injected = False
+        if target_type == "service_worker":
+            # SW 的暂停态在「首脚本已执行完、全局接口对象尚未安装」之间：
+            # 此刻 `StorageManager` 等一律 undefined，晚层若走「读已装接口」
+            # 的路径会整段跳过。但暂停态**只能发一条命令**：实测第二条命令
+            # 会让本会话整条 CDP 连接断开（swdbg9：小探针返回 undefined 后，
+            # 下一条 evaluate 即报连接已关闭，浏览器本身仍存活）。所以不能
+            # 「轮询等就位再补」，也不能「先放行再补」——放行后 SW 立刻开始
+            # 处理事件，晚补丁已经赶不上（swdbg8）。
+            #
+            # 唯一可靠时序（rawsw22 实测）：暂停态只能发一条命令，且此刻
+            # 接口尚未安装；把三段包成「立即试跑 + 定时器重试到就位」的
+            # 安装器（defer=True），作为该会话第一条命令发出且不等应答，
+            # 随后放行。安装器的定时器在放行后先于 SW 的事件回调执行。
+            merged = build_worker_merged_patch(self.spec, drops, defer=True)
+            with contextlib.suppress(CDPError, asyncio.TimeoutError):
+                await self._send("Runtime.evaluate", {"expression": merged},
+                                 session_id=session_id, timeout=0.05)
+            await asyncio.sleep(0.2)
+            await self._resume(session_id)
+            return
         try:
             await self._send("Runtime.evaluate", {"expression": patch},
                              session_id=session_id, timeout=3.0)
@@ -16718,8 +19000,9 @@ class MobileEmulationSession:
         # （typeof self.VideoDecoder === 'undefined'）——必须走插桩断点那条
         # 「首行执行前」的窗口。因此即便没有要删的全局，也要挂断点。
         late = build_worker_late_patch(self.spec)
-        if (drops or late) and injected:
-            # 插桩断点：命中「脚本执行前」再补删一次全局差集、补装静态面。
+        # 断点不能以「暂停态补丁成功」为前提：暂停态 Runtime 命令可能整条
+        # 无应答（首条命令被吞）。断点是 target 级命令，暂停态立即可用。
+        if drops or late:
             try:
                 await self._send("Debugger.enable", {},
                                  session_id=session_id, timeout=3.0)
@@ -16728,14 +19011,13 @@ class MobileEmulationSession:
                                  session_id=session_id, timeout=3.0)
                 self._worker_drop_waiters[session_id] = (drops, late)
             except (CDPError, asyncio.TimeoutError):
-                # 断点链路不可用（老内核）：退回暂停态补删（已在上面的补丁里执行）。
-                # 极小竞态窗口（首行可能读到未抹除的构造器）记入边界。
+                # 断点链路不可用（老内核）：退回暂停态补删（见下方补丁）。
                 with contextlib.suppress(CDPError, asyncio.TimeoutError):
                     await self._send("Debugger.disable", {},
                                      session_id=session_id, timeout=3.0)
         await self._resume(session_id)
         if not injected:
-            # 暂停态不受理 Runtime 命令时（理论上不会）：放行后补一次，
+            # 暂停态不受理 Runtime 命令时：放行后补一次，
             # 极小竞态窗口（Worker 首行可能已读取原生值）
             with contextlib.suppress(CDPError, asyncio.TimeoutError):
                 await self._send("Runtime.evaluate", {"expression": patch},
@@ -16771,6 +19053,63 @@ class MobileEmulationSession:
             patterns.append({"urlPattern": origin + "/*", "requestStage": "Request"})
         return patterns
 
+    def _wire_header_patterns(self) -> list[dict]:
+        """iOS 档：请求阶段的头改写规则（删 UA-CH / 改 Accept / 改语言）。
+
+        Accept 只有 Document / Image 取值不同，但 UA-CH 与 Accept-Language
+        是**每一类请求**都要处理——内核在脚本/样式/取数/XHR 上都发
+        `Sec-CH-UA*`，真机 iOS 全不发。按资源类型白名单会漏掉 fetch/XHR，
+        检测站一抓 `Sec-CH-UA-Platform` 就判 Blink。故一律全类型拦截。
+
+        Android 档不进这套（_enable_wire_headers 不把会话加进
+        _wire_sessions）：那边只需要改 Accept-Language，用 extra-headers
+        一次性下发即可，不必为每个请求付一次 CDP 往返。
+        """
+        return [{"urlPattern": "*", "requestStage": "Request"}]
+
+    async def _enable_wire_headers(self, sid: str) -> None:
+        """请求头口径对齐（Accept-Encoding + Accept + Accept-Language）。
+
+        iOS 面（Safari 与 CriOS 都是系统 WebKit 网络栈）必须按 Safari 口径
+        发头，包括删掉全部 UA-CH；Android 面只对齐 Accept-Language——
+        Blink 的 UA-CH 与 Accept 取值本来就是真机 Chrome 的行为，不能动。
+
+        Accept-Language 两引擎都要改：内核的 `acceptLanguage` 覆盖只发裸
+        单值（CDP 把 `en-US,en;q=0.9` 归一成 `en-US`），而真机两个引擎都
+        发与 `navigator.languages` 同构的 q 权重列表。
+
+        Android 侧的 Accept-Language 在第 4 步与 UA-CH 低熵头**合并**下发
+        （setExtraHTTPHeaders 是整组替换，分两次调用会互相抹掉），这里只
+        处理 iOS；且 iOS 不走 extra-headers 改语言——它本来就要为 Accept
+        与 UA-CH 挂 Fetch，语言顺带在同一轮请求阶段改。
+        """
+        if not self.spec.get("ios"):
+            return
+        # 压缩编码：extra-headers 能覆盖（实测 /tmp/f862 的 B 组）。
+        # 明文 HTTP 上 Safari 只报 gzip, deflate，HTTPS 才加 br——用
+        # 请求级拦截按 URL scheme 分叉会多拦一类请求，而 `br` 在明文上
+        # 只是「多报了一个服务端本来也支持的编码」，比整段缺失更接近真机。
+        with contextlib.suppress(CDPError):
+            await self._send("Network.enable", {}, session_id=sid)
+        with contextlib.suppress(CDPError):
+            await self._send("Network.setExtraHTTPHeaders",
+                             {"headers": {"Accept-Encoding": "gzip, deflate, br"}},
+                             session_id=sid)
+        self._wire_sessions.add(sid)
+        await self._refresh_fetch_patterns(sid)
+
+    async def _refresh_fetch_patterns(self, sid: str) -> None:
+        """按当前需要重算 Fetch 拦截规则（Accept-CH 源集合 + Safari 档改写）。"""
+        patterns = self._accept_ch_patterns(sid) if sid in self._fetch_sessions else []
+        if sid in self._wire_sessions:
+            patterns += self._wire_header_patterns()
+        if not patterns:
+            with contextlib.suppress(CDPError):
+                await self._send("Fetch.disable", {}, session_id=sid)
+            return
+        with contextlib.suppress(CDPError):
+            await self._send("Fetch.enable", {"patterns": patterns}, session_id=sid)
+
     async def _enable_accept_ch(self, sid: str) -> None:
         """启用 Accept-CH 高熵头回送（仅页面级会话）。
 
@@ -16782,9 +19121,8 @@ class MobileEmulationSession:
         if self.spec.get("ios") or not self.spec.get("uaCh"):
             return
         self._accept_ch.setdefault(sid, {})
-        with contextlib.suppress(CDPError):
-            await self._send("Fetch.enable", {"patterns": self._accept_ch_patterns(sid)},
-                             session_id=sid)
+        self._fetch_sessions.add(sid)
+        await self._refresh_fetch_patterns(sid)
 
     async def _enroll_crios_post_request(self, sid: str) -> None:
         """iOS Chrome：启用 POST 文档的标记通道（B1-7）。
@@ -16794,10 +19132,8 @@ class MobileEmulationSession:
         """
         if not self.spec.get("iosChrome"):
             return
-        with contextlib.suppress(CDPError):
-            await self._send("Fetch.enable",
-                             {"patterns": self._accept_ch_patterns(sid)},
-                             session_id=sid)
+        self._fetch_sessions.add(sid)
+        await self._refresh_fetch_patterns(sid)
         with contextlib.suppress(CDPError):
             await self._send("Network.enable", {}, session_id=sid)
 
@@ -16812,6 +19148,34 @@ class MobileEmulationSession:
         # 主帧 id 未知时（getFrameTree 失败）按主文档处理：宁可多补一次，
         # 也不让 POST 文档漏掉重放面。
         return main is None or frame_id == main
+
+    @staticmethod
+    def _replace_headers_case_insensitive(headers: Dict[str, str],
+                                           values: Dict[str, str]) -> bool:
+        """覆盖请求头而不制造大小写不同的重复键。
+
+        Fetch.continueRequest 接收的是数组，CDP 把头名大小写视为同一字段，
+        但把 ``DPR`` 与 ``dpr`` 同时放进数组时不同 Chromium 版本的行为不一：
+        有的保留第一项，有的折叠成逗号串。先删除所有等价键，再写入规范名，
+        才能可靠地替换网络层已经生成的宿主 DPR/内存值。
+        """
+        changed = False
+        for name, value in values.items():
+            wanted = name.lower()
+            found = False
+            for old in list(headers):
+                if old.lower() != wanted:
+                    continue
+                if not found:
+                    headers[old] = str(value)
+                    found = True
+                else:
+                    del headers[old]
+                changed = True
+            if not found:
+                headers[name] = str(value)
+                changed = True
+        return changed
 
     async def _mark_crios_post_document(self, sid: str,
                                         params: Dict[str, Any]) -> None:
@@ -16879,27 +19243,39 @@ class MobileEmulationSession:
                 if origin and hints and known.get(origin) != hints:
                     # 新声明或集合变化：更新该源的提示并刷新拦截规则
                     known[origin] = hints
-                    with contextlib.suppress(CDPError):
-                        await self._send("Fetch.enable",
-                                         {"patterns": self._accept_ch_patterns(sid)},
-                                         session_id=sid)
+                    await self._refresh_fetch_patterns(sid)
             await self._continue_paused(sid, rid, is_response=True)
             return
-        # Request 阶段：只有已声明源的请求会走到这里
+        # Request 阶段：Accept / UA-CH / Accept-Language 改写，或已声明源的
+        # 高熵头回送（两者可能同时命中同一请求）。
+        headers = dict(request.get("headers") or {})
+        changed = False
+        if sid in self._wire_sessions:
+            rewritten = safari_wire_headers(
+                headers, params.get("resourceType") or "",
+                locale=self.locale, ios=bool(self.spec.get("ios")))
+            if rewritten != headers:
+                headers = rewritten
+                changed = True
         origin = url_origin(request.get("url") or "")
         hints = (self._accept_ch.get(sid) or {}).get(origin)
-        if not hints:
+        if hints:
+            ua_ch = self.spec.get("uaCh") or {}
+            # 拦截层看到的请求头未必包含 CDP extra-headers/UA 覆盖注入的项。
+            # UA-CH 及移动端 DPR/内存/视口都必须**强制**覆盖：网络层先前
+            # 已经写入的宿主值（例如 DPR=2、Device-Memory=16）不能用
+            # setdefault 留下，否则 BrowserLeaks 会直接显示 HTTP/JS 不一致。
+            values = dict(sec_ch_headers(ua_ch))
+            values.update(high_entropy_headers(
+                ua_ch, hints, dpr=self.dpr,
+                device_memory=self.spec.get("deviceMemory"),
+                viewport_width=self.css_w, viewport_height=self.viewport_h))
+            if self.ua:
+                values["User-Agent"] = self.ua
+            changed = self._replace_headers_case_insensitive(headers, values) or changed
+        if not changed:
             await self._continue_paused(sid, rid)
             return
-        ua_ch = self.spec.get("uaCh") or {}
-        headers = dict(request.get("headers") or {})
-        # 拦截层看到的请求头未必包含 CDP extra-headers/UA 覆盖注入的项：
-        # 缺失时补齐（已有值保持——浏览器视角的最终值优先）
-        for name, value in sec_ch_headers(ua_ch).items():
-            headers.setdefault(name, value)
-        if self.ua:
-            headers.setdefault("User-Agent", self.ua)
-        headers.update(high_entropy_headers(ua_ch, hints))
         await self._continue_paused(sid, rid, headers=headers)
 
     async def _continue_paused(self, sid: str, rid: str, *,
@@ -17005,14 +19381,30 @@ class MobileEmulationSession:
         # 0.5 JS 补丁 init 脚本：紧跟 Page.enable 挂载（关键路径最短化）。
         #     新目标被 waitForDebuggerOnStart 门控时，本脚本必须在放行前
         #     到达，否则首个文档仍会以原生指纹执行页面脚本。
+        #     runImmediately：同源 about:blank 子帧不发起导航，注册式 init
+        #     脚本对它们从不触发（只对主文档生效）。检测站的字体探测就在这种
+        #     子帧里跑（mixvisit fonts.ts 的 withIframe → about:blank →
+        #     span.offsetWidth 比对），子帧读到的全是宿主 macOS 字体，
+        #     而同一份上传体的主文档声明 Android——字体表自相矛盾。
+        #     加 runImmediately 后脚本在「已有文档」上也会执行一次，子帧
+        #     因此带上同一套补丁（实测主帧/子帧读数一致）。
         patch = build_mobile_patch(self.spec)
         with contextlib.suppress(CDPError):
             await self._send("Page.addScriptToEvaluateOnNewDocument",
-                             {"source": patch}, session_id=sid)
+                             {"source": patch, "runImmediately": True}, session_id=sid)
         # WebAuthn 平台认证器：见 OOPIF 路径同名注释。按 target 各装一份——
         # 主文档、跨域 iframe、新标签页都是独立 target，装过一处不代表其余
         # 各处也生效。
         await self._ensure_virtual_authenticator(sid)
+        # Desktop Chromium has no Android package manager/Google Play Services.
+        # Install the narrow account-intent bridge after the main fingerprint
+        # patch so an already-loaded Google registration page becomes usable as
+        # soon as the emulation channel attaches, too.
+        with contextlib.suppress(CDPError):
+            await self._send("Page.addScriptToEvaluateOnNewDocument", {
+                "source": _ACCOUNT_INTENT_FALLBACK_JS,
+                "runImmediately": True,
+            }, session_id=sid)
 
         # 1. 设备度量：视口 + 屏幕 + DPR + 移动布局（CSS 逻辑像素）
         #    真机首屏 innerHeight < screen.height（浏览器 UI 占位），
@@ -17058,18 +19450,18 @@ class MobileEmulationSession:
             }, session_id=sid)
         # 不启用 setEmitTouchEventsForMouse（会吞鼠标命令应答，见主路径注释）
 
-        # 2.5 色域：iPhone 7 及以后全系是 Display P3 屏，
-        #     (color-gamut: p3) 恒为 true；宿主桌面显示器多为 sRGB，内核默认
-        #     报 false——「声明 iPhone 但只有 sRGB」是硬件级互斥判据。CDP 的
-        #     setEmulatedMedia 可原生注入该特性，无需 JS 改 matchMedia。
+        # 2.5 色域：按 profile 的显示面板档位注入 `color-gamut`；iOS 设备
+        #     使用 Display P3，Android 仅 Pixel 8 系列（或显式面板字段）使用
+        #     P3，其余保守使用 sRGB。宿主桌面显示器的实际色域不能泄漏到目标
+        #     profile，CDP 的 setEmulatedMedia 可原生注入该特性，无需 JS 改写。
         #     实测（fp-chromium 148）：立即生效、同一页面内导航后保持、同进程
         #     iframe 继承，但**不跨页面**（新 page 目标回到 sRGB）——故页面路径
         #     与 OOPIF 路径各自下发，且每次页面级仿真都重发。
-        if self.ios:
+        if self.display_gamut in ("srgb", "p3", "rec2020"):
             with contextlib.suppress(CDPError):
                 await self._send("Emulation.setEmulatedMedia", {
                     "media": "screen",
-                    "features": [{"name": "color-gamut", "value": "p3"}],
+                    "features": [{"name": "color-gamut", "value": self.display_gamut}],
                 }, session_id=sid)
 
         # 2.6 安全区（P2-5 后半）：真机 iOS 在 viewport-fit=cover 页面把
@@ -17087,17 +19479,25 @@ class MobileEmulationSession:
             await self._reapply_ua(sid)
 
         # 4. Android：UA-CH 低熵请求头（该内核不发送任何 Sec-CH-UA* 头，
-        #    真实 Chrome 默认对全站发送这三个提示）
+        #    真实 Chrome 默认对全站发送这三个提示）。Accept-Language 一并
+        #    在这里下发：setExtraHTTPHeaders 是**整组替换**，分两次调用会
+        #    把先写入的那组抹掉（实测：只发语言后 Sec-CH-UA 三个头全消失）。
+        #    iOS 不在这里改语言——它由第 6b 步的 Fetch 请求阶段统一改写。
         ua_ch = self.spec.get("uaCh")
-        if ua_ch:
+        android_headers: dict[str, str] = dict(sec_ch_headers(ua_ch)) if ua_ch else {}
+        if self.locale and not self.spec.get("ios"):
+            android_headers["Accept-Language"] = accept_language_header(self.locale)
+        if android_headers:
             with contextlib.suppress(CDPError):
                 await self._send("Network.enable", {}, session_id=sid)
             with contextlib.suppress(CDPError):
                 await self._send("Network.setExtraHTTPHeaders",
-                                 {"headers": sec_ch_headers(ua_ch)}, session_id=sid)
+                                 {"headers": android_headers}, session_id=sid)
 
-        # 5. 时区：geoip 解析的出口时区（与内核 --timezone 参数同时生效，
-        #    覆盖 JS Intl/Date；内核参数覆盖不到的场景由此兜底）
+        # 5. 时区：geoip 解析的出口时区。这是移动端时区的**唯一**来源——
+        #    内核在移动端模式不再下发 --timezone（该参数会让本覆盖静默失效：
+        #    CDP 返回成功但 Intl/Date 保持命令行值，实测 fp-chromium 152）。
+        #    覆盖跨导航、同进程 iframe 与 Dedicated Worker 保持。
         if self.timezone:
             with contextlib.suppress(CDPError):
                 await self._send("Emulation.setTimezoneOverride",
@@ -17138,6 +19538,10 @@ class MobileEmulationSession:
         #    （内核完全不处理 Accept-CH；真机 Chrome 全量支持，缺回送是明显破绽）
         await self._enable_accept_ch(sid)
 
+        # 6b. 请求头口径对齐：iOS 改 Accept / Accept-Encoding / 删 UA-CH，
+        #     两引擎都改 Accept-Language（内核只发裸单值，真机发 q 权重列表）
+        await self._enable_wire_headers(sid)
+
         # 7. Android：传感器事件流。真机 Chrome Android 持续派发
         #    devicemotion/deviceorientation（60Hz 级数值流）；桌面内核没有
         #    传感器，只在注册监听时派发一次全 null 的哨兵事件——「有没有
@@ -17153,7 +19557,11 @@ class MobileEmulationSession:
         """清零安全区覆盖（非 cover 页面 / 新文档起点 / 非 iOS 页面）。"""
         if sid not in self._safe_sessions:
             return
-        with contextlib.suppress(CDPError, asyncio.TimeoutError):
+        # 导航与会话关闭可以同时发生：后台安全区任务可能比 CDP reader
+        # 晚一个事件循环 tick，websockets 此时会抛 ConnectionClosedOK，而不是
+        # 本层的 CDPError。安全区只是视觉校准，连接已关闭时直接结束任务，不能
+        # 把一个正常的浏览器停止动作变成 ``Task exception was never retrieved``。
+        with contextlib.suppress(Exception):
             # 空 insets：未给出的边按 0 计算（实测 fp-chromium 148 下
             # env() 均返回 0px，与真机非 cover 页面的计算值一致）
             await self._send("Emulation.setSafeAreaInsetsOverride",
@@ -17171,12 +19579,12 @@ class MobileEmulationSession:
             res = await self._send("Runtime.evaluate", {
                 "expression": _SAFE_AREA_META_JS, "returnByValue": True,
             }, session_id=sid, timeout=5.0)
-        except (CDPError, asyncio.TimeoutError):
+        except Exception:
             return
         content = str(((res or {}).get("result") or {}).get("value") or "")
         # 关键字大小写不敏感、允许 "viewport-fit = cover"（空白归一化后判定）
         cover = "viewport-fit=cover" in "".join(content.lower().split())
-        with contextlib.suppress(CDPError, asyncio.TimeoutError):
+        with contextlib.suppress(Exception):
             await self._send("Emulation.setSafeAreaInsetsOverride", {
                 # max-inset 与 inset 同值：真机 Safari 竖屏下浏览器 UI 可收缩
                 # 的余量未观测到差异，取保守口径（见方案文档 §2.16.1）
@@ -17192,11 +19600,18 @@ class MobileEmulationSession:
         <head> 里的 meta 往往已解析，能让文档尾部的脚本读到真机口径；
         DOMContentLoaded 再兜底一次（见 _read_loop）。
         """
-        await self._clear_safe_area(sid)
-        for delay in (0.0, 0.03, 0.12):
-            if delay:
-                await asyncio.sleep(delay)
-            await self._sync_safe_area(sid)
+        try:
+            await self._clear_safe_area(sid)
+            for delay in (0.0, 0.03, 0.12):
+                if delay:
+                    await asyncio.sleep(delay)
+                await self._sync_safe_area(sid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - best-effort background task
+            # A normal CDP close during stop/reconnect is not a verification
+            # failure. The next connection reapplies the safe-area override.
+            log.debug("安全区导航同步在 CDP 关闭后结束: %s", exc)
 
     # ---------------- 传感器仿真（Android）----------------
 
@@ -17301,12 +19716,21 @@ class MobileEmulationSession:
                 self._sensor_task = None
 
     async def _reapply_ua(self, sid: str) -> None:
-        """下发 UA 覆盖（首次挂载与 F-86 兜底重发共用同一份参数）。"""
+        """下发 UA 覆盖（首次挂载与 F-86 兜底重发共用同一份参数）。
+
+        `acceptLanguage` 传**逗号列表**而不是裸 locale：CDP 收到裸单值时会把
+        `navigator.languages` 收成一段，且网络层只发裸值（实测 /tmp/fb05/alang6.py：
+        裸 `zh-CN` → 头 `zh-CN`、languages `["zh-CN"]`；`zh-CN,zh` → 头
+        `zh-CN,zh;q=0.9`、languages `["zh-CN","zh"]`）。q 权重形式（`zh-CN,zh;q=0.9`）
+        更糟——内核把 `;q=0.9` 当成语言子标签，产出 `zh-CN,zh;q=0.9;q=0.9` 与
+        `["zh-CN","zh;q=0.9"]`。逗号列表是唯一两个面都正确的形态。
+        """
         ua_params: dict[str, Any] = {"userAgent": self.ua}
         if self.platform:
             ua_params["platform"] = self.platform
         if self.locale:
-            ua_params["acceptLanguage"] = self.locale
+            langs = _locale_languages(self.locale)
+            ua_params["acceptLanguage"] = ",".join(langs) if langs else self.locale
         try:
             await self._send("Emulation.setUserAgentOverride", ua_params,
                              session_id=sid)
@@ -17363,6 +19787,18 @@ class MobileEmulationSession:
         with contextlib.suppress(CDPError):
             await self._send("Runtime.evaluate", {"expression": patch},
                              session_id=sid, timeout=5.0)
+        # `Page.addScriptToEvaluateOnNewDocument(..., runImmediately=True)`
+        # is not reliable on every fp-chromium build for a document that was
+        # already loaded before the emulation channel attached.  The Google
+        # same-device registration page puts its Continue control behind an
+        # Android `intent://` link, so an already-open page otherwise keeps an
+        # inert button even though touch input reaches the element.  Execute
+        # the narrow web fallback in the current document as well; the script
+        # is idempotent and only handles accounts.google.com intents.
+        with contextlib.suppress(CDPError):
+            await self._send("Runtime.evaluate", {
+                "expression": _ACCOUNT_INTENT_FALLBACK_JS,
+            }, session_id=sid, timeout=5.0)
 
     async def _navigate_start_url(self) -> None:
         sid = self._first_page_session

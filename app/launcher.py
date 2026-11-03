@@ -159,7 +159,6 @@ class LaunchManager:
             # navigator.language 会让它与 Intl 互相矛盾——那比「两者都是中文、
             # 只有时区对不上」更容易被判定为改环境，故桌面保持原状。
             if (launch.geoip and (not launch.timezone or not launch.locale)
-                    and proxy is not None
                     and profile["kernel"] == fp_chromium_kernel.KERNEL_NAME):
                 mobile_target = profile.get("target_os") in ("android", "ios")
                 geo = await resolve_exit_geo(proxy)
@@ -308,7 +307,19 @@ class LaunchManager:
                             log.warning("移动端仿真建立失败：%s", e)
                             with contextlib.suppress(Exception):
                                 await mobile_session.close()
-                            return
+                            # A strict first-viewport bootstrap failure must
+                            # fail the browser start, not leave a running
+                            # desktop Chromium with the mobile channel
+                            # silently disabled.  ``inst`` is not registered
+                            # in ``_running`` until this task completes, so
+                            # clean the kernel here before re-raising to the
+                            # LaunchManager error path.
+                            with contextlib.suppress(Exception):
+                                if input_proxy is not None:
+                                    await input_proxy.close()
+                            with contextlib.suppress(Exception):
+                                await fp_chromium_kernel.stop(result)
+                            raise
                         inst.extra["mobile_session"] = mobile_session
                         log.info("✅ 移动端仿真已生效 (OS=%s, %s %s, CSS %sx%s @%.2fx, 视口高 %s)",
                                  target_os, fd.get("manufacturer") or "", fd.get("device_model") or "",
@@ -332,7 +343,8 @@ class LaunchManager:
                                 await input_proxy.close()
                             input_proxy = None
 
-                    # 异步建立仿真（不阻塞启动流程），句柄随实例生命周期管理
+                    # 建立仿真任务；下面在把启动响应返回给调用方前等待其
+                    # 首次挂载完成，之后看门狗仍由会话自身常驻管理。
                     mobile_task = asyncio.create_task(_setup_mobile_context())
 
                     async def _stop_fpchromium() -> None:
@@ -359,6 +371,17 @@ class LaunchManager:
                         stop=_stop_fpchromium,
                         process=result["process"],
                     )
+                    # The mobile CDP session must finish its initial attach
+                    # before start() returns.  Previously this task was left
+                    # running in the background, allowing readiness/RPA
+                    # clients to create a blank target while startup cleanup
+                    # was still collapsing restored tabs; the cleanup could
+                    # then close that client's WebSocket and yield a
+                    # transient "no close frame received" probe failure.
+                    # Awaiting the already-created task makes the browser
+                    # start contract deterministic; the watchdog remains
+                    # resident inside MobileEmulationSession afterwards.
+                    await mobile_task
                 else:
                     result = await chromium_kernel.start(
                         profile_id=profile_id,

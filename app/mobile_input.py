@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 import weakref
 from typing import Any, Optional
 
@@ -125,8 +126,16 @@ class TouchInput:
         fracs[-1] = 1.0
         mean_dy = abs(travel) / steps
 
+        # CDP accepts an explicit event timestamp.  Without it the browser uses
+        # the moment each command reaches the renderer.  A CDP round trip can
+        # occasionally stall for one compositor tick, turning an otherwise
+        # 14 ms drag cadence into a 46--50 ms ``TouchEvent.timeStamp`` gap.
+        # Keep the dispatch schedule in monotonic time, but stamp the events
+        # from one wall-clock epoch so the page observes the intended cadence.
+        stamp_epoch = time.time()
         await cdp.send("Input.dispatchTouchEvent", {
             "type": "touchStart",
+            "timestamp": stamp_epoch,
             "touchPoints": [self._point(start_x, start_y, 0.35, 4.0)]})
         loop = asyncio.get_running_loop()
         base = loop.time()
@@ -149,11 +158,17 @@ class TouchInput:
                 # 压力，不加到时间轴上，否则相位会一路漂移。
                 due = base + (i + 1) * float(step_delay)
                 await asyncio.sleep(max(0.0, due - loop.time()))
-            await cdp.send("Input.dispatchTouchEvent", {
+            payload = {
                 "type": "touchMove",
-                "touchPoints": [self._point(px, ny, press, radius)]})
+                "touchPoints": [self._point(px, ny, press, radius)]}
+            if step_delay:
+                payload["timestamp"] = stamp_epoch + (i + 1) * float(step_delay)
+            await cdp.send("Input.dispatchTouchEvent", payload)
+        end_payload = {"type": "touchEnd", "touchPoints": []}
+        if step_delay:
+            end_payload["timestamp"] = stamp_epoch + (steps + 1) * float(step_delay)
         await cdp.send("Input.dispatchTouchEvent", {
-            "type": "touchEnd", "touchPoints": []})
+            **end_payload})
 
 
 _TOUCH_INPUTS: "weakref.WeakKeyDictionary[Any, TouchInput]" = weakref.WeakKeyDictionary()

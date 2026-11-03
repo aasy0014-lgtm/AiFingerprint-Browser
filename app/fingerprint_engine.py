@@ -246,8 +246,11 @@ def check_health(fingerprint_data: dict[str, Any], target_os: str) -> dict[str, 
         "windows": {"Win32"},
         "macos": {"MacIntel"},
         "linux": {"Linux x86_64"},
-        # 移动端 JS 层 navigator.platform 的真机典型值
-        "android": {"Linux aarch64", "Linux armv8l", "Linux armv7l"},
+        # 移动端 JS 层 navigator.platform 的真机典型值。
+        # Android 走 UA 缩减口径，取值被 Blink 硬编码为 "Linux armv81"
+        # （navigator_base.cc GetReducedNavigatorPlatform()），不按 ABI 报
+        # aarch64/armv8l——只有 Android desktop/XR 才可能是 "Linux x86_64"。
+        "android": {"Linux armv81"},
         "ios": {"iPhone", "iPad", "iPod"},
     }
     if platform and platform not in expected_platform.get(target_os, {platform}):
@@ -305,13 +308,13 @@ def check_health(fingerprint_data: dict[str, Any], target_os: str) -> dict[str, 
             warnings.append("移动端屏幕字段类型异常")
 
         # UA ↔ 机型 ↔ 系统版本 相互印证
-        if model and target_os == "android":
-            # 机型名可能含空格（Pixel 8 Pro），做整名匹配
-            if model not in ua:
-                warnings.append(f"UA 中未见机型标识 {model}")
+        # Android 走 UA 缩减口径：UA 串固定为 "Android 10; K"，机型与系统
+        # 版本不在 UA 里，真值只经 UA-CH 两条高熵提示下发。故这里校验的是
+        # 「缩减串形态 + 高熵值 == 档案」，而不是把机型/版本拼进 UA。
+        if target_os == "android":
+            if "Android 10; K)" not in ua:
+                warnings.append("Android UA 未取缩减形态（应为 `Android 10; K`）")
         if os_version:
-            if target_os == "android" and f"Android {os_version}" not in ua:
-                warnings.append(f"UA 中 Android 版本与档案不一致（应为 {os_version}）")
             if target_os == "ios" and f"OS {os_version.replace('.', '_')}" not in ua:
                 warnings.append(f"UA 中 iOS 版本与档案不一致（应为 {os_version}）")
 
@@ -320,8 +323,12 @@ def check_health(fingerprint_data: dict[str, Any], target_os: str) -> dict[str, 
         if target_os == "android":
             if not ua_ch:
                 warnings.append("Android 缺少 UA-CH 元数据")
-            elif model and str(ua_ch.get("model") or "") != model:
-                warnings.append("UA-CH model 与 UA 机型标识不一致")
+            else:
+                if model and str(ua_ch.get("model") or "") != model:
+                    warnings.append("UA-CH model 与档案机型不一致")
+                want_pv = f"{os_version}.0.0" if os_version else ""
+                if want_pv and str(ua_ch.get("platformVersion") or "") != want_pv:
+                    warnings.append("UA-CH platformVersion 与档案系统版本不一致")
         elif ua_ch:
             warnings.append("iOS 不应携带 UA-CH 元数据")
 

@@ -216,24 +216,73 @@ def _normalize_browser(target_os: str, browser: Optional[str]) -> str:
     raise ValueError(f"iOS 端浏览器口径仅支持 safari / chrome_ios（收到 {browser}）")
 
 
+# Chromium 的 UA-CH 品牌表由 major version 派生，不是常量
+# （components/embedder_support/user_agent_utils.cc:214-256、535-551）：
+#   * GREASE 品牌 = "Not" + c[seed%11] + "A" + c[(seed+1)%11] + "Brand"，
+#     版本 = ["8","99","24"][seed%3]，seed 就是 major version；
+#   * 三项品牌再用 GetRandomOrder(seed, 3) 打乱顺序。
+# 真机 Chrome 156 实测 ['Not:A-Brand/8','Chromium/156','Google Chrome/156']，
+# 与本函数输出逐字一致。写死成固定 GREASE 串（早期库里存的是
+# Not/A)Brand/99）会同时错掉品牌名、版本与顺序三项——检测站拿到低熵
+# brands 就能直接比对。
+_UA_CH_GREASE_CHARS = (" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_")
+_UA_CH_GREASE_VERSIONS = ("8", "99", "24")
+_UA_CH_ORDERS = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))
+
+
+def _ua_ch_brands(major: str, version: str, version_type: str) -> List[Dict[str, str]]:
+    """按 Chromium 的 seed 规则生成 UA-CH 品牌表（低熵 brands / 高熵 fullVersionList）。"""
+    seed = int(major)
+    greasey_brand = "Not" + _UA_CH_GREASE_CHARS[seed % 11] + "A" + _UA_CH_GREASE_CHARS[(seed + 1) % 11] + "Brand"
+    greasey_version = _UA_CH_GREASE_VERSIONS[seed % 3]
+    if version_type == "full":
+        greasey_version += ".0.0.0"
+    base = [(greasey_brand, greasey_version),
+            ("Chromium", version),
+            ("Google Chrome", version)]
+    order = _UA_CH_ORDERS[seed % len(_UA_CH_ORDERS)]
+    shuffled: List[Dict[str, str]] = [{"brand": "", "version": ""} for _ in base]
+    for i, target in enumerate(order):
+        shuffled[target] = {"brand": base[i][0], "version": base[i][1]}
+    return shuffled
+
+
+# UA 缩减（Chrome 110 全量；Android M110+ 2023-05-11 起 100%）：
+# 真机 UA 串里的 OS 版本与机型被**冻结**成字面量，真实值只走高熵提示
+# Sec-CH-UA-Platform-Version / Sec-CH-UA-Model。
+#   * UA 段：`Linux; Android 10; K`
+#     （components/embedder_support/user_agent_utils.cc GetUnifiedPlatform()
+#     的 `return "Linux; Android 10; K";`）
+#   * navigator.platform：`Linux armv81`，硬编码、不按 ABI 取值
+#     （third_party/blink/renderer/core/execution_context/navigator_base.cc
+#     GetReducedNavigatorPlatform()；仅 Android desktop/XR 且启用
+#     kAndroidDesktopUASpoofAsChromeOS 时才是 `Linux x86_64`）
+# 两处取值都以 152.0.7977.82 tag 逐字核对。生成端、内核命令行与运行期注入
+# 三处必须同源，否则会出现「UA 已缩减、platform 仍按 ABI」的跨面矛盾。
+ANDROID_REDUCED_UA_PLATFORM = "Linux; Android 10; K"
+ANDROID_REDUCED_NAV_PLATFORM = "Linux armv81"
+
+
+def _reduced_android_ua(ua: Any) -> str:
+    """把 Android UA 收敛成真机的缩减形态（只重写括号内 platform 段）。
+
+    存量档案存的是缩减前串（`Linux; Android 16; <Build.MODEL>`）；运行期与
+    内核命令行都走这里改写，其余（AppleWebKit / Mobile / Safari 段）原样保留。
+    """
+    text = str(ua or "")
+    if not text:
+        return text
+    return re.sub(r"\(Linux; Android [^)]*\)",
+                  f"({ANDROID_REDUCED_UA_PLATFORM})", text, count=1)
+
+
 def _android_ua_ch(device: Dict[str, Any], os_version: str, browser: Dict[str, Any]) -> Dict[str, Any]:
     """Chrome Android 的 navigator.userAgentData（含高熵值）。"""
     major = str(browser["major"])
     full = str(browser["full"])
-    grease = _LIBRARY.get("grease_brand") or {"brand": "Not/A)Brand", "version": "99"}
-    grease_brand = {"brand": grease["brand"], "version": str(grease["version"])}
-    grease_full = {"brand": grease["brand"], "version": f"{grease['version']}.0.0.0"}
     return {
-        "brands": [
-            {"brand": "Chromium", "version": major},
-            {"brand": "Google Chrome", "version": major},
-            dict(grease_brand),
-        ],
-        "fullVersionList": [
-            {"brand": "Chromium", "version": full},
-            {"brand": "Google Chrome", "version": full},
-            dict(grease_full),
-        ],
+        "brands": _ua_ch_brands(major, major, "major"),
+        "fullVersionList": _ua_ch_brands(major, full, "full"),
         "fullVersion": full,
         "platform": "Android",
         "platformVersion": f"{os_version}.0.0",
@@ -253,30 +302,292 @@ def _android_ua_ch(device: Dict[str, Any], os_version: str, browser: Dict[str, A
 
 # ------------------------------------------------------------------ 字体
 _MOBILE_FONTS = {
+    # iOS 侧按 Apple「Fonts for Apple platforms」页的 iOS 标注重写
+    # （system font iOS / document support iOS，抓取于 2026-10）。
+    #
+    # 早先这里混着两类不存在的族：
+    #   * 标注为 downloadable iOS 的（Tahoma / Comic Sans MS / Bookman /
+    #     Lucida Console / Monaco / Lucida Grande）：iOS 出厂不带，要在
+    #     设置里手动装。声明了就等于放行抢占，macOS 宿主的同名族照样解析
+    #     ——Monaco 在真机上量不到，仿真却量得到，是最明显的一条。
+    #   * 宿主 macOS 上根本没有的（SF Pro Text / SF Pro Icons /
+    #     ITC Avant Garde Gothic / Sand / System Font / Arial MT /
+    #     Georgia MT）：本地() 探测本来就落空，声明它们只是噪音。
+    # 保留下来的都是 iOS 真机预装的族，见 _IOS_DEVICE_FONTS。
     "ios": {
         "essential": [
             'Helvetica Neue', 'Arial', 'Times New Roman', 'Courier New',
-            'Georgia', 'Verdana', 'Tahoma', 'Palatino', 'Garamond',
-            'Bookman', 'Comic Sans MS', 'Trebuchet MS', 'Lucida Console',
-            'Menlo', 'Monaco', 'Lucida Grande', 'PingFang SC', 'PingFang HK',
+            'Georgia', 'Verdana', 'Palatino', 'Trebuchet MS',
+            'Menlo', 'Helvetica', 'PingFang SC', 'PingFang HK',
         ],
         "extra": [
-            'SF Pro Text', 'SF Pro Icons', 'Helvetica', 'Chalkboard SE',
-            'Didot', 'ITC Avant Garde Gothic', 'Century Gothic', 'Sand',
-            'System Font', 'Times', 'Arial MT', 'Georgia MT',
+            'Chalkboard SE', 'Didot', 'Apple SD Gothic Neo',
+            'Avenir', 'Avenir Next', 'Baskerville', 'Futura', 'Optima',
+            'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Apple Color Emoji',
         ],
     },
+    # Android 侧只列 **AOSP 预装的族名**，取自
+    # platform/frameworks/base/data/fonts/{fonts.xml,alias.json} 与同目录的
+    # 字体文件清单（Roboto-Regular / DroidSansMono / NotoSerif / NotoSans* /
+    # SourceSansPro / CutiveMono / ComingSoon / DancingScript /
+    # CarroisGothicSC / NotoColorEmoji / NotoSansSymbols / RobotoFlex）。
+    #
+    # 早先这里放的是 Open Sans / Montserrat / Lato / Merriweather / Poppins /
+    # PT Sans / PT Serif 等**网页字体**——Android 系统里没有这些文件。后果
+    # 不是「多报几个字体」这么轻：声明表同时是 F-93③ 的放行名单，声明了
+    # 就不抢占该族名。PT Sans / PT Serif 恰好是宿主 macOS 预装的（macOS 带
+    # 的 PT 系），于是 BrowserLeaks 的 3564 名扫描把它们量成「存在」，与
+    # Android 机型自相矛盾。按 AOSP 清单重写后这些族回到抢占列表，扫描结果
+    # 里不再出现宿主专有族。
+    #
+    # 通用族别名（Arial/Helvetica/Tahoma/Verdana/Times/Georgia/Courier/
+    # Palatino/Monaco/Baskerville）**故意不列**：真机上它们由 alias.json 解析
+    # 到 sans-serif/serif/monospace，而我们没法让一个族名解析到宿主通用族
+    # （抢占只能把族名变成「不存在」）。列进来会让 macOS 的原生 Arial 字形
+    # 顶上去——那正是 F-93③ 要挡的宿主字形。
     "android": {
         "essential": [
-            'Droid Sans', 'Droid Serif', 'Roboto', 'Open Sans', 'Montserrat',
-            'Noto Sans', 'Noto Sans SC', 'Source Sans Pro', 'Lato',
+            # AOSP 的 /system/fonts 自带 DroidSansMono.ttf，族名就是
+            # "Droid Sans Mono"（与 "Droid Sans" 是两个族）。creepjs 的
+            # ANDROID_FONTS 用它判定 Android，漏了会让 FontFace 探测得到 0/51。
+            # Dancing Script / Noto Color Emoji 同理在 AOSP 清单里，且
+            # creepjs 会探测。
+            'Roboto', 'Droid Sans Mono', 'Dancing Script', 'Noto Color Emoji',
+            'Noto Sans', 'Noto Serif', 'Source Sans Pro',
         ],
         "extra": [
-            'Merriweather', 'Oxygen', 'PT Sans', 'PT Serif', 'Fira Sans',
-            'Raleway', 'Ubuntu', 'Karumbi', 'Poppins', 'Josefin Sans',
+            'Cutive Mono', 'Coming Soon', 'Carrois Gothic SC',
+            'Noto Sans SC', 'Noto Sans Symbols', 'Roboto Flex',
         ],
     },
 }
+
+# ------------------------------------------------------------------ iOS 设备字体白名单
+# F-93③ 的放行名单：注入器把宿主 macOS 上按名字可解析、但 iPhone 上**没有**的
+# 族名逐个用同名空 FontFace 抢占，让字体探测落空。判据是清单里那句「宿主有、
+# 设备没有」——所以这里列的是 iPhone 真机预装、可以照常解析的族。
+#
+# 数据源：Apple「Fonts for Apple platforms」页里标注为 `system font iOS` 或
+# `document support iOS` 的族（抓取于 2026-10）。标注为 `downloadable iOS` 的
+# **不列**——那些要在设置里手动装，出厂没有。
+#
+# 两条实测出来的细节：
+#   * 该标注对 CJK **不可信**：PingFang SC/TC/HK、Songti、Kaiti、Heiti 这些
+#     iOS 默认中文字体全被标成 downloadable（Apple 页把它们当可选下载项列）。
+#     所以 CJK 单独手列在 _IOS_CJK_FAMILIES，不依赖标注。
+#   * 宿主枚举出来的是 PostScript 名（STSongti-SC-Regular、PingFangHK-Light、
+#     .Hiragino Sans GB Interface），Apple 只列族名+样式名，两者不同构。
+#     CJK 用前缀匹配覆盖这些变体，拉丁族必须精确匹配——用 `arial` 前缀会把
+#     macOS 专有的 Arial Narrow / Arial Unicode MS 一起放行。
+_IOS_DEVICE_FONTS = (
+    'Academy Engraved LET Plain:1.0', 'Al Nile', 'Al Nile Bold', 'American Typewriter',
+    'American Typewriter Bold', 'American Typewriter Condensed', 'American Typewriter Condensed Bold',
+    'American Typewriter Condensed Light', 'American Typewriter Light', 'American Typewriter Semibold',
+    'Apple Color Emoji', 'Apple SD Gothic Neo Bold', 'Apple SD Gothic Neo Light',
+    'Apple SD Gothic Neo Medium', 'Apple SD Gothic Neo Regular', 'Apple SD Gothic Neo SemiBold',
+    'Apple SD Gothic Neo Thin', 'Apple SD Gothic Neo UltraLight', 'Apple Symbols',
+    'AppleGothic Regular', 'Arial', 'Arial Bold', 'Arial Bold Italic', 'Arial Hebrew',
+    'Arial Hebrew Bold', 'Arial Hebrew Light', 'Arial Italic', 'Arial Rounded MT Bold',
+    'Asphalt Medium', 'Athelas Bold', 'Athelas Bold Italic', 'Athelas Italic',
+    'Athelas Regular', 'Avenir Black', 'Avenir Black Oblique', 'Avenir Book', 'Avenir Book Oblique',
+    'Avenir Heavy', 'Avenir Heavy Oblique', 'Avenir Light', 'Avenir Light Oblique',
+    'Avenir Medium', 'Avenir Medium Oblique', 'Avenir Next Bold', 'Avenir Next Bold Italic',
+    'Avenir Next Condensed Bold', 'Avenir Next Condensed Bold Italic', 'Avenir Next Condensed Demi Bold',
+    'Avenir Next Condensed Demi Bold Italic', 'Avenir Next Condensed Heavy', 'Avenir Next Condensed Heavy Italic',
+    'Avenir Next Condensed Italic', 'Avenir Next Condensed Medium', 'Avenir Next Condensed Medium Italic',
+    'Avenir Next Condensed Regular', 'Avenir Next Condensed Ultra Light', 'Avenir Next Condensed Ultra Light Italic',
+    'Avenir Next Demi Bold', 'Avenir Next Demi Bold Italic', 'Avenir Next Heavy',
+    'Avenir Next Heavy Italic', 'Avenir Next Italic', 'Avenir Next Medium', 'Avenir Next Medium Italic',
+    'Avenir Next Regular', 'Avenir Next Ultra Light', 'Avenir Next Ultra Light Italic',
+    'Avenir Oblique', 'Avenir Roman', 'Balega Regular', 'Baskerville', 'Baskerville Bold',
+    'Baskerville Bold Italic', 'Baskerville Italic', 'Baskerville SemiBold', 'Baskerville SemiBold Italic',
+    'Bebas Neue', 'Bodoni 72 Oldstyle Bold', 'Bodoni 72 Oldstyle Book', 'Bodoni 72 Oldstyle Book Italic',
+    'Bodoni 72 Smallcaps Book', 'Bodoni Ornaments', 'Bradley Hand Bold', 'Carlito',
+    'Carlito Bold', 'Carlito Bold Italic', 'Carlito Italic', 'Chalkboard SE Bold',
+    'Chalkboard SE Light', 'Chalkboard SE Regular', 'Chalkduster', 'Charter Black',
+    'Charter Black Italic', 'Charter Bold', 'Charter Bold Italic', 'Charter Italic',
+    'Charter Roman', 'Cochin', 'Cochin Bold', 'Cochin Bold Italic', 'Cochin Italic',
+    'Copperplate', 'Copperplate Bold', 'Copperplate Light', 'Courier', 'Courier Bold',
+    'Courier Bold Oblique', 'Courier New', 'Courier New Bold', 'Courier New Bold Italic',
+    'Courier New Italic', 'Courier Oblique', 'Damascus Bold', 'Damascus Light',
+    'Damascus Medium', 'Damascus Regular', 'Damascus Semi Bold', 'DB LCD Temp Black',
+    'Dear Joe Four Small Semibold', 'Devanagari Sangam MN', 'Devanagari Sangam MN Bold',
+    'Didot', 'Didot Bold', 'Didot Italic', 'DIN Alternate Bold', 'DIN Condensed Bold',
+    'Druk Bold', 'Druk Bold Italic', 'Druk Heavy', 'Druk Heavy Italic', 'Druk Medium',
+    'Druk Medium Italic', 'Druk Super', 'Druk Super Italic', 'Druk Text Bold',
+    'Druk Wide Bold', 'Druk Wide Bold Italic', 'Druk Wide Medium', 'Druk Wide Medium Italic',
+    'Euphemia UCAS', 'Euphemia UCAS Bold', 'Euphemia UCAS Italic', 'Fakt Slab Stencil Pro Medium',
+    'Farah Regular', 'Futura Bold', 'Futura Condensed ExtraBold', 'Futura Condensed Medium',
+    'Futura Medium', 'Futura Medium Italic', 'Galvji', 'Galvji Bold', 'Geeza Pro Bold',
+    'Geeza Pro Regular', 'Georgia', 'Georgia Bold', 'Georgia Bold Italic', 'Georgia Italic',
+    'Gill Sans', 'Gill Sans Bold', 'Gill Sans Bold Italic', 'Gill Sans Italic',
+    'Gill Sans Light', 'Gill Sans Light Italic', 'Gill Sans SemiBold', 'Gill Sans SemiBold Italic',
+    'Gill Sans UltraBold', 'Grantha Sangam MN Bold', 'Grantha Sangam MN Regular',
+    'Helvetica', 'Helvetica Bold', 'Helvetica Bold Oblique', 'Helvetica Light',
+    'Helvetica Light Oblique', 'Helvetica Neue', 'Helvetica Neue Bold', 'Helvetica Neue Bold Italic',
+    'Helvetica Neue Condensed Black', 'Helvetica Neue Condensed Bold', 'Helvetica Neue Italic',
+    'Helvetica Neue Light', 'Helvetica Neue Light Italic', 'Helvetica Neue Medium',
+    'Helvetica Neue Medium Italic', 'Helvetica Neue Thin', 'Helvetica Neue Thin Italic',
+    'Helvetica Neue UltraLight', 'Helvetica Neue UltraLight Italic', 'Helvetica Oblique',
+    'Hiragino Kaku Gothic Pro W3', 'Hiragino Kaku Gothic Pro W6', 'Hiragino Kaku Gothic ProN W3',
+    'Hiragino Kaku Gothic ProN W6', 'Hiragino Kaku Gothic Std W8', 'Hiragino Kaku Gothic StdN W8',
+    'Hiragino Maru Gothic Pro W4', 'Hiragino Maru Gothic ProN W4', 'Hiragino Mincho Pro W3',
+    'Hiragino Mincho Pro W6', 'Hiragino Mincho ProN W3', 'Hiragino Mincho ProN W6',
+    'Hiragino Sans W3', 'Hiragino Sans W4', 'Hiragino Sans W5', 'Hiragino Sans W6',
+    'Hiragino Sans W7', 'Hiragino Sans W8', 'Hoefler Text', 'Hoefler Text Black',
+    'Hoefler Text Black Italic', 'Hoefler Text Italic', 'Impact', 'Iowan Old Style Bold',
+    'Iowan Old Style Bold Italic', 'Iowan Old Style Italic', 'Iowan Old Style Roman',
+    'Journal Sans New Inline', 'Kailasa Bold', 'Kailasa Regular', 'Kefa Regular',
+    'Khmer Sangam MN', 'Kohinoor Bangla', 'Kohinoor Bangla Light', 'Kohinoor Bangla Semibold',
+    'Kohinoor Devanagari Light', 'Kohinoor Devanagari Regular', 'Kohinoor Devanagari Semibold',
+    'Kohinoor Gujarati Bold', 'Kohinoor Gujarati Light', 'Kohinoor Gujarati Regular',
+    'Kohinoor Telugu', 'Kohinoor Telugu Light', 'Kohinoor Telugu Medium', 'Lao Sangam MN',
+    'Malayalam Sangam MN', 'Malayalam Sangam MN Bold', 'Marion Bold', 'Marion Italic',
+    'Marion Regular', 'Marker Felt Thin', 'Marker Felt Wide', 'Menlo Bold', 'Menlo Bold Italic',
+    'Menlo Italic', 'Menlo Regular', 'Mishafi Regular', 'MuktaMahee Bold', 'MuktaMahee Light',
+    'MuktaMahee Regular', 'Myanmar Sangam MN', 'Myanmar Sangam MN Bold', 'Noteworthy Bold',
+    'Noteworthy Light', 'Noto Nastaliq Urdu', 'Noto Nastaliq Urdu Bold', 'Noto Sans Adlam Regular',
+    'Noto Sans Armenian Bold', 'Noto Sans Armenian Light', 'Noto Sans Armenian Regular',
+    'Noto Sans Avestan Regular', 'Noto Sans Bamum Regular', 'Noto Sans Bassa Vah Regular',
+    'Noto Sans Batak Regular', 'Noto Sans Bhaiksuki Regular', 'Noto Sans Brahmi Regular',
+    'Noto Sans Buginese Regular', 'Noto Sans Buhid Regular', 'Noto Sans Canadian Aboriginal Regular',
+    'Noto Sans Carian Regular', 'Noto Sans Caucasian Albanian Regular', 'Noto Sans Chakma Regular',
+    'Noto Sans Cham Regular', 'Noto Sans Coptic Regular', 'Noto Sans Cuneiform Regular',
+    'Noto Sans Cypriot Regular', 'Noto Sans Duployan Regular', 'Noto Sans Egyptian Hieroglyphs Regular',
+    'Noto Sans Elbasan Regular', 'Noto Sans Glagolitic Regular', 'Noto Sans Gothic Regular',
+    'Noto Sans Gunjala Gondi Regular', 'Noto Sans Hanifi Rohingya Regular', 'Noto Sans Hanunoo Regular',
+    'Noto Sans Hatran Regular', 'Noto Sans Imperial Aramaic Regular', 'Noto Sans Inscriptional Pahlavi Regular',
+    'Noto Sans Inscriptional Parthian Regular', 'Noto Sans Javanese Regular', 'Noto Sans Kaithi Regular',
+    'Noto Sans Kannada Bold', 'Noto Sans Kannada Light', 'Noto Sans Kannada Regular',
+    'Noto Sans Kayah Li Regular', 'Noto Sans Kharoshthi Regular', 'Noto Sans Khojki Regular',
+    'Noto Sans Khudawadi Regular', 'Noto Sans Lepcha Regular', 'Noto Sans Limbu Regular',
+    'Noto Sans Linear A Regular', 'Noto Sans Linear B Regular', 'Noto Sans Lisu Regular',
+    'Noto Sans Lycian Regular', 'Noto Sans Lydian Regular', 'Noto Sans Mahajani Regular',
+    'Noto Sans Mandaic Regular', 'Noto Sans Manichaean Regular', 'Noto Sans Marchen Regular',
+    'Noto Sans Masaram Gondi Regular', 'Noto Sans Meetei Mayek Regular', 'Noto Sans Mende Kikakui Regular',
+    'Noto Sans Meroitic Regular', 'Noto Sans Miao Regular', 'Noto Sans Modi Regular',
+    'Noto Sans Mongolian', 'Noto Sans Mro Regular', 'Noto Sans Multani Regular',
+    'Noto Sans Myanmar Bold', 'Noto Sans Myanmar Light', 'Noto Sans Myanmar Regular',
+    'Noto Sans Nabataean Regular', 'Noto Sans New Tai Lue Regular', 'Noto Sans Newa Regular',
+    'Noto Sans NKo Regular', 'Noto Sans Ol Chiki Regular', 'Noto Sans Old Hungarian Regular',
+    'Noto Sans Old Italic Regular', 'Noto Sans Old North Arabian Regular', 'Noto Sans Old Permic Regular',
+    'Noto Sans Old Persian Regular', 'Noto Sans Old South Arabian Regular', 'Noto Sans Old Turkic Regular',
+    'Noto Sans Oriya', 'Noto Sans Oriya Bold', 'Noto Sans Osage Regular', 'Noto Sans Osmanya Regular',
+    'Noto Sans Pahawh Hmong Regular', 'Noto Sans Palmyrene Regular', 'Noto Sans Pau Cin Hau Regular',
+    'Noto Sans PhagsPa Regular', 'Noto Sans Phoenician Regular', 'Noto Sans Psalter Pahlavi Regular',
+    'Noto Sans Rejang Regular', 'Noto Sans Samaritan Regular', 'Noto Sans Saurashtra Regular',
+    'Noto Sans Sharada Regular', 'Noto Sans Siddham Regular', 'Noto Sans Sora Sompeng Regular',
+    'Noto Sans Sundanese Regular', 'Noto Sans Syloti Nagri Regular', 'Noto Sans Syriac Regular Black',
+    'Noto Sans Syriac Regular Bold', 'Noto Sans Syriac Regular ExtraBold', 'Noto Sans Syriac Regular ExtraLight',
+    'Noto Sans Syriac Regular Light', 'Noto Sans Syriac Regular Medium', 'Noto Sans Syriac Regular Regular',
+    'Noto Sans Syriac Regular SemiBold', 'Noto Sans Syriac Regular Thin', 'Noto Sans Tagalog Regular',
+    'Noto Sans Tagbanwa Regular', 'Noto Sans Tai Le Regular', 'Noto Sans Tai Tham',
+    'Noto Sans Tai Viet Regular', 'Noto Sans Takri Regular', 'Noto Sans Thaana Regular',
+    'Noto Sans Tifinagh Regular', 'Noto Sans Tirhuta Regular', 'Noto Sans Ugaritic Regular',
+    'Noto Sans Vai Regular', 'Noto Sans Wancho Regular', 'Noto Sans Warang Citi Regular',
+    'Noto Sans Yi Regular', 'Noto Sans Zawgyi Bold', 'Noto Sans Zawgyi Light',
+    'Noto Sans Zawgyi Regular', 'Noto Serif Ahom Regular', 'Noto Serif Balinese Regular',
+    'Noto Serif Hmong Nyiakeng Regular', 'Noto Serif Yezidi Regular', 'Optima Bold',
+    'Optima Bold Italic', 'Optima ExtraBlack', 'Optima Italic', 'Optima Regular',
+    'Palatino', 'Palatino Bold', 'Palatino Bold Italic', 'Palatino Italic', 'Papyrus',
+    'Papyrus Condensed', 'Party LET Plain', 'Rockwell', 'Rockwell Bold', 'Rockwell Bold Italic',
+    'Rockwell Italic', 'Savoye LET Plain:1.0', 'Scheme-Bold', 'Seravek', 'Seravek Bold',
+    'Seravek Bold Italic', 'Seravek ExtraLight', 'Seravek ExtraLight Italic', 'Seravek Italic',
+    'Seravek Light', 'Seravek Light Italic', 'Seravek Medium', 'Seravek Medium Italic',
+    'SignPainter-HouseScript Semibold', 'Sinhala Sangam MN', 'Sinhala Sangam MN Bold',
+    'Snell Roundhand', 'Snell Roundhand Black', 'Snell Roundhand Bold', 'STIX Two Math Regular',
+    'STIX Two Text Bold', 'STIX Two Text Italic Bold Italic', 'STIX Two Text Italic Italic',
+    'STIX Two Text Italic Medium Italic', 'STIX Two Text Italic SemiBold Italic',
+    'STIX Two Text Medium', 'STIX Two Text Regular', 'STIX Two Text SemiBold',
+    'STIXGeneral-Bold', 'STIXGeneral-BoldItalic', 'STIXGeneral-Italic', 'STIXGeneral-Regular',
+    'Sukhumvit Set Bold', 'Sukhumvit Set Light', 'Sukhumvit Set Medium', 'Sukhumvit Set Semi Bold',
+    'Sukhumvit Set Text', 'Sukhumvit Set Thin', 'Superclarendon Black', 'Superclarendon Black Italic',
+    'Superclarendon Bold', 'Superclarendon Bold Italic', 'Superclarendon Italic',
+    'Superclarendon Light', 'Superclarendon Light Italic', 'Superclarendon Regular',
+    'Symbol', 'Tamil Sangam MN', 'Tamil Sangam MN Bold', 'The Hand Serif Semibold',
+    'Thonburi', 'Thonburi Bold', 'Thonburi Light', 'Times New Roman', 'Times New Roman Bold',
+    'Times New Roman Bold Italic', 'Times New Roman Italic', 'Trebuchet MS', 'Trebuchet MS Bold',
+    'Trebuchet MS Bold Italic', 'Trebuchet MS Italic', 'Verdana', 'Verdana Bold',
+    'Verdana Bold Italic', 'Verdana Italic', 'Zapf Dingbats', 'Zapfino',
+)
+
+
+_IOS_CJK_FAMILIES = (
+    'PingFang SC', 'PingFang TC', 'PingFang HK', 'PingFang MO', 'Songti SC', 'Songti TC',
+    'Kaiti SC', 'Kaiti TC', 'Yuanti SC', 'Yuanti TC', 'Heiti SC', 'Heiti TC', 'STHeiti',
+    'STSong', 'STKaiti', 'STFangsong', 'Hiragino Sans GB', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN',
+    'Hiragino Mincho ProN', 'Hiragino Maru Gothic ProN', 'Apple SD Gothic Neo',
+    'Apple LiGothic', 'Apple LiSung', 'AppleMyungjo', 'NanumGothic', 'NanumMyeongjo',
+    'GungSeo', 'PCMyungjo', 'PilGi', 'Apple Color Emoji',
+)
+
+
+_IOS_CJK_PREFIXES = (
+    'applecoloremoji', 'appleligothic', 'applelisung', 'applemyungjo', 'applesdgothicneo',
+    'dotapplecoloremoji', 'dotappleligothic', 'dotapplelisung', 'dotapplemyungjo',
+    'dotapplesdgothicneo', 'dotgungseo', 'dotheitisc', 'dotheititc', 'dothiraginokakugothicpron',
+    'dothiraginomarugothicpron', 'dothiraginominchopron', 'dothiraginosans', 'dothiraginosansgb',
+    'dotkaitisc', 'dotkaititc', 'dotnanumgothic', 'dotnanummyeongjo', 'dotpcmyungjo',
+    'dotpilgi', 'dotpingfanghk', 'dotpingfangmo', 'dotpingfangsc', 'dotpingfangtc',
+    'dotsongtisc', 'dotsongtitc', 'dotstfangsong', 'dotstheiti', 'dotstkaiti',
+    'dotstsong', 'dotyuantisc', 'dotyuantitc', 'gungseo', 'heitisc', 'heititc',
+    'hiraginokakugothicpron', 'hiraginomarugothicpron', 'hiraginominchopron', 'hiraginosans',
+    'hiraginosansgb', 'kaitisc', 'kaititc', 'nanumgothic', 'nanummyeongjo', 'pcmyungjo',
+    'pilgi', 'pingfanghk', 'pingfangmo', 'pingfangsc', 'pingfangtc', 'songtisc',
+    'songtitc', 'stapple', 'stapplecoloremoji', 'stappleligothic', 'stapplelisung',
+    'stapplemyungjo', 'stapplesdgothicneo', 'stfangsong', 'stgungseo', 'stheiti',
+    'stheitisc', 'stheititc', 'sthiragino', 'sthiraginokakugothicpron', 'sthiraginomarugothicpron',
+    'sthiraginominchopron', 'sthiraginosans', 'sthiraginosansgb', 'stkaiti', 'stkaitisc',
+    'stkaititc', 'stnanumgothic', 'stnanummyeongjo', 'stpcmyungjo', 'stpilgi',
+    'stpingfang', 'stpingfanghk', 'stpingfangmo', 'stpingfangsc', 'stpingfangtc',
+    'stsong', 'stsongti', 'stsongtisc', 'stsongtitc', 'ststfangsong', 'ststheiti',
+    'ststkaiti', 'ststsong', 'styuanti', 'styuantisc', 'styuantitc', 'yuantisc',
+    'yuantitc',
+)
+
+
+def _norm_font_name(name: str) -> str:
+    """族名归一化：小写、只留字母数字，并去掉 `Plain:1.0` 这类版本后缀。"""
+    return re.sub(r"[^0-9a-z]", "", re.sub(r":[\d.]+$", "", str(name)).lower())
+
+
+_FONT_STYLE_WORDS = frozenset(
+    "plain regular bold italic oblique light medium semibold demibold heavy black "
+    "thin ultralight extralight book roman semi demi extra ultra".split())
+
+
+def _font_family_forms(name: str) -> set:
+    """一个字体名可能对应的所有族形态：整体 + 逐个剥掉尾部样式词。
+
+    Apple 按「族名 + 样式名」逐条列举（"Avenir Book"、"Charter Black"），宿主
+    枚举的既有族名（"Avenir"）也有完整名（"Avenir Book"），两边都要展开才能
+    对上。condensed/narrow/wide/expanded 是**族名成分**不是样式词，剥掉会把
+    "Avenir Next Condensed" 误归约成 "Avenir Next"。
+    """
+    text = re.sub(r":[\d.]+$", "", str(name).strip())
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+    words = [w for w in re.split(r"[^0-9A-Za-z]+",
+                                 text.replace("-", " ").replace("_", " ")) if w]
+    forms = {_norm_font_name("".join(words))}
+    while len(words) > 1 and words[-1].lower() in _FONT_STYLE_WORDS:
+        words = words[:-1]
+        forms.add(_norm_font_name("".join(words)))
+    return {f for f in forms if len(f) >= 3}
+
+
+_IOS_DECLARED_FONTS = frozenset(
+    form
+    for name in tuple(_IOS_DEVICE_FONTS) + tuple(_IOS_CJK_FAMILIES)
+    for form in _font_family_forms(name))
+
+
+def _ios_font_visible(name: str) -> bool:
+    """该族名在 iPhone 上能否按名字解析（真机预装 → True）。"""
+    key = _norm_font_name(name)
+    if key in _IOS_DECLARED_FONTS:
+        return True
+    return any(key.startswith(p) for p in _IOS_CJK_PREFIXES)
 
 
 # ------------------------------------------------------------------ 文本度量
@@ -370,14 +681,19 @@ def _generate_mobile_font_subset(target_os: str, *, full: bool = False) -> List[
 
 # ------------------------------------------------------------------ 辅助数据
 def _generate_battery_api() -> Dict[str, Any]:
-    """Android Chrome navigator.getBattery() 的初始值（iOS 无该 API，返回 None）。"""
+    """Android Chrome navigator.getBattery() 的初始值（iOS 无该 API，返回 None）。
+
+    按规范只存「另一侧」的有限时长：充电时 dischargingTime 为 Infinity，
+    放电时 chargingTime 为 Infinity。Infinity 无法写进存储的 JSON（HTTP 序列化
+    会 500），故这里存 None，由注入器在运行期按 charging 推导。
+    """
     level = round(random.uniform(0.2, 1.0), 2)
     charging = random.random() < 0.15
     return {
         "level": level,
         "charging": charging,
-        "chargingTime": 0 if not charging else random.randint(1800, 7200),
-        "dischargingTime": random.randint(14400, 43200),
+        "chargingTime": None if not charging else random.randint(1800, 7200),
+        "dischargingTime": random.randint(14400, 43200) if not charging else None,
     }
 
 
@@ -481,19 +797,16 @@ _ANDROID_REMOVE_NAV_PROPS = [
 # 故 hvc1 家族单列校准为 "probably"；ogg/webm/opus 内核已与真机同口径，不动。
 _CODEC_CAPABILITY_IOS: Dict[str, str] = {
     # --- AVFoundation 容器白名单外：拒绝 ---
-    "audio/ogg": "",
-    'audio/ogg; codecs="vorbis"': "",
-    'audio/ogg; codecs="opus"': "",
-    "audio/webm": "",
-    'audio/webm; codecs="opus"': "",
-    'audio/webm; codecs="vorbis"': "",
-    "video/webm": "",
-    'video/webm; codecs="vp8"': "",
-    'video/webm; codecs="vp8, vorbis"': "",
-    'video/webm; codecs="vp9"': "",
-    'video/webm; codecs="vp09.00.10.08"': "",
-    "video/ogg": "",
-    'video/ogg; codecs="theora"': "",
+    # ogg 不在此表：iOS 18.4 起 WebKit 支持 Ogg 容器（vorbis/opus/flac），
+    # 低于 18.4 才整族缺席。版本门控在注入层 __cptIos / __mseSupports 按
+    # opt.ogg 判定，表里写死会把这档机型答成「不是 iOS」。
+    # video/ogg 在所有版本都缺席（AVFoundation 无 theora 解码器），可由
+    # 算法判空，故同样不列。
+    # F-199：webm 不再写死。iOS 17.4 起 AVFoundation 带 WebM 解码器
+    # （caniuse webm：ios_saf 17.3 仍是「仅 WebRTC 内 VP8/VP9」的 a 档，
+    # 17.4 转 y），覆盖层若继续钉成 '' 会把 17.4+ 的机型答成「不是 iOS」。
+    # 平台差由注入层 __cptIos 按 opt.webm 判定（<17.4 走容器门拒绝 → ''，
+    # ≥17.4 裸容器 → "maybe"、带 vp8/vp9/opus/vorbis → "probably"）。
     # --- Apple VideoToolbox：HEVC 硬件解码 ---
     'video/mp4; codecs="hvc1"': "probably",
     'video/mp4; codecs="hvc1.1.6.L93.B0"': "probably",
@@ -781,6 +1094,16 @@ _IOS_REMOVE_GLOBALS = [
     #   `storage`（Source/WebCore/page/NavigatorStorage.idl，2026-10 核实），
     #   真机 Safari/CriOS 均无。桌面内核两者俱全，一行 `in` 即可判假。
     "v8BreakIterator", "webkitTemporaryStorage", "webkitPersistentStorage",
+    # 真机 Safari 无 window.chrome（F-64 口径仍然成立）。内核 152 的
+    # window.chrome 是 own + **configurable:true**（实测 /tmp/fb05/chromedel3.py：
+    # 文档起点 `delete window.chrome` 后 `'chrome' in window === false`，
+    # 0ms 定时器复查仍为 false，不会被惰性装回）——F-169 当年那句
+    # 「configurable:false，delete 静默失败」是内核 148 时代的观测，对 152
+    # 已失效。删干净后 creepjs 的守卫
+    # `if (!('chrome' in window && 'runtime' in chrome)) return false;`
+    # 在第一支即短路（实测 guard 返回 true），不会像「值改成 undefined」
+    # 那样对 undefined 取 `in` 抛 TypeError 击穿 getHeadlessFeatures。
+    "chrome",
     # F-05 / F-09 / F-10 / F-21：WebKit 27.2 实测缺席、桌面内核仍带的入口
     # 接口对象与 Blink 遗留别名。整族只收「入口」——家族成员的 `in` 随
     # 入口缺席而消失。webkit* 前缀族是 Chromium 的遗留别名，真机 iOS 用
@@ -1380,6 +1703,12 @@ _IOS_DROP_PROTO_MEMBERS: Dict[str, List[str]] = {
     ],
     # isExtended 是 F-09 的同一项；onchange 为 WebKit 未实现的 Screen 事件
     "Screen": ["isExtended", "onchange"],
+    # iOS Safari exposes only the read-only orientation state.  Blink keeps the
+    # lock()/unlock() pair on ScreenOrientation.prototype, although the WebKit
+    # IDL does not expose either method on iPhone/iPad.  Leaving the pair in
+    # place is a one-line capability probe (`'lock' in screen.orientation`) and
+    # also makes the injected type/angle state look internally inconsistent.
+    "ScreenOrientation": ["lock", "unlock"],
     "OffscreenCanvas": ["oncontextlost", "oncontextrestored"],
     "ShadowRoot": ["getSelection", "pointerLockElement", "setHTML"],
     "VideoFrame": ["flip", "rotation", "metadata"],
@@ -1594,37 +1923,49 @@ def _parse_ios_version_local(value: Any) -> Optional[tuple]:
 # --------------------------------------------------------------------------
 # 真机 Chrome Android 预装 Google TTS，`speechSynthesis.getVoices()` 返回
 # 数十条；宿主 macOS 上 Blink 返回的是宿主语音（婷婷/Albert/Samantha…），
-# 两者都不是 Android 真机形态。表内取自真机 Chrome Android（Pixel 8,
-# Android 14, 2026-10 采样）的常见子集：字段顺序为
+# 两者都不是 Android 真机形态。字段顺序为
 #   [voiceURI, lang, localService, default]
-# voiceURI 用 Google TTS 的 "Google <语言名>" 形态（真机也是这个名字），
-# 每条都是本地引擎（localService=true，离线 TTS），只有 default 一条为 true。
+#
+# 名字与 lang 的形态**照抄 Chromium 的构造方式**，不能凭印象编：
+# content/public/android/java/.../TtsPlatformImpl.java 遍历
+# `Locale.getAvailableLocales()`，对 `isLanguageAvailable(locale) > 0` 且
+# variant 为空的 locale 生成
+#     name = locale.getDisplayLanguage() [+ " " + getDisplayCountry()]
+#     lang = locale.toString()
+# 即 en-US 设备上得到 "English United States" / "en_US"——名字是**语言+国家的
+# 显示名**，不是 "Google xxx"；lang 是 Java 的 `_` 分隔形态而非 BCP-47 的 `-`。
+# 早先按 "Google 中文（简体）" 造表是错的：Google 品牌名是**远程**语音的命名
+# （remote=true → localService=false），把它和 localService=true 拼在一起是
+# 自相矛盾，IPHey 的 BROWSER 判据直接给 "inconsistent browser fingerprint"，
+# 分数卡在 60。改成源码口径后该判据消失（实测 60 → 90，余下只剩 location）。
+# 每条都是本地引擎（native=true → remote=false → localService=true）。
 _ANDROID_TTS_VOICES: List[List[Any]] = [
-    ["Google 中文（简体）", "zh-CN", True, True],
-    ["Google 普通话（中国大陆）", "cmn-Hans-CN", True, False],
-    ["Google 粤語（香港）", "yue-HK", True, False],
-    ["Google 中文（繁體）", "zh-TW", True, False],
-    ["Google English (United States)", "en-US", True, False],
-    ["Google English (United Kingdom)", "en-GB", True, False],
-    ["Google English (India)", "en-IN", True, False],
-    ["Google 日本語", "ja-JP", True, False],
-    ["Google 한국어", "ko-KR", True, False],
-    ["Google Deutsch", "de-DE", True, False],
-    ["Google français", "fr-FR", True, False],
-    ["Google español (España)", "es-ES", True, False],
-    ["Google español (Estados Unidos)", "es-US", True, False],
-    ["Google italiano", "it-IT", True, False],
-    ["Google português (Brasil)", "pt-BR", True, False],
-    ["Google português (Portugal)", "pt-PT", True, False],
-    ["Google русский", "ru-RU", True, False],
-    ["Google ภาษาไทย", "th-TH", True, False],
-    ["Google Tiếng Việt", "vi-VN", True, False],
-    ["Google Bahasa Indonesia", "id-ID", True, False],
-    ["Google हिन्दी", "hi-IN", True, False],
-    ["Google Türkçe", "tr-TR", True, False],
-    ["Google Nederlands", "nl-NL", True, False],
-    ["Google polski", "pl-PL", True, False],
-    ["Google العربية", "ar-XA", True, False],
+    ["English United States", "en_US", True, True],
+    ["English United Kingdom", "en_GB", True, False],
+    ["English India", "en_IN", True, False],
+    ["English Australia", "en_AU", True, False],
+    ["English Canada", "en_CA", True, False],
+    ["Chinese China", "zh_CN", True, False],
+    ["Chinese Taiwan", "zh_TW", True, False],
+    ["Chinese Hong Kong", "zh_HK", True, False],
+    ["Japanese Japan", "ja_JP", True, False],
+    ["Korean Korea", "ko_KR", True, False],
+    ["German Germany", "de_DE", True, False],
+    ["French France", "fr_FR", True, False],
+    ["Spanish Spain", "es_ES", True, False],
+    ["Spanish United States", "es_US", True, False],
+    ["Italian Italy", "it_IT", True, False],
+    ["Portuguese Brazil", "pt_BR", True, False],
+    ["Portuguese Portugal", "pt_PT", True, False],
+    ["Russian Russia", "ru_RU", True, False],
+    ["Thai Thailand", "th_TH", True, False],
+    ["Vietnamese Vietnam", "vi_VN", True, False],
+    ["Indonesian Indonesia", "in_ID", True, False],
+    ["Hindi India", "hi_IN", True, False],
+    ["Turkish Turkey", "tr_TR", True, False],
+    ["Dutch Netherlands", "nl_NL", True, False],
+    ["Polish Poland", "pl_PL", True, False],
+    ["Arabic Egypt", "ar_EG", True, False],
 ]
 
 
@@ -1657,28 +1998,23 @@ def _android_tts_voices(target_os: str, locale: str = "") -> List[List[Any]]:
 def _pick_default_voice(rows: List[List[Any]], locale: str) -> Optional[int]:
     """按 locale 挑默认 TTS 语音的下标；无匹配语族返回 None。
 
-    优先级：完全同 locale（`en-US` → `en-US`）＞ 同语族（`en-US` → `en-GB`
-    等）＞ `cmn-Hans-CN` 一类的汉字变体（`zh` ↔ `cmn`）。
+    优先级：完全同 locale（`en-US` → `en_US`）＞ 同语族（`en-US` → `en_GB`
+    等）。两侧都归一成 `-` 分隔再比：调用方给的是 BCP-47（`en-US`），而表里
+    是 Java `Locale.toString()` 的 `_` 形态（`en_US`）。
     """
-    base = locale.split("-")[0]
-    exact = None
+    def norm(s: str) -> str:
+        return str(s or "").strip().lower().replace("_", "-")
+
+    want = norm(locale)
+    base = want.split("-")[0]
     same_family = None
     for i, row in enumerate(rows):
-        lang = str(row[1] or "").lower()
-        if lang == locale:
-            exact = i
-            break
+        lang = norm(row[1])
+        if lang == want:
+            return i
         if same_family is None and lang.split("-")[0] == base:
             same_family = i
-    if exact is not None:
-        return exact
-    if same_family is not None:
-        return same_family
-    if base == "zh":
-        for i, row in enumerate(rows):
-            if str(row[1] or "").lower().startswith("cmn-"):
-                return i
-    return None
+    return same_family
 
 
 # --------------------------------------------------------------------------
@@ -2079,6 +2415,21 @@ _IOS_ADD_SPEC: Dict[str, Any] = {
     # /tmp/wkprobe/f25chain.py）；init 为实例初值，argInit 为「构造参数 →
     # 成员」的位置映射（'' = 该位不映射）。
     "interfaces": {
+        # CSSOM derived declaration interfaces (Safari 26+).  Chromium keeps
+        # CSSStyleDeclaration as the public constructor and does not expose
+        # these WebKit/CSSOM globals.  They are non-constructible in WebKit
+        # and inherit the declaration members from CSSStyleDeclaration; the
+        # injector supplies the same prototype chain and native-shaped
+        # Illegal constructor semantics.
+        "CSSStyleProperties": {"construct": "illegal", "length": 0,
+                                "extends": "CSSStyleDeclaration",
+                                "members": []},
+        "CSSFontFaceDescriptors": {"construct": "illegal", "length": 0,
+                                    "extends": "CSSStyleDeclaration",
+                                    "members": []},
+        "CSSPageDescriptors": {"construct": "illegal", "length": 0,
+                                "extends": "CSSStyleDeclaration",
+                                "members": []},
         "AudioSession": {"construct": "illegal", "length": 0,
                          "extends": "EventTarget",
                          "members": ["=type"]},
@@ -2244,8 +2595,15 @@ _IOS_ADD_SPEC: Dict[str, Any] = {
                    "members": ["type", "url", "body", "!toJSON"]},
         # 混合体：不带 new 是 args 文案，带 new 是裸 Illegal constructor
         # （实测 /tmp/wkprobe/f25nonew.py）。
+        # repair=True：内核 152 已原生暴露 window.FontFaceSet（内核 148 没有，
+        # 旧注释「裸 fp-chromium 没有这个全局」已过时），其构造语义是 Blink 的
+        # `Failed to construct 'FontFaceSet': Illegal constructor`、length 0。
+        # 不加 repair 会被 __addIfaceObj 的 `existing && !repair` 直接跳过，
+        # 两处 Blink 文案原样漏给检测站（verify iOS「接口对象形态」即在此失败）。
+        # 真机 WebKit 26.6 实测：length 1、new → Illegal constructor、
+        # 无 new → Constructor requires 'new' operator（/tmp/fb04/wkffs.py）。
         "FontFaceSet": {"construct": "illegal", "length": 1,
-                        "noNew": "args",
+                        "noNew": "args", "repair": True,
                         "extends": "EventTarget",
                         "members": ["size", "=onloading", "=onloadingdone",
                                     "=onloadingerror", "ready", "status",
@@ -2452,20 +2810,22 @@ def generate_mobile_fingerprint(
     is_tablet = device["type"] == "tablet"
     max_touch_points = int(device.get("max_touch_points") or 5)
     memory_class = _memory_class(int(device.get("ram_gb") or 4))
+    # F-99：显示面板色域独立于 GPU。Android 只在有面板证据时下发 P3；
+    # iPhone/iPad profile 按既有全系 Display-P3 口径固定为 p3。
+    display_gamut = (_android_display_gamut(device)
+                     if target_os == "android" else "p3")
 
     if target_os == "android":
         android_browser = _pick_android_browser(mode)
-        major = str(android_browser["major"]) 
+        major = str(android_browser["major"])
         mobile_token = "" if is_tablet else "Mobile "
         user_agent = (
-            f"Mozilla/5.0 (Linux; Android {os_version}; {device['model']}) "
+            f"Mozilla/5.0 ({ANDROID_REDUCED_UA_PLATFORM}) "
             f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 "
             f"{mobile_token}Safari/537.36"
         )
-        # F-41：真机 Chrome Android 的 navigator.platform 按 ABI 取值——
-        # 32 位 armv8l、64 位 aarch64（Chrome 111 起）。现役机型全 arm64，
-        # 故默认 aarch64。旧值 "Linux armv81" 不匹配任何真机/构建串。
-        nav_platform = "Linux aarch64"
+        # 机型与系统版本不进 UA，只走 UA-CH 两条高熵头（见上方常量注释）。
+        nav_platform = ANDROID_REDUCED_NAV_PLATFORM
         vendor = "Google Inc."
         ua_ch: Optional[Dict[str, Any]] = _android_ua_ch(device, os_version, android_browser)
         browser_version = str(android_browser["full"])
@@ -2633,6 +2993,7 @@ def generate_mobile_fingerprint(
             "memoryClass": memory_class,
             "hasUaCh": ua_ch is not None,
             "hasBattery": battery is not None,
+            "displayGamut": display_gamut,
             "emptyPlugins": empty_plugins,
             "connectionType": connection_type,
             "downlinkMax": downlink_max,
