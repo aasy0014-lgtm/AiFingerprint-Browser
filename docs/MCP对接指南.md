@@ -94,7 +94,7 @@ Cursor 的 MCP 配置在项目级 `.cursor/mcp.json` 或全局设置中：
 |---|---|---|
 | `list_profiles` | 环境列表 | `group`（可选，按分组名过滤） |
 | `get_profile` | 查看单个环境详情（含完整指纹） | `profile_id` |
-| `create_profile` | 创建环境 | `name`, `kernel`, `fingerprint_mode`, `target_os`, `group`, `proxy_json`, `launch_json` |
+| `create_profile` | 创建环境 | `name`, `kernel`, `fingerprint_mode`, `target_os`, `group`, `manufacturer`, `device_model`, `browser`, `proxy_json`, `launch_json` |
 | `update_profile` | 修改环境配置（名称/分组/代理/指纹重生成等） | `profile_id`, `updates_json` |
 | `delete_profile` | 删除环境（需先停止） | `profile_id` |
 | `batch_create_profiles` | 按模板批量创建（支持代理池） | `count`, `template_json`, `proxy_pool_json` |
@@ -134,7 +134,7 @@ Cursor 的 MCP 配置在项目级 `.cursor/mcp.json` 或全局设置中：
 | `extract_elements` | 抽取元素文本/属性（返回数组） | `profile_id`, `selector`, `attr` |
 | `get_page_info` | 获取页面 title/url/cookies | `profile_id` |
 | `get_html` | 获取页面 HTML | `profile_id`, `max_length` |
-| `readiness_check` | 环境就绪度体检（17 项，约 20-60 秒） | `profile_id` |
+| `readiness_check` | 环境就绪度体检（网络/指纹/存储/移动仿真多项，约 20-60 秒；返回 `login_readiness` 子评分） | `profile_id` |
 
 ### 3.5 代理 / 矩阵风控（3 个）
 
