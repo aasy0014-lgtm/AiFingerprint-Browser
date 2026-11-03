@@ -18,7 +18,8 @@
   "voices": [...] | null,        # preset 自带 speechVoices 时为 null（用预设的）
   "health": {"score": int, "warnings": [...]},
   "target_os": "windows" | "macos" | "linux" | "android" | "ios",
-  "manufacturer": ...              # 仅移动端有效（Samsung/Apple/Google 等）
+  "manufacturer": ...,             # 仅移动端有效（Samsung/Apple/Google/Xiaomi/Huawei 等）
+  "device_model": ...              # 仅移动端有效（固定的市场名）
 }
 """
 import random
@@ -40,16 +41,19 @@ _GPU_OS_HINTS = {
 
 
 def create_fingerprint(target_os: str, mode: str = "generate", manufacturer: Optional[str] = None,
-                       browser: Optional[str] = None) -> dict[str, Any]:
+                       browser: Optional[str] = None,
+                       device_model: Optional[str] = None) -> dict[str, Any]:
     """创建一套环境指纹（生成模式或真实预设模式）。
 
     manufacturer 仅移动端使用（机型库品牌筛选，留空则按权重随机）。
     browser 仅 iOS 移动端使用（"safari" 默认 / "chrome_ios"，见 mobile_fingerprints）。
+    device_model 仅移动端使用（固定具体机型，支持市场名或型号代码）。
     """
     # 移动端指纹使用专用引擎
     if target_os in ("android", "ios"):
         from .mobile_fingerprints import create_mobile_fingerprint
-        return create_mobile_fingerprint(target_os, mode, manufacturer, browser=browser)
+        return create_mobile_fingerprint(
+            target_os, mode, manufacturer, browser=browser, device_model=device_model)
     
     data: dict[str, Any] = {
         "mode": mode,

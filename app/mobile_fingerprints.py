@@ -2,7 +2,8 @@
 
 数据文件: app/data/mobile_devices.json
 - 机型档案: 屏幕(物理/CSS/视口)、DPR、GPU(真实 WebGL 上报字符串)、CPU/内存、
-  可运行系统版本及在网权重、机型标识（Android UA 可见）
+  可运行系统版本及在网权重、机型标识（经 UA-CH `Sec-CH-UA-Model` 下发；
+  Android UA 串自 Chrome 110 起已缩减，不再含机型/系统版本）
 - 版本库: Chrome 主版本 → 完整构建号（Android UA/UA-CH 使用）
 
 生成链路：按权重抽取机型 → 按机型可运行版本配对系统版本 → 配对浏览器版本，
@@ -21,6 +22,7 @@
 """
 import json
 import random
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -76,8 +78,34 @@ def _memory_class(ram_gb: int) -> int:
     return 1
 
 
-def _pick_device(target_os: str, manufacturer: Optional[str]) -> Dict[str, Any]:
-    """按平台 + 可选品牌过滤后按权重抽取机型；品牌无匹配时回退到平台全池。"""
+def _device_identifier_matches(device: Dict[str, Any], device_model: str) -> bool:
+    """匹配用户可见机型名或设备型号代码（大小写不敏感）。"""
+    wanted = str(device_model or "").strip().casefold()
+    if not wanted:
+        return False
+    return wanted in {
+        str(device.get("market_name") or "").strip().casefold(),
+        str(device.get("model") or "").strip().casefold(),
+    }
+
+
+def find_device(target_os: str, device_model: str,
+                manufacturer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """按平台、可选品牌和具体机型查找档案，供 API 校验与生成共用。"""
+    if target_os not in ("android", "ios") or not str(device_model or "").strip():
+        return None
+    for device in _DEVICES:
+        if device["platform"] != target_os or not _device_identifier_matches(device, device_model):
+            continue
+        if manufacturer and str(device["brand"]).casefold() != str(manufacturer).strip().casefold():
+            continue
+        return device
+    return None
+
+
+def _pick_device(target_os: str, manufacturer: Optional[str],
+                 device_model: Optional[str] = None) -> Dict[str, Any]:
+    """按平台/品牌/具体机型筛选；未指定具体机型时按权重抽取。"""
     pool = [d for d in _DEVICES if d["platform"] == target_os]
     if not pool:
         raise ValueError(f"机型库中没有平台 {target_os} 的设备")
@@ -85,7 +113,33 @@ def _pick_device(target_os: str, manufacturer: Optional[str]) -> Dict[str, Any]:
         matched = [d for d in pool if str(d["brand"]).lower() == manufacturer.lower()]
         if matched:
             pool = matched
+    if device_model:
+        matched = [d for d in pool if _device_identifier_matches(d, device_model)]
+        if not matched:
+            raise ValueError(f"机型库中不存在具体机型 {device_model}（{target_os}）")
+        return matched[0]
     return random.choices(pool, weights=[max(0.0001, float(d["weight"])) for d in pool], k=1)[0]
+
+
+# Android 的 CSS `color-gamut` 是显示面板能力，不是 GPU/渲染器能力。
+# 设备库目前没有把它作为必填 SSOT 字段（历史档案也因此没有该键），所以
+# 运行期先接受可选的 `display_gamut`/`displayGamut` 覆盖；对已经在库中的
+# Pixel 8 系列保留一条有来源的兜底事实：Actua OLED 的默认 Adaptive 模式
+# 为 DCI-P3。其余机型在没有显式面板证据时按 sRGB，避免把「旗舰 OLED」
+# 推断成 P3，导致色彩模式与真机不一致。将来补齐数据字段后，显式值会优先。
+_ANDROID_P3_DISPLAY_MODELS = frozenset({"Pixel 8", "Pixel 8 Pro"})
+
+
+def _android_display_gamut(device: Dict[str, Any]) -> str:
+    """返回 Android profile 的显示色域档位（``p3`` 或 ``srgb``）。"""
+    raw = device.get("display_gamut", device.get("displayGamut"))
+    value = str(raw or "").strip().lower().replace("-", "")
+    if value in {"p3", "displayp3", "dcip3"}:
+        return "p3"
+    if value in {"srgb", "rgb", "standard"}:
+        return "srgb"
+    name = str(device.get("market_name") or device.get("model") or "").strip()
+    return "p3" if name in _ANDROID_P3_DISPLAY_MODELS else "srgb"
 
 
 def _pick_os_version(device: Dict[str, Any], mode: str) -> str:
@@ -2367,13 +2421,16 @@ def generate_mobile_fingerprint(
     manufacturer: Optional[str] = None,
     mode: str = "generate",
     browser: Optional[str] = None,
+    device_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """生成一套移动端指纹（基于真实机型库）。
 
     Parameters:
         target_os: "android" or "ios"
-        manufacturer: 可选品牌（Samsung/Google/Xiaomi/OnePlus/Honor/Apple 等），
+        manufacturer: 可选品牌（Samsung/Google/Xiaomi/OnePlus/Honor/Huawei/Apple 等），
                       无匹配时回退为该平台全库，实际结果见返回的 manufacturer
+        device_model: 可选具体机型名（如 Pixel 8 Pro）或型号代码（如 SM-S928B），
+                      指定后不再按权重随机
         mode: "generate"（版本随机）/ "preset"（版本取机型当前主流组合）
         browser: 浏览器口径。Android 仅 "chrome"（默认）；iOS 可选
                  "safari"（默认）/"chrome_ios"（Chrome iOS，CriOS）。
@@ -2383,7 +2440,9 @@ def generate_mobile_fingerprint(
     mode = "preset" if mode == "preset" else "generate"
     browser_choice = _normalize_browser(target_os, browser)
 
-    device = _pick_device(target_os, manufacturer)
+    # 保留旧版测试/扩展对两参数 _pick_device 的替换能力。
+    device = (_pick_device(target_os, manufacturer, device_model)
+              if device_model else _pick_device(target_os, manufacturer))
     screen_meta = device["screen"]
     css_w, css_h = int(screen_meta["css_w"]), int(screen_meta["css_h"])
     viewport_h = int(screen_meta["viewport_h"])
@@ -2610,12 +2669,14 @@ def create_mobile_fingerprint(
     mode: str = "generate",
     manufacturer: Optional[str] = None,
     browser: Optional[str] = None,
+    device_model: Optional[str] = None,
 ) -> dict:
     """创建移动端环境指纹（与桌面端 create_fingerprint 接口一致）。
 
     - mode=preset:  真实机型预设（版本组合取机型当前主流值）
     - mode=generate: 基于真实机型库的合成（版本随机）
     - browser: Android 恒为 chrome；iOS 可选 safari（默认）/ chrome_ios
+    - device_model: 可选具体机型名或型号代码；指定后固定该机型
     """
     if target_os not in ("android", "ios"):
         raise ValueError(f"不支持的移动端目标 OS: {target_os}")
@@ -2638,7 +2699,8 @@ def create_mobile_fingerprint(
         "device_model": None,
     }
 
-    raw_fp = generate_mobile_fingerprint(target_os, manufacturer, mode, browser)
+    raw_fp = generate_mobile_fingerprint(
+        target_os, manufacturer, mode, browser, device_model=device_model)
     data["fingerprint"] = raw_fp
 
     # 厂商 / 机型以实际机型库配对结果为准（未指定 manufacturer 时为按权重抽取结果）

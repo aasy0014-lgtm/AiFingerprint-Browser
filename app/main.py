@@ -323,6 +323,18 @@ def _check_mobile_manufacturer(target_os: str, manufacturer: Optional[str]) -> N
         raise ApiError(400, f"机型库中不存在品牌 {manufacturer}（{target_os} 可选: {', '.join(brands)}）")
 
 
+def _check_mobile_device_model(target_os: str, device_model: Optional[str],
+                               manufacturer: Optional[str] = None) -> None:
+    """校验移动端具体机型，并确保与显式品牌一致。"""
+    if not device_model or target_os not in ("android", "ios"):
+        return
+    from .mobile_fingerprints import find_device
+    device = find_device(target_os, device_model, manufacturer)
+    if device is None:
+        suffix = f"（品牌 {manufacturer}）" if manufacturer else ""
+        raise ApiError(400, f"机型库中不存在具体机型 {device_model}{suffix}（{target_os}）")
+
+
 def _check_mobile_browser(target_os: str, browser: Optional[str]) -> None:
     """移动端浏览器口径校验：Android 仅 chrome；iOS 为 safari / chrome_ios。"""
     if not browser or target_os not in ("android", "ios"):
@@ -598,9 +610,11 @@ async def create_profile(request: Request, body: ProfileCreate) -> dict:
     _check_kernel_available(body.kernel)
     _check_mobile_target(body.kernel, body.target_os)
     _check_mobile_manufacturer(body.target_os, body.manufacturer)
+    _check_mobile_device_model(body.target_os, body.device_model, body.manufacturer)
     _check_mobile_browser(body.target_os, body.browser)
     fingerprint = create_fingerprint(body.target_os, body.fingerprint_mode,
-                                     body.manufacturer, browser=body.browser)
+                                     body.manufacturer, browser=body.browser,
+                                     device_model=body.device_model)
     p = db.create_profile(
         name=body.name,
         group_name=body.group_name,
@@ -622,6 +636,8 @@ async def create_profiles_batch(request: Request, body: ProfileBatchCreate) -> d
     _check_kernel_available(body.template.kernel)
     _check_mobile_target(body.template.kernel, body.template.target_os)
     _check_mobile_manufacturer(body.template.target_os, body.template.manufacturer)
+    _check_mobile_device_model(body.template.target_os, body.template.device_model,
+                               body.template.manufacturer)
     _check_mobile_browser(body.template.target_os, body.template.browser)
     created = []
     for i in range(body.count):
@@ -635,6 +651,7 @@ async def create_profiles_batch(request: Request, body: ProfileBatchCreate) -> d
         fingerprint = create_fingerprint(
             body.template.target_os, body.template.fingerprint_mode,
             body.template.manufacturer, browser=body.template.browser,
+            device_model=body.template.device_model,
         )
         p = db.create_profile(
             name=f"{body.template.name}-{i + 1}",
@@ -676,6 +693,16 @@ async def update_profile(request: Request, profile_id: str, body: ProfileUpdate)
     # 移动端配对校验按「改后的生效值」判断（可能只改 kernel 或只改 target_os）
     _check_mobile_target(body.kernel or p["kernel"], body.target_os or p["target_os"])
     _check_mobile_manufacturer(body.target_os or p["target_os"], body.manufacturer)
+    effective_os = body.target_os or p["target_os"]
+    stored_brand = p["fingerprint"].get("manufacturer")
+    model_brand = body.manufacturer if body.manufacturer is not None else (
+        stored_brand if effective_os == p["target_os"] else None
+    )
+    _check_mobile_device_model(
+        effective_os,
+        body.device_model,
+        model_brand,
+    )
     _check_mobile_browser(body.target_os or p["target_os"], body.browser)
 
     updates: dict[str, Any] = {}
@@ -701,11 +728,13 @@ async def update_profile(request: Request, profile_id: str, body: ProfileUpdate)
         regen = True  # 换 OS 必须重生成指纹，否则穿帮
     if body.fingerprint_mode and body.fingerprint_mode != p["fingerprint"].get("mode"):
         regen = True
-    effective_os = body.target_os or p["target_os"]
-    stored_brand = p["fingerprint"].get("manufacturer")
     if (body.manufacturer is not None and effective_os in ("android", "ios")
             and body.manufacturer != stored_brand):
         regen = True  # 移动端换品牌必须重生成指纹
+    stored_device_model = p["fingerprint"].get("device_model")
+    if (body.device_model is not None and effective_os in ("android", "ios")
+            and body.device_model != stored_device_model):
+        regen = True  # 移动端换具体机型必须重生成指纹
     stored_browser = ((p["fingerprint"].get("fingerprint") or {}).get("mobileExtra") or {}).get("browser")
     if (body.browser is not None and effective_os in ("android", "ios")
             and body.browser != stored_browser):
@@ -715,6 +744,8 @@ async def update_profile(request: Request, profile_id: str, body: ProfileUpdate)
 
         mode = body.fingerprint_mode or p["fingerprint"].get("mode", "generate")
         os_ = effective_os
+        brand_changed = body.manufacturer is not None
+        target_os_changed = body.target_os is not None and body.target_os != p["target_os"]
         if body.manufacturer is not None:
             brand = body.manufacturer
         elif os_ in ("android", "ios"):
@@ -730,8 +761,17 @@ async def update_profile(request: Request, profile_id: str, body: ProfileUpdate)
                 browser = stored_browser
             elif os_ == "android" and stored_browser == "chrome":
                 browser = stored_browser
+        if body.device_model is not None:
+            selected_device_model = body.device_model
+        elif not brand_changed and not target_os_changed and os_ in ("android", "ios"):
+            # 仅重生成/改浏览器口径时保留已固定的具体机型。
+            selected_device_model = stored_device_model
+        else:
+            selected_device_model = None
         updates["fingerprint_json"] = _json.dumps(
-            create_fingerprint(os_, mode, brand, browser=browser), ensure_ascii=False
+            create_fingerprint(
+                os_, mode, brand, browser=browser, device_model=selected_device_model
+            ), ensure_ascii=False
         )
 
     updated = db.update_profile(profile_id, updates)

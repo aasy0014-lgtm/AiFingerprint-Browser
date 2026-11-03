@@ -12,6 +12,8 @@ let editingTaskId = null;  // 任务编辑
 let currentRunId = null;   // 运行详情
 let currentRunTaskId = null; // 待运行的任务
 let logOffset = 0;
+let profileSearch = "";
+let profileStatusFilter = "all";
 
 /* ------------------------------------------------ 通用 */
 
@@ -271,7 +273,7 @@ async function ensureMobileLibrary() {
   return mobileLibrary;
 }
 
-/* 按当前目标 OS 填充品牌下拉（Apple/Samsung/Google/Xiaomi/OnePlus/Honor） */
+/* 按当前目标 OS 填充品牌下拉（Apple/Samsung/Google/Xiaomi/OnePlus/Honor/Huawei） */
 function fillMobileBrands() {
   const sel = $("#mobileBrandSelect");
   const os = $("#targetOsSelect").value;
@@ -291,16 +293,39 @@ function fillMobileBrands() {
   sel.value = prev;
 }
 
-async function syncMobileOptionState(restoreBrand, restoreBrowser) {
+/* 按当前平台与品牌填充具体机型；空值保留按权重随机。 */
+function fillMobileModels(restoreModel) {
+  const sel = $("#mobileModelSelect");
+  const os = $("#targetOsSelect").value;
+  const brand = $("#mobileBrandSelect").value;
+  const prev = typeof restoreModel === "string" ? restoreModel : sel.value;
+  sel.innerHTML = '<option value="">随机（按品牌/平台权重抽取）</option>';
+  if (!mobileLibrary || !["android", "ios"].includes(os)) return;
+  (mobileLibrary.devices || [])
+    .filter((d) => d.platform === os && (!brand || d.brand === brand))
+    .sort((a, b) => String(a.market_name).localeCompare(String(b.market_name), "zh-CN"))
+    .forEach((d) => {
+      const opt = document.createElement("option");
+      // market_name 是摘要与指纹中保存的稳定人类可读机型名；型号代码放在提示中。
+      opt.value = d.market_name;
+      opt.textContent = `${d.market_name}（${d.model}）`;
+      sel.appendChild(opt);
+    });
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+async function syncMobileOptionState(restoreBrand, restoreBrowser, restoreModel) {
   const f = $("#profileForm");
   const mobile = isMobileTargetOs();
   const ios = $("#targetOsSelect").value === "ios";
   $("#mobileHint").style.display = mobile ? "" : "none";
   $("#mobileBrandWrap").style.display = mobile ? "" : "none";
+  $("#mobileModelWrap").style.display = mobile ? "" : "none";
   // 浏览器口径仅 iOS 可选（Android 恒为 Chrome）
   $("#mobileBrowserWrap").style.display = ios ? "" : "none";
   if (!mobile) {
     $("#mobileBrandSelect").value = "";
+    $("#mobileModelSelect").value = "";
     $("#mobileBrowserSelect").value = "safari";
     return;
   }
@@ -320,6 +345,7 @@ async function syncMobileOptionState(restoreBrand, restoreBrowser) {
   if (typeof restoreBrand === "string") {
     $("#mobileBrandSelect").value = restoreBrand;
   }
+  fillMobileModels(restoreModel);
 }
 
 function openProfileModal(profile, batchMode = false) {
@@ -362,6 +388,7 @@ function openProfileModal(profile, batchMode = false) {
   syncMobileOptionState(
     profile && !batchMode ? (profile.fingerprint_summary?.manufacturer || "") : "",
     profile && !batchMode ? (profile.fingerprint_summary?.browser_kind || "safari") : "safari",
+    profile && !batchMode ? (profile.fingerprint_summary?.device_model || "") : "",
   );
   $("#profileModal").classList.remove("hidden");
 }
@@ -403,6 +430,8 @@ function collectProfileForm() {
       fingerprint_mode: fd.get("fingerprint_mode"),
       // 移动端机型品牌（仅 android/ios；空值 = 按在网权重随机）
       manufacturer: isMobileTargetOs() ? (fd.get("manufacturer") || null) : null,
+      // 移动端具体机型（仅 android/ios；空值 = 按品牌/平台权重随机）
+      device_model: isMobileTargetOs() ? (fd.get("device_model") || null) : null,
       // 浏览器口径（仅 iOS；Android 恒为 chrome，由后端归一化）
       browser: $("#targetOsSelect").value === "ios" ? (fd.get("browser") || null) : null,
       proxy, launch,
@@ -416,6 +445,7 @@ $("#btnBatchNew").addEventListener("click", () => openProfileModal(null, true));
 
 // 移动端目标 OS 的内核/指纹模式联动（选中即自动切换，改回也恢复自由选择）
 $("#targetOsSelect").addEventListener("change", syncMobileOptionState);
+$("#mobileBrandSelect").addEventListener("change", () => fillMobileModels());
 $("#kernelSelect").addEventListener("change", () => {
   if (isMobileTargetOs() && $("#profileForm").kernel.value !== "fp-chromium") {
     $("#kernelSelect").value = "fp-chromium";

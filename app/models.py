@@ -83,6 +83,8 @@ class ProfileCreate(BaseModel):
     fingerprint_mode: FingerprintMode = "generate"
     # 移动端机型库品牌筛选（android/ios 专用；留空=按在网权重随机）
     manufacturer: Optional[str] = Field(default=None, max_length=32)
+    # 移动端具体机型（android/ios 专用；留空=按品牌/平台权重随机）
+    device_model: Optional[str] = Field(default=None, max_length=96)
     # 移动端浏览器口径（iOS 专用；留空=safari。Android 恒为 chrome）
     browser: Optional[MobileBrowser] = None
     proxy: Optional[ProxyConfig] = None
@@ -119,6 +121,8 @@ class ProfileUpdate(BaseModel):
     fingerprint_mode: Optional[FingerprintMode] = None
     # 移动端机型库品牌筛选（改品牌会重新生成指纹）
     manufacturer: Optional[str] = Field(default=None, max_length=32)
+    # 移动端具体机型（改机型会重新生成指纹）
+    device_model: Optional[str] = Field(default=None, max_length=96)
     # 移动端浏览器口径（改口径会重新生成指纹；Android 仅 chrome）
     browser: Optional[MobileBrowser] = None
     proxy: Optional[ProxyConfig] = None

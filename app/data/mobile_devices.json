@@ -1,6 +1,6 @@
 {
   "version": "2026.10",
-  "updated": "2026-10-19",
+  "updated": "2026-10-30",
   "notes": "移动端真实机型指纹库。屏幕/DPR/CSS 视口取自 Chrome DevTools 设备库实测值（Playwright deviceDescriptors）与厂商公开规格；GPU 字符串为对应 SoC 在 Chrome(ANGLE) / Safari 下的真实 WebGL 上报格式；系统版本分布为 2026-10 各机型的在网份额近似值。新增机型时按同结构追加即可。android_browsers 仅是没有安装 fp-chromium 内核时的回退版本池；已安装内核时 Android Chrome 版本自动跟随内核真实引擎版本（UA 与引擎 feature 必须一致）。",
   "android_browsers": [
     {"major": "156", "full": "156.0.8078.35", "weight": 40},
@@ -9,7 +9,6 @@
     {"major": "154", "full": "154.0.7861.102", "weight": 16},
     {"major": "153", "full": "153.0.7763.98", "weight": 14}
   ],
-  "grease_brand": {"brand": "Not/A)Brand", "version": "99"},
   "devices": [
     {
       "brand": "Samsung", "platform": "android", "type": "phone",
@@ -80,7 +79,7 @@
       "weight": 4,
       "screen": {"w": 1080, "h": 2400, "dpr": 2.625, "css_w": 412, "css_h": 915, "viewport_h": 839},
       "gpu": {"vendor": "ARM", "renderer": "ANGLE (ARM, Mali-G715-Immortalis MC10, OpenGL ES 3.2)"},
-      "cpu_cores": 8, "ram_gb": 8, "max_touch_points": 5,
+      "cpu_cores": 9, "ram_gb": 8, "max_touch_points": 5,
       "os_versions": {"16": 40, "17": 35, "15": 20, "14": 5}
     },
     {
@@ -89,7 +88,7 @@
       "weight": 2,
       "screen": {"w": 1344, "h": 2992, "dpr": 3.0, "css_w": 448, "css_h": 997, "viewport_h": 921},
       "gpu": {"vendor": "ARM", "renderer": "ANGLE (ARM, Mali-G715-Immortalis MC10, OpenGL ES 3.2)"},
-      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "cpu_cores": 9, "ram_gb": 12, "max_touch_points": 5,
       "os_versions": {"16": 40, "17": 35, "15": 20, "14": 5}
     },
     {
@@ -192,6 +191,42 @@
       "os_versions": {"16": 45, "17": 35, "15": 20}
     },
     {
+      "brand": "Xiaomi", "platform": "android", "type": "phone",
+      "model": "2406APNFAG", "market_name": "Xiaomi 14T", "released": "2024-09",
+      "weight": 6,
+      "screen": {"w": 1220, "h": 2712, "dpr": 2.75, "css_w": 444, "css_h": 986, "viewport_h": 910},
+      "gpu": {"vendor": "ARM", "renderer": "ANGLE (ARM, Mali-G615 MC6, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"15": 40, "16": 35, "14": 20, "17": 5}
+    },
+    {
+      "brand": "Xiaomi", "platform": "android", "type": "phone",
+      "model": "24030PN60G", "market_name": "Xiaomi 14 Ultra", "released": "2024-02",
+      "weight": 3,
+      "screen": {"w": 1440, "h": 3200, "dpr": 3.5, "css_w": 411, "css_h": 914, "viewport_h": 838},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 16, "max_touch_points": 5,
+      "os_versions": {"15": 40, "16": 35, "14": 20, "17": 5}
+    },
+    {
+      "brand": "Xiaomi", "platform": "android", "type": "phone",
+      "model": "25010PN30G", "market_name": "Xiaomi 15 Ultra", "released": "2025-03",
+      "weight": 3,
+      "screen": {"w": 1440, "h": 3200, "dpr": 3.5, "css_w": 411, "css_h": 914, "viewport_h": 838},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 830, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 16, "max_touch_points": 5,
+      "os_versions": {"16": 45, "17": 35, "15": 20}
+    },
+    {
+      "brand": "Xiaomi", "platform": "android", "type": "phone",
+      "model": "24117RK2CC", "market_name": "Redmi K80 Pro", "released": "2024-11",
+      "weight": 4,
+      "screen": {"w": 1440, "h": 3200, "dpr": 3.5, "css_w": 411, "css_h": 914, "viewport_h": 838},
+      "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 830, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"16": 45, "17": 35, "15": 20}
+    },
+    {
       "brand": "OnePlus", "platform": "android", "type": "phone",
       "model": "CPH2581", "market_name": "OnePlus 12", "released": "2023-12",
       "weight": 3,
@@ -253,6 +288,42 @@
       "gpu": {"vendor": "Qualcomm", "renderer": "ANGLE (Qualcomm, Adreno (TM) 840, OpenGL ES 3.2)"},
       "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
       "os_versions": {"16": 55, "17": 45}
+    },
+    {
+      "brand": "Huawei", "platform": "android", "type": "phone",
+      "model": "ADY-AL00", "market_name": "Huawei Pura 70", "released": "2024-04",
+      "weight": 4,
+      "screen": {"w": 1256, "h": 2760, "dpr": 3.0, "css_w": 419, "css_h": 920, "viewport_h": 844},
+      "gpu": {"vendor": "HUAWEI", "renderer": "ANGLE (HUAWEI, Maleoon 910, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"14": 45, "15": 35, "16": 20}
+    },
+    {
+      "brand": "Huawei", "platform": "android", "type": "phone",
+      "model": "HBN-AL00", "market_name": "Huawei Pura 70 Pro", "released": "2024-04",
+      "weight": 3,
+      "screen": {"w": 1260, "h": 2844, "dpr": 3.0, "css_w": 420, "css_h": 948, "viewport_h": 872},
+      "gpu": {"vendor": "HUAWEI", "renderer": "ANGLE (HUAWEI, Maleoon 910, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"14": 45, "15": 35, "16": 20}
+    },
+    {
+      "brand": "Huawei", "platform": "android", "type": "phone",
+      "model": "PLR-AL00", "market_name": "Huawei Mate 70 Pro", "released": "2024-11",
+      "weight": 3,
+      "screen": {"w": 1316, "h": 2832, "dpr": 3.5, "css_w": 376, "css_h": 809, "viewport_h": 733},
+      "gpu": {"vendor": "HUAWEI", "renderer": "ANGLE (HUAWEI, Maleoon 910, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 12, "max_touch_points": 5,
+      "os_versions": {"14": 40, "15": 40, "16": 20}
+    },
+    {
+      "brand": "Huawei", "platform": "android", "type": "phone",
+      "model": "PLA-AL10", "market_name": "Huawei Mate 70 Pro+", "released": "2024-11",
+      "weight": 2,
+      "screen": {"w": 1316, "h": 2832, "dpr": 3.5, "css_w": 376, "css_h": 809, "viewport_h": 733},
+      "gpu": {"vendor": "HUAWEI", "renderer": "ANGLE (HUAWEI, Maleoon 910, OpenGL ES 3.2)"},
+      "cpu_cores": 8, "ram_gb": 16, "max_touch_points": 5,
+      "os_versions": {"14": 40, "15": 40, "16": 20}
     },
     {
       "brand": "Apple", "platform": "ios", "type": "phone",
