@@ -1,0 +1,25 @@
+[
+  {
+    "action": "goto",
+    "url": "http://127.0.0.1:3000/signup"
+  },
+  {
+    "action": "fill",
+    "selector": "input[name=firstName]",
+    "value": "ROLE_A"
+  },
+  {
+    "action": "fill",
+    "selector": "input[name=lastName]",
+    "value": "ROLE_B"
+  },
+  {
+    "action": "click",
+    "selector": "button[type=submit]",
+    "submit": true
+  },
+  {
+    "action": "wait",
+    "ms": 2000
+  }
+]
