@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -27,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.config import DETECT_LINKS
 
 
-BASE = "http://127.0.0.1:18080/api/v1"
+DEFAULT_MANAGEMENT_URL = "http://127.0.0.1:18080"
 
 # These signals are useful for regression reports, but they are not failures
 # for a mobile Chrome profile.  CreepJS uses a desktop-Blink rule set and marks
@@ -164,6 +165,9 @@ SAMPLE_JS = r"""(() => {
     const lang = String(nav.language || '').toLowerCase();
     const detectedLocale = detectionLanguage?.[2]?.trim().toLowerCase() || null;
     const browserTimezone = resolved.timeZone || null;
+    // Tri-state on purpose: ``null`` means the page had not rendered its own
+    // value yet, so "consistent" cannot be judged.  Reporting ``false`` there
+    // reads as a real mismatch and contradicts the values sampled above.
     siteSignals.browserScan = {
       bot: browserScanBot[1] || null, score: Number(browserScanBot[2]),
       timezoneWarning: /Different time zones[^%]*-10%|Your IP timezone does not match[^.]*\./i.exec(bodyText)?.[0] || null,
@@ -172,9 +176,12 @@ SAMPLE_JS = r"""(() => {
       browserTimezone,
       detectionLanguage: detectionLanguage?.[1]?.trim() || null,
       detectionLocale: detectedLocale,
-      languageConsistent: !!(detectedLocale && lang
-        && (lang === detectedLocale || lang.startsWith(detectedLocale + '-'))),
-      timezoneConsistent: !!(ipTimezone && browserTimezone && ipTimezone === browserTimezone),
+      languageConsistent: (detectedLocale && lang)
+        ? (lang === detectedLocale || lang.startsWith(detectedLocale + '-'))
+        : null,
+      timezoneConsistent: (ipTimezone && browserTimezone)
+        ? ipTimezone === browserTimezone
+        : null,
     };
     // Keep the structured warning under ``siteSignals.browserScan``.  Copying
     // it into the generic diagnostics bucket makes the summary report it
@@ -386,6 +393,12 @@ def main() -> int:
                         help="只检测指定名称，逗号分隔；名称来自 app/config.py 的 DETECT_LINKS")
     parser.add_argument("--output", type=Path,
                         help="将逐站结果与汇总写入 JSON 文件")
+    parser.add_argument(
+        "--management-url",
+        default=os.environ.get("FPWB_MANAGEMENT_URL"),
+        help=("管理端地址；默认 http://127.0.0.1:18080。受限 macOS 终端"
+              "直接拉起内核会在 CDP 就绪前退出，建议指向已运行的管理端"),
+    )
     args = parser.parse_args()
 
     selected_links = DETECT_LINKS
@@ -398,7 +411,10 @@ def main() -> int:
             parser.error("未知检测站名称: " + ", ".join(sorted(missing)))
 
     created_id = None
-    with httpx.Client(base_url=BASE, timeout=90) as client:
+    base = (args.management_url or DEFAULT_MANAGEMENT_URL).rstrip("/")
+    if not base.endswith("/api/v1"):
+        base += "/api/v1"
+    with httpx.Client(base_url=base, timeout=90) as client:
         if args.profile_id:
             profile_id = args.profile_id
         else:
