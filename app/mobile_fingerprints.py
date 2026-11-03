@@ -2477,6 +2477,17 @@ _IOS_ADD_SPEC: Dict[str, Any] = {
                     "members": ["identifier", "listStyle", "separator"]},
         "SVGPathSeg": {"construct": "illegal", "length": 0,
                        "members": ["pathSegType", "pathSegTypeAsLetter"]},
+        # F-25：WebKit 的 SVGPathSegList 是 legacy 列表接口（getItem 0 基、
+        # numberOfItems 与 length 同值）。Blink 从 Chromium 76 起整族移除
+        # （`'SVGPathSegList' in window === false`，一行判假）。真机形态实测
+        # Playwright WebKit 26.5：原型 9 个成员、构造 Illegal constructor、
+        # 空列表 length/numberOfItems 均为 0（/tmp 探针逐描述符）。
+        "SVGPathSegList": {"construct": "illegal", "length": 0,
+                           "init": {"length": 0, "numberOfItems": 0},
+                           "members": ["length", "numberOfItems", "!clear",
+                                       "!initialize", "!getItem",
+                                       "!insertItemBefore", "!replaceItem",
+                                       "!removeItem", "!appendItem"]},
         "MathMLMathElement": {"construct": "illegal", "length": 0,
                               "extends": "MathMLElement", "members": []},
         # 真机 type 取第 4 个参数（实测 new DataCue(5, 9, 'V', 'text/plain')
