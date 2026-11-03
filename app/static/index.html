@@ -91,16 +91,58 @@
         <div class="sub">每个环境 = 一台独立的"真实设备"：固定指纹、独立存储、独立代理</div>
       </div>
 
-      <div class="toolbar">
-        <button class="btn primary" id="btnNew">＋ 新建环境</button>
-        <button class="btn" id="btnBatchNew">⧉ 批量新建</button>
-        <button class="btn" id="btnImport">⬇ 导入环境</button>
-        <button class="btn" id="btnRefresh">刷新</button>
-        <button class="btn" id="btnProxyTest">🌐 代理测试</button>
-        <button class="btn" id="btnDetect">🔍 环境自检链接</button>
-        <a class="btn ghost" href="/docs" target="_blank">API 文档</a>
+      <div class="env-overview" id="envOverview" aria-label="环境概览">
+        <article class="metric-card metric-primary">
+          <div class="metric-icon">⌘</div>
+          <div><span class="metric-label">全部环境</span><strong id="overviewTotal">0</strong><small>已创建的环境总数</small></div>
+        </article>
+        <article class="metric-card metric-success">
+          <div class="metric-icon">●</div>
+          <div><span class="metric-label">运行中</span><strong id="overviewRunning">0</strong><small>当前活跃浏览器实例</small></div>
+        </article>
+        <article class="metric-card metric-violet">
+          <div class="metric-icon">▣</div>
+          <div><span class="metric-label">移动端</span><strong id="overviewMobile">0</strong><small>Android / iOS 仿真环境</small></div>
+        </article>
+        <article class="metric-card metric-warn">
+          <div class="metric-icon">✓</div>
+          <div><span class="metric-label">健康环境</span><strong id="overviewHealthy">0</strong><small>指纹一致性评分 ≥ 90</small></div>
+        </article>
+      </div>
+
+      <div class="toolbar env-toolbar">
+        <div class="toolbar-group">
+          <button class="btn primary" id="btnNew">＋ 新建环境</button>
+          <button class="btn" id="btnBatchNew">⧉ 批量新建</button>
+          <button class="btn" id="btnImport">⬇ 导入环境</button>
+        </div>
+        <div class="toolbar-group toolbar-secondary">
+          <button class="btn" id="btnRefresh">刷新</button>
+          <button class="btn" id="btnProxyTest">🌐 代理测试</button>
+          <button class="btn" id="btnProxyRefresh" title="会更换出口，注册期间不要重复刷新">🔄 刷新代理</button>
+          <button class="btn" id="btnDetect">🔍 自检链接</button>
+          <a class="btn ghost" href="/docs" target="_blank">API 文档</a>
+        </div>
         <span class="spacer"></span>
-        <span class="muted" id="runningCount">0 个环境运行中</span>
+        <span class="toolbar-count" id="runningCount">0 个环境运行中</span>
+      </div>
+
+      <div class="list-tools">
+        <label class="search-field" aria-label="搜索环境">
+          <span>⌕</span>
+          <input id="profileSearch" type="search" placeholder="搜索名称、分组、代理或机型…" autocomplete="off">
+        </label>
+        <label class="filter-field">
+          <span>显示</span>
+          <select id="profileStatusFilter" aria-label="环境筛选">
+            <option value="all">全部环境</option>
+            <option value="running">仅运行中</option>
+            <option value="stopped">仅已停止</option>
+            <option value="mobile">仅移动端</option>
+            <option value="desktop">仅桌面端</option>
+          </select>
+        </label>
+        <span class="muted" id="profileResultCount">共 0 个环境</span>
       </div>
 
       <div class="batch-bar" id="batchBar">
@@ -118,6 +160,7 @@
         每个环境指纹创建后固定，重启不变；「体检」可实测风控一致性。
       </div>
 
+      <div class="table-shell">
       <table class="list">
         <thead><tr>
           <th style="width:30px"><input type="checkbox" id="checkAll"></th>
@@ -128,6 +171,7 @@
           <tr><td colspan="10" class="empty">加载中…</td></tr>
         </tbody>
       </table>
+      </div>
     </section>
 
     <!-- RPA 任务 -->
@@ -144,20 +188,24 @@
       </div>
 
       <div class="section-title">任务列表</div>
+      <div class="table-shell">
       <table class="list">
         <thead><tr>
           <th>任务名</th><th>步骤数</th><th>备注</th><th>更新时间</th><th style="width:230px">操作</th>
         </tr></thead>
         <tbody id="taskRows"><tr><td colspan="5" class="empty">暂无任务</td></tr></tbody>
       </table>
+      </div>
 
       <div class="section-title">运行记录</div>
+      <div class="table-shell">
       <table class="list">
         <thead><tr>
           <th>Run ID</th><th>任务</th><th>环境</th><th>状态</th><th>开始时间</th><th style="width:170px">操作</th>
         </tr></thead>
         <tbody id="runRows"><tr><td colspan="6" class="empty">暂无运行记录</td></tr></tbody>
       </table>
+      </div>
     </section>
 
     <!-- 调度计划 -->
@@ -172,12 +220,14 @@
         <button class="btn" id="btnRefreshSchedules">刷新</button>
       </div>
 
+      <div class="table-shell">
       <table class="list">
         <thead><tr>
           <th>名称</th><th>任务</th><th>类型</th><th>环境数</th><th>上次运行</th><th>下次运行</th><th>状态</th><th style="width:280px">操作</th>
         </tr></thead>
         <tbody id="scheduleRows"><tr><td colspan="8" class="empty">暂无调度计划</td></tr></tbody>
       </table>
+      </div>
     </section>
 
     <!-- 矩阵风控 -->
@@ -219,12 +269,14 @@
         <button class="btn" id="btnRefreshLogs">刷新</button>
       </div>
 
+      <div class="table-shell">
       <table class="list">
         <thead><tr>
           <th>时间 (UTC)</th><th>动作</th><th>对象</th><th>详情</th><th>结果</th>
         </tr></thead>
         <tbody id="logRows"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
       </table>
+      </div>
       <div class="toolbar" style="margin-top:14px">
         <button class="btn" id="btnMoreLogs">加载更多</button>
       </div>
@@ -260,7 +312,7 @@
         </div>
       </div>
 
-      <div class="settings-section">
+      <div class="settings-section settings-compact">
         <h3>API Key 认证</h3>
         <p class="muted" style="margin-bottom:12px">
           开启后，所有 /api/* 请求必须携带 <code>X-API-Key</code> 请求头（按成员密钥识别身份）。

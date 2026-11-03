@@ -188,7 +188,7 @@ python -m venv .venv
 | 方法                  | 路径                                                                | 说明                                                                                  |
 | ------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | GET                 | `/api/v1/status`                                                  | 服务与内核状态                                                                             |
-| GET/POST            | `/api/v1/profiles`                                                | 环境列表 / 创建（fingerprint\_mode: generate/preset；kernel: camoufox/fp-chromium/chromium） |
+| GET/POST            | `/api/v1/profiles`                                                | 环境列表 / 创建（fingerprint\_mode: generate/preset；kernel: camoufox/fp-chromium/chromium；移动端可指定 manufacturer/device_model） |
 | POST                | `/api/v1/profiles/batch` `batch-delete`                           | 批量创建（模板+代理池）/ 批量删除                                                                  |
 | GET                 | `/api/v1/profiles/{id}/export` / POST `/profiles/import`          | 导出（?include\_data=true 含数据目录）/ 导入                                                   |
 | GET/POST            | `/api/v1/system/backup` `/system/restore`                         | 整机备份 / 恢复                                                                           |
@@ -249,7 +249,7 @@ app/
 ├── transfer.py           # 导入导出 + 整机备份恢复
 ├── proxy_test.py         # 代理连通性测试
 ├── proxy_forwarder.py    # 代理认证转发器（本地无认证端口→上游认证代理）
-├── readiness.py          # 环境就绪度体检（17 项检测）
+├── readiness.py          # 环境就绪度体检（网络/指纹/存储/移动仿真多项检测）
 ├── kernels/
 │   ├── camoufox_kernel.py   # Camoufox 内核（Firefox 定制）
 │   ├── fp_chromium_kernel.py# fingerprint-chromium 内核（Chromium 定制+CDP）
@@ -296,6 +296,11 @@ Canvas 哈希完全一致。
 .venv\Scripts\python scripts\phase3_test.py             # Phase 3 全量（矩阵风控/使用统计/成员权限/Webhook/调度/双实例同步）
 .venv\Scripts\python scripts\phase4_test.py             # Phase 4 回归（转发器/调度时区/MCP协议/自动同步/内核健康）
 .venv\Scripts\python scripts\riskctrl_test.py           # 风控优化（预设/就绪度体检/人机化节奏/预热模板）
+.venv\Scripts\python scripts\detect_sites_probe.py       # 逐站采样公开指纹检测页（临时 Android 环境）
+.venv\Scripts\python scripts\detect_sites_probe.py --only "BrowserScan 综合,JustBrowser,ProxyLabs" --wait 10
+.venv\Scripts\python scripts\login_chain_verify.py     # 本地登录链路回归（Android/iOS 弹窗+存储+重启连续性）
+.venv\Scripts\python scripts\rpa_fpchromium_test.py --management-url http://127.0.0.1:18080
+.venv\Scripts\python scripts\mobile_e2e_test.py --management-url http://127.0.0.1:18080
 .venv\Scripts\python scripts\playwright_bridge_test.py  # Playwright 对接（双内核真实连接+指纹一致性）
 .venv\Scripts\python scripts\fpchromium_verify.py       # fp-chromium 内核验证
 .venv\Scripts\python scripts\mcp_protocol_test.py       # MCP 协议独立测试（10 项检查）
@@ -313,13 +318,115 @@ Canvas 哈希完全一致。
 | `standard`   | 默认参数                                       | 大多数站点           |
 | `cloudflare` | 禁用 COOP（Turnstile 勾选框可交互）+ 类人鼠标轨迹增强（上限 2s） | Cloudflare 防护站点 |
 | `china`      | locale=zh-CN + 时区=Asia/Shanghai + geoip 对齐 | 极验 / 网易易盾等国内风控  |
+| `login`      | geoip 对齐 + 稳定类人节奏 + 禁用会阻断登录资源的广告拦截 | 登录连续性体检与登录链路 |
 
 ### 2. 环境就绪度体检（环境列表 →「体检」按钮）
 
-在真实浏览器内实测 8 项一致性并给出整改建议（每项标注关联的风控体系）：
-网络出口可达性、时区 vs IP 属地、语言 vs IP 国家、**WebRTC 公网 IP 泄露**、
-navigator.webdriver 自动化标记、Canvas 读取稳定性、WebGL 渲染器合理性、字体渲染。
-输出 0\~100 评分与结论（就绪/建议优化/存在穿帮风险）。
+在真实浏览器内实测网络、指纹、移动仿真与登录存储能力并给出整改建议（每项标注关联的风控体系）：
+出口质量、时区/语言属地一致性、**WebRTC 公网 IP 泄露**、navigator.webdriver、
+UA/UA-CH/platform 交叉一致性、浏览器与独立代理连接的出口一致性、Canvas/Audio 稳定性、WebGL/屏幕/硬件、触控媒体面、
+Cookie/localStorage/IndexedDB、环境数据目录连续性、移动 CDP 仿真通道与启动模式。
+输出总评分与 `login_readiness` 登录子评分（可进入登录/登录前建议优化/暂不建议登录）。
+
+公开检测站逐站采样：
+
+```bash
+.venv/bin/python scripts/detect_sites_probe.py --wait 2
+# 复用已有环境：
+.venv/bin/python scripts/detect_sites_probe.py --profile-id PROFILE_ID --wait 3
+```
+
+采样页包含 CreepJS、BrowserLeaks（Canvas/WebGL/字体/Client Hints/WebRTC）、Pixelscan、
+IPHey、AmIUnique、Device Info、EFF Cover Your Tracks、JA3/JA4、FingerprintJS、
+Fingerprint Pro、CHA.LA、ILSERBY、ProxyLabs、JustBrowser、Sannysoft、BrowserScan
+（综合页/机器人检测）、CleanIP、PrivacyTests、Fingerprint Bot Demo，以及
+ReadMyBrowser、XDLogin、BrowserFingerprint.org、Panopticlick、BrowserScan.one、
+VoriTools、SpeedIQ、BellCrier、Dual Login、Pixelscan.dev、BrowserLeaks.io（共 37 个入口）；
+输出 UA/UA-CH、时区/日期、屏幕/DPR/触控、内存/CPU、WebGL/Canvas、页面告警以及表格中的
+`failed`/`warn` 行，并额外提取 BrowserScan/JustBrowser/ProxyLabs/CreepJS 的结果摘要。
+`--only` 可只跑指定入口，`--output report.json` 可保存机器可读报告。每次默认创建并清理
+临时 Android 环境，不输入账号、不提交表单。
+
+登录链路回归使用本地合成 OAuth 页面，不读取真实账号，并通过移动端 CDP 触摸点击（不是脚本注入的伪手势）验证弹窗：
+
+```bash
+.venv/bin/python scripts/login_chain_verify.py --target-os android
+.venv/bin/python scripts/login_chain_verify.py --target-os ios
+# macOS 受限终端无法直接拉起 GUI 时，经已运行的管理端验证：
+.venv/bin/python scripts/login_chain_verify.py --management-url http://127.0.0.1:18080 --target-os android
+# 账号登录入口公开面回归（不提交凭据，临时 Xiaomi Android 环境）
+.venv/bin/python scripts/google_login_probe.py --management-url http://127.0.0.1:18080
+# 复测一次性同设备/设备电话检查启动地址（启动器会限定账号主机并归一化）
+.venv/bin/python scripts/google_login_probe.py --management-url http://127.0.0.1:18080 \
+  --start-url 'https://accounts.google.com/lifecycle/steps/signup/crossflowverification/samedevice?TOKEN=VALUE'
+```
+
+注册链路追踪（默认 dry-run，不执行 `submit=true` 步骤）使用
+`scripts/registration_trace.py`：它经 CDP 记录脱敏的请求/响应元数据、挑战路由、
+HTTP 状态、出口 IP 观测和页面运行时状态，生成 JSON + Markdown 风控报告；Cookie、
+Authorization、查询值、表单值和响应正文不写入报告。
+
+```bash
+.venv/bin/python scripts/registration_trace.py \
+  --management-url http://127.0.0.1:18080 \
+  --profile-id PROFILE_ID \
+  --flow-file scripts/registration_flow.example.json \
+  --output /tmp/registration-trace.json
+```
+
+如需离线验证追踪器，可先启动内置本地测试表单（不会创建真实账号，也不会访问公网）：
+
+```bash
+.venv/bin/python scripts/registration_fixture_server.py --port 3000
+```
+
+步骤模板见 `scripts/registration_flow.example.json`；追踪器只允许 `localhost`/回环地址，
+不会导航到第三方注册站点；需要执行最终提交步骤时显式加 `--allow-submit`，并只对自有
+测试表单使用。仅当本地测试页提供 IP JSON 时才记录出口短哈希，不保存原始 IP；控制台
+错误和页面异常也只保存长度、哈希等元数据。
+
+需要观测**真实站点**（如 Google 注册流程）时用 `scripts/network_capture_log.py`：它不
+驱动页面，只旁路挂监听器记录脱敏网络元数据，用户自己在窗口里操作；日志逐条追加写入
+`data/logs/network-capture/<时间戳>-<profile前缀>.jsonl`（已被 `.gitignore` 的 `/data/`
+覆盖），并生成同名 `.analysis.json` / `.analysis.md`。
+
+```bash
+# 旁路观测已在界面打开的环境（期间用户自己操作）
+.venv/bin/python scripts/network_capture_log.py --profile-id PROFILE_ID --duration 90
+# 启动临时环境并打开注册入口，抓包结束后自动停止并删除环境
+.venv/bin/python scripts/network_capture_log.py --new-profile \
+  --start-url https://accounts.google.com/signup --duration 45
+# 只分析已有日志
+.venv/bin/python scripts/network_capture_log.py --analyze-only data/logs/network-capture/X.jsonl
+```
+
+报告会区分**挑战三档**——可见挑战框（`api2/payload`、`/challenge/` 页）、挑战意图
+（正文关键词、挑战页导航）、仅加载验证库——避免把 `recaptcha/anchor` 这类隐形组件
+当成已触发挑战。还会给出流程步骤与停留时间、设备指纹信标（`browserinfo`）、请求失败
+原因、被拒/限流主机和第三方依赖。设备信标的 `f.req` 只展开**字段结构**（`<value>` /
+`<empty>`），逐层解开内层 JSON，不落任何字段值。
+
+`batchexecute` 响应单独解析：`)]}'` 前缀后面的每段信封按类型拆开，`wrb.fr` 记 RPC 名
+与 payload 是否为空，`er` 记错误码，`di`/`e`/`af.httprm`/`f.mt` 记流级标记。**实测挑战
+触发时 `er` 信封并不会出现**——挑战决定写在 payload 里（深层嵌套的下一步指针字符串）。
+报告因此提供「挑战前一跳」表：挑战页导航前 200ms 内返回的那个 RPC 才是风控点。请求体
+也会展开成结构（值一律记作 `<str:长度>` / `<number>` / `<null>`），方便看该 RPC 提交了
+哪些设备字段。对应关系见 `docs/移动端真实指纹库.md` 的 FAQ。
+
+回归会验证用户手势弹窗、安全上下文、Cookie、localStorage、sessionStorage、IndexedDB，
+并确认同一环境重启后持久登录状态保留、sessionStorage 按会话重置；显式/geoip
+locale 会同时收敛 `Intl`、`navigator.language(s)`、Worker 与 Android TTS
+（例如 `en-US` → `["en-US", "en"]`）。
+
+fp-chromium 在桌面系统上没有 Android 的 Google Play Services；注册设备检查的
+`intent://accounts.google.com/...` 按钮会由移动端 CDP 会话转到同一验证流程的 HTTPS
+入口，继续完成 Google 的短信/设备验证。启动器还会清理保存下来的
+`crossflowverification/samedevice`、`devicephoneverification/initiate` 和
+`devicephoneverification/consent`、`info/sessionexpired` 一次性地址，避免重启环境反复回到过期检查页；
+服务端实际发起的验证仍按账号风控流程处理。
+
+管理端 `navigate` 接口以及 RPA 的 `navigate` / `tab_open` 步骤也使用同一规则，粘贴旧的一次性
+设备检查链接时不会再次保存或打开该临时页面。
 
 ### 3. 行为质量
 

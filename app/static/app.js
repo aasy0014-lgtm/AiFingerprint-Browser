@@ -107,6 +107,17 @@ async function loadStatus() {
     s.sync.server_enabled ? '<span class="badge ok">同步服务器 ✔</span>' : "",
   ].join("");
   $("#runningCount").textContent = `${profiles.filter((p) => p.running).length} 个环境运行中`;
+  const kernelList = [s.kernels.camoufox, s.kernels["fp-chromium"], s.kernels.chromium];
+  const availableKernels = kernelList.filter((k) => k && k.available).length;
+  const healthEl = $("#serviceHealth");
+  const healthText = $("#headerHealthText");
+  if (healthEl && healthText) {
+    const healthy = s.kernel_health?.status === "ok";
+    healthEl.classList.toggle("is-warn", !healthy);
+    healthText.textContent = healthy
+      ? `服务在线 · ${availableKernels}/3 个内核可用`
+      : `服务在线 · ${s.kernel_health?.note || "内核需要关注"}`;
+  }
   $("#aboutBox").innerHTML = `
     <div class="item"><div class="k">版本</div><div class="v">v${esc(s.version)}（Phase ${s.phase}）</div></div>
     <div class="item"><div class="k">Camoufox 内核</div><div class="v">${s.kernels.camoufox.available ? "已安装 ✔" : "未安装"}</div></div>
@@ -127,9 +138,42 @@ function badge(name, okFlag) {
 
 async function loadProfiles() {
   profiles = await api("GET", "/profiles");
+  renderEnvironmentOverview();
   renderRows();
   $("#runningCount").textContent = `${profiles.filter((p) => p.running).length} 个环境运行中`;
   updateBatchBar();
+}
+
+function renderEnvironmentOverview() {
+  const running = profiles.filter((p) => p.running).length;
+  const mobile = profiles.filter((p) => ["android", "ios"].includes(p.target_os)).length;
+  const healthy = profiles.filter((p) => (p.fingerprint_summary?.health?.score ?? 100) >= 90).length;
+  const values = {
+    "#overviewTotal": profiles.length,
+    "#overviewRunning": running,
+    "#overviewMobile": mobile,
+    "#overviewHealthy": healthy,
+  };
+  Object.entries(values).forEach(([selector, value]) => {
+    const el = $(selector);
+    if (el) el.textContent = value;
+  });
+}
+
+function visibleProfiles() {
+  const query = profileSearch.trim().toLowerCase();
+  return profiles.filter((p) => {
+    const mobile = ["android", "ios"].includes(p.target_os);
+    if (profileStatusFilter === "running" && !p.running) return false;
+    if (profileStatusFilter === "stopped" && p.running) return false;
+    if (profileStatusFilter === "mobile" && !mobile) return false;
+    if (profileStatusFilter === "desktop" && mobile) return false;
+    if (!query) return true;
+    const fp = p.fingerprint_summary || {};
+    const haystack = [p.name, p.group_name, p.target_os, p.kernel,
+      p.proxy?.host, fp.manufacturer, fp.device_model, fp.user_agent].join(" ").toLowerCase();
+    return haystack.includes(query);
+  });
 }
 
 function healthCell(fp) {
@@ -141,11 +185,20 @@ function healthCell(fp) {
 
 function renderRows() {
   const tbody = $("#profileRows");
+  const rows = visibleProfiles();
+  const countEl = $("#profileResultCount");
+  if (countEl) countEl.textContent = profileSearch || profileStatusFilter !== "all"
+    ? `显示 ${rows.length} / ${profiles.length} 个环境`
+    : `共 ${profiles.length} 个环境`;
   if (!profiles.length) {
     tbody.innerHTML = '<tr><td colspan="10" class="empty">还没有环境，点击「新建环境」或「批量新建」开始</td></tr>';
     return;
   }
-  tbody.innerHTML = profiles.map((p) => {
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">没有匹配的环境，试试调整搜索或筛选条件</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map((p) => {
     const proxy = p.proxy
       ? `<span class="mono">${esc(p.proxy.scheme)}://${esc(p.proxy.host)}:${p.proxy.port}</span>`
       : '<span class="muted">直连</span>';
@@ -177,6 +230,25 @@ function renderRows() {
     </tr>`;
   }).join("");
 }
+
+$("#profileSearch")?.addEventListener("input", (e) => {
+  profileSearch = e.target.value;
+  renderRows();
+});
+$("#profileStatusFilter")?.addEventListener("change", (e) => {
+  profileStatusFilter = e.target.value;
+  renderRows();
+});
+
+$("#btnQuickRefresh")?.addEventListener("click", async () => {
+  const btn = $("#btnQuickRefresh");
+  btn.classList.add("spinning");
+  try {
+    await Promise.all([loadProfiles(), loadStatus()]);
+    toast("数据已刷新");
+  } catch (e) { toast(`刷新失败：${e.message}`, "err"); }
+  finally { setTimeout(() => btn.classList.remove("spinning"), 260); }
+});
 
 /* ------------------------------------------------ 批量操作 */
 
