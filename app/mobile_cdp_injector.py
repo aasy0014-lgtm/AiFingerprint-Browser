@@ -16076,6 +16076,9 @@ class MobileEmulationSession:
         self._sensor_supported: Optional[bool] = None
         self._sensor_task: Optional[asyncio.Task] = None
         self._sensor_session: Optional[str] = None
+        # 已装虚拟平台认证器的 target（session）集合：每个 target 各装一份，
+        # 同 target 不重复 add。见 _ensure_virtual_authenticator。
+        self._virtual_auth_targets: set[str] = set()
         self._closed = False
         # 通道健康看门狗：CDP 连接是「仿真是否生效」的唯一凭据——客户端断开
         # 时内核会还原全部 Emulation 覆盖，文档起点补丁脚本也随会话失效：
@@ -16126,6 +16129,8 @@ class MobileEmulationSession:
         self._safe_sessions.clear()
         self._sensor_supported = None
         self._sensor_session = None
+        # 重连 = 新 CDP 连接：session 标识全部失效，认证器须按 target 重装。
+        self._virtual_auth_targets.clear()
         self._emu_verified = None
         self._ua_guard.clear()
         self._ua_guard_busy.clear()
@@ -16606,6 +16611,23 @@ class MobileEmulationSession:
             with contextlib.suppress(CDPError):
                 await self._send("Page.addScriptToEvaluateOnNewDocument",
                                  {"source": patch}, session_id=session_id)
+            # WebAuthn 平台认证器：内核在没有生物识别硬件时
+            # `PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()`
+            # 恒返回 false，`getClientCapabilities().userVerifyingPlatformAuthenticator`
+            # 同为 false。真机 Android（有屏幕锁）恒为 true——Google 注册页的
+            # Hcb() 正是读这个值写进设备数据字段 14。该字段只是随行信号之一：
+            # 实测修成 true 后密码步仍跳 crossflowverification/samedevice，
+            # 真正的决定项是 MjyMj payload 字段 1（Zcb 的 GMS 能力检查，桌面
+            # 内核恒 0）。补齐 uvpaa 是为上报值与真机一致，不是为流程改道。
+            # 用 CDP 的虚拟平台认证器把内核能力补齐，比在 JS 层
+            # 改写返回值干净：函数体与 own 属性完全不变，toString 仍是原生，
+            # 任何 realm 读到的都是同一个实现，无包装痕迹。
+            # 必须是 `transport: internal` + `hasUserVerification`，才被内核认作
+            # 平台认证器（usb/nfc 等外部 transport 不会让 uvpaa 变 true）。
+            # WebAuthn 平台认证器：每个 target 各装一份（见
+            # _ensure_virtual_authenticator）。OOPIF 是独立 target，主文档
+            # 装过不代表它也装过——跨域 iframe 里的三方检测读到的仍是 false。
+            await self._ensure_virtual_authenticator(session_id)
             # 触控仿真：pointer/hover 媒体查询与触控事件（JS 补丁只覆盖
             # maxTouchPoints 数值，媒体查询来自目标的触控开关）
             with contextlib.suppress(CDPError):
@@ -16906,6 +16928,55 @@ class MobileEmulationSession:
                 await self._send("Fetch.continueRequest", {"requestId": rid},
                                  session_id=sid)
 
+    async def _ensure_virtual_authenticator(self, sid: str) -> None:
+        """给当前 target 装上 WebAuthn 虚拟平台认证器。
+
+        内核在没有生物识别硬件时
+        ``PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()``
+        恒返回 false，``getClientCapabilities().userVerifyingPlatformAuthenticator``
+        同为 false。真机手机（有屏幕锁）恒为 true——Google 注册页的 ``Hcb()``
+        正是读这个值写进设备数据字段 14。字段 14 只是随行信号之一：实测把它从
+        false 修成 true 后，密码步仍会跳 crossflowverification/samedevice，
+        真正的决定项是 ``MjyMj`` payload 字段 1（``Zcb`` 的 GMS 能力检查，桌面
+        内核恒 0）。补齐 uvpaa 是为了让上报值与真机一致，不是为了让流程改道。
+
+        用 CDP 虚拟认证器补齐内核能力本身，比在 JS 层改写返回值干净：函数体与
+        own 属性完全不变，toString 仍是原生，任何 realm 读到的都是同一个实现。
+
+        **每个 target 各装一份**：主文档、跨域 iframe、新标签页都是独立 target，
+        各自需要 ``WebAuthn.enable`` + ``addVirtualAuthenticator``。实测 A/B 两个
+        target 各装一次后同时为 true、互不干扰；只在其中一个下发时，另一个的
+        uvpaa 仍是 false（跨域 iframe 里的三方检测就露馅）。
+
+        同一 target 内不要重复 add（``_virtual_auth_targets`` 去重）：内核按
+        environment 报 "Chrome only supports one internal authenticator per
+        environment"，但实测该错误不影响已装的那份。
+
+        必须是 ``transport: internal`` + ``hasUserVerification``，才被内核认作
+        平台认证器（usb/nfc 等外部 transport 不会让 uvpaa 变 true）。
+        """
+        if sid in self._virtual_auth_targets:
+            return
+        self._virtual_auth_targets.add(sid)
+        with contextlib.suppress(CDPError):
+            await self._send("WebAuthn.enable", {"enableUI": False}, session_id=sid)
+        try:
+            await self._send("WebAuthn.addVirtualAuthenticator", {
+                "options": {
+                    "protocol": "ctap2",
+                    "transport": "internal",
+                    "hasResidentKey": True,
+                    "hasUserVerification": True,
+                    "isUserVerified": True,
+                    "automaticPresenceSimulation": True,
+                },
+            }, session_id=sid)
+        except CDPError as exc:
+            # 装不上就撤掉去重标记，让该 target 的下一次挂载再试一次；否则
+            # 一次失败会让这个 target 永久停在 uvpaa=false。
+            self._virtual_auth_targets.discard(sid)
+            log.debug("WebAuthn 虚拟平台认证器安装失败: %s", exc)
+
     async def _apply_device_emulation(self, sid: str) -> None:
         # 0. 启用 Page 域：未启用时 addScriptToEvaluateOnNewDocument 虽然返回
         #    identifier，但 init 脚本不会真正挂载到后续文档（导航后的新文档
@@ -16938,6 +17009,10 @@ class MobileEmulationSession:
         with contextlib.suppress(CDPError):
             await self._send("Page.addScriptToEvaluateOnNewDocument",
                              {"source": patch}, session_id=sid)
+        # WebAuthn 平台认证器：见 OOPIF 路径同名注释。按 target 各装一份——
+        # 主文档、跨域 iframe、新标签页都是独立 target，装过一处不代表其余
+        # 各处也生效。
+        await self._ensure_virtual_authenticator(sid)
 
         # 1. 设备度量：视口 + 屏幕 + DPR + 移动布局（CSS 逻辑像素）
         #    真机首屏 innerHeight < screen.height（浏览器 UI 占位），

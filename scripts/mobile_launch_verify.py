@@ -275,6 +275,23 @@ STATE_JS = """async () => {
         gTrackProcessor: typeof window.MediaStreamTrackProcessor,
         gDigitalCredential: typeof window.DigitalCredential,
         gDevicePostureCtor: typeof window.DevicePosture,
+        // WebAuthn 平台认证器：内核无生物识别硬件时 uvpaa 恒 false，真机
+        // Android（有屏幕锁）恒 true。由 CDP 虚拟平台认证器补齐（注入层
+        // WebAuthn.addVirtualAuthenticator）。同步采样点只能读同步值，两个
+        // Promise 结果在外部 probe 里 await 后回填。
+        uvpaaFn: typeof (window.PublicKeyCredential
+            && window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable),
+        uvpaaOwn: (window.PublicKeyCredential
+            && window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable)
+            ? Object.getOwnPropertyNames(
+                window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable).sort()
+            : null,
+        uvpaaSrc: (window.PublicKeyCredential
+            && window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable)
+            ? String(window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable)
+            : null,
+        condMediationFn: typeof (window.PublicKeyCredential
+            && window.PublicKeyCredential.isConditionalMediationAvailable),
         // F-82：WebGPU 整族按 iOS 版本门控（BCD safari_ios=26）。抽样三类：
         // navigator 成员、接口对象、常量命名空间；再给一个整族在册计数。
         hasNavigatorGpu: 'gpu' in nav,
@@ -3066,7 +3083,7 @@ setTimeout(function () {
 
 # 二次客户端（Playwright 自身会话）读取跨域 frame 的即时值：
 # 验证 OOPIF 补丁对任意客户端口径均一致
-FRAME_LIVE_JS = """(() => ({
+FRAME_LIVE_JS = """(async () => ({
   platform: navigator.platform,
   cd: screen.colorDepth,
   sw: screen.width, sh: screen.height,
@@ -3083,6 +3100,14 @@ FRAME_LIVE_JS = """(() => ({
   chromeRuntime: (function () { try { return typeof window.chrome === 'object'
     && window.chrome !== null && 'runtime' in window.chrome; }
     catch (e) { return 'ERR'; } })(),
+  // WebAuthn 平台认证器：CDP 虚拟认证器按 target 下发，OOPIF 是独立 target，
+  // 必须单独确认——只在主文档生效时，三方 iframe 里的 uvpaa 仍为 false。
+  uvpaa: window.PublicKeyCredential
+    ? await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()
+    : null,
+  condMediation: window.PublicKeyCredential
+    ? await PublicKeyCredential.isConditionalMediationAvailable()
+    : null,
 }))()"""
 
 # Accept-CH 高熵头回送探针：/accept-ch 的响应声明高熵提示，页面同源 fetch
@@ -4095,6 +4120,22 @@ async def main() -> int:
         await page.route("https://probe.test/**", on_route)
         await page.goto("https://probe.test/", wait_until="domcontentloaded")
         state = await page.evaluate(STATE_JS)
+        # WebAuthn 平台认证器两个口径（同步采样点拿不到 Promise 值）
+        try:
+            state["uvpaa"] = await page.evaluate(
+                "() => window.PublicKeyCredential"
+                " ? PublicKeyCredential"
+                "   .isUserVerifyingPlatformAuthenticatorAvailable() : null")
+            state["uvpaaCaps"] = await page.evaluate(
+                "(async () => { try {"
+                " var c = await PublicKeyCredential.getClientCapabilities();"
+                " return c.userVerifyingPlatformAuthenticator; }"
+                " catch (e) { return String(e); } })()")
+            state["condMediation"] = await page.evaluate(
+                "() => window.PublicKeyCredential"
+                " ? PublicKeyCredential.isConditionalMediationAvailable() : null")
+        except Exception as exc:
+            state["uvpaaError"] = f"{type(exc).__name__}: {exc}"[:120]
 
         print("\n== 页面实际状态（导航后）==")
         print(json.dumps(state, ensure_ascii=False, indent=1))
@@ -4306,6 +4347,26 @@ async def main() -> int:
         "innerWidth == CSS 宽度": state["innerW"] == css_w,
         "innerHeight == 首屏视口高（非屏幕全高）": state["innerH"] == vp_h,
         "触控事件可用": state["touchEvents"] is True,
+        # ---- WebAuthn 平台认证器（同设备验证能力）----
+        # 真机手机有屏幕锁（指纹/面容/PIN）即被视作「有用户验证的平台认证器」，
+        # uvpaa 恒 true；内核无生物识别硬件时恒 false。Google 注册页的 Hcb()
+        # 正是读这个值写进设备数据字段 14。该字段是随行信号之一，不是密码步
+        # 去向的决定项（实测修成 true 后仍跳 crossflowverification/samedevice，
+        # 决定项是 MjyMj 字段 1 的 GMS 能力检查）。
+        # 由注入层的 CDP 虚拟平台认证器补齐，因此这里同时断言「值对」与
+        # 「函数形态未被 JS 层改写」（toString 原生、own 属性仅 length/name）。
+        "WebAuthn：平台认证器可用（uvpaa == true）": state.get("uvpaa") is True,
+        "WebAuthn：getClientCapabilities 口径与 uvpaa 一致": (
+            state.get("uvpaaCaps") is True and state.get("uvpaa") is True),
+        "WebAuthn：条件中介可用（condMediation == true）": (
+            state.get("condMediationFn") == "function"
+            and state.get("condMediation") is True),
+        "WebAuthn：uvpaa 保持原生形态（toString 原生、own 仅 length/name）": (
+            # 原生 toString 的排版按引擎不同：Blink 单行
+            # `{ [native code] }`，WebKit 多行 `{\n    [native code]\n}`，
+            # 只认标记本身，不认排版。
+            re.search(r"\[native code\]", str(state.get("uvpaaSrc") or "")) is not None
+            and state.get("uvpaaOwn") == ["length", "name"]),
         # ---- 输入事件层（行为型风控）：触摸派发 = 移动端自动化的真机路径 ----
         "事件层：触摸派发 → touchstart/touchend": (
             "touchstart" in ev_touch and "touchend" in ev_touch),
@@ -4457,6 +4518,10 @@ async def main() -> int:
             fr_live.get("platform") == nav.get("platform")
             and fr_live.get("cd") == 24
             and fr_live.get("coarse") is True),
+        # OOPIF 是独立 CDP target：虚拟平台认证器必须按 target 下发，
+        # 只在主文档生效时三方 iframe（reCAPTCHA 等）里的 uvpaa 仍为 false。
+        "跨域 iframe：WebAuthn 平台认证器可用（按 target 下发）": (
+            fr_live.get("uvpaa") is True and fr_live.get("condMediation") is True),
         "Worker（页面）：platform 一致": wk_main.get("late") == nav.get("platform"),
         "Worker（跨域 iframe）：platform 一致": fr_worker.get("late") == nav.get("platform"),
     })
