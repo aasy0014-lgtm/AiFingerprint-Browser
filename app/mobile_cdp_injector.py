@@ -3770,6 +3770,2214 @@ var __mc = (function () {
 # 构造器面同样按原生复刻：new.target 透传给 Reflect.construct（子类实例
 # 原型链正确）、无 new 时借用原生报错文案、prototype 复用原生对象并置
 # 不可写、length 2、原型上的 constructor 指回包装器。
+# ---------------------------------------------------------------------------
+# F-25：SVG 路径面（WebKit 有、Blink 没有）。
+#
+# 分六段，运行时拼成一个 IIFE 顶层的 <script> 片段：
+#   part1_core      数值基元 / 词法 / 数字与弧标志解析 / 最小 AffineTransform
+#   part1b_libm     float 版 atan2/sin/cos/tan/ceil（弧转三次曲线要用）
+#   part2_parser    SVGPathParser 的字节流与字符串两种源、unaltered/normalized
+#   part3_traversal PathTraversalState（total / vector / segment 三种动作）
+#   part4a_stream   字节流 ⇄ d 字符串（FormattedNumber::fixedPrecision 口径）
+#   part4b_surface  SVGPathSeg / 19 子类 / SVGPathSegList / SVGPathElement 的 DOM 面
+#
+# 为什么自带几何引擎：实测 Blink 的 path 几何只有 16/22 条基线同 WebKit
+# （二次/平滑三次/全部弧线与大坐标精度均有偏差），不能直接委派。
+# SVGPoint / SVGMatrix 不重建：Blink 的形状、描述符、参数个数、数值全同，
+# 只重排原型键顺序；重建会切断 getScreenCTM() 等原生返回值的互操作。
+
+_SVG_SRC = r"""// ---- 数值 / 几何基础（全部按 C++ float 语义，Math.fround 建模）----
+var __svgf32 = Math.fround;
+var __svgOneOverThree = __svgf32(1 / 3);
+var __svgPiF = __svgf32(3.14159265358979323846);
+var __svgPiOverTwoF = __svgf32(1.57079632679489661923);
+var __svgPiD = 3.14159265358979323846;
+var __svgTol = __svgf32(0.00001);
+var __svgFloatMax = 3.4028234663852886e38;
+
+function __svgP(x, y) { return { x: __svgf32(x), y: __svgf32(y) }; }
+function __svgPAdd(a, b) { return __svgP(__svgf32(a.x + b.x), __svgf32(a.y + b.y)); }
+function __svgPSub(a, b) { return __svgP(__svgf32(a.x - b.x), __svgf32(a.y - b.y)); }
+function __svgPScale(a, s) {
+    s = __svgf32(s);
+    return __svgP(__svgf32(a.x * s), __svgf32(a.y * s));
+}
+function __svgPMove(a, dx, dy) {
+    return __svgP(__svgf32(a.x + __svgf32(dx)), __svgf32(a.y + __svgf32(dy)));
+}
+function __svgPEq(a, b) { return a.x === b.x && a.y === b.y; }
+function __svgMid(a, b) { return __svgP(__svgf32((a.x + b.x) / 2), __svgf32((a.y + b.y) / 2)); }
+function __svgSlope(a) { return __svgf32(Math.atan2(a.y, a.x)); }
+function __svgDistLine(a, b) { return __svgf32(Math.hypot(__svgf32(b.x - a.x), __svgf32(b.y - a.y))); }
+
+// ---- 段类型常量（与 WebKit SVGPathSegType 同值）----
+var __svgUnknown = 0, __svgClose = 1, __svgMabs = 2, __svgMrel = 3,
+    __svgLabs = 4, __svgLrel = 5, __svgCabs = 6, __svgCrel = 7,
+    __svgQabs = 8, __svgQrel = 9, __svgAabs = 10, __svgArel = 11,
+    __svgHabs = 12, __svgHrel = 13, __svgVabs = 14, __svgVrel = 15,
+    __svgSabs = 16, __svgSrel = 17, __svgTabs = 18, __svgTrel = 19;
+
+// 20 个段的字母表（索引即类型值）
+var __svgLetters = ['', 'Z', 'M', 'm', 'L', 'l', 'C', 'c', 'Q', 'q', 'A', 'a',
+                    'H', 'h', 'V', 'v', 'S', 's', 'T', 't'];
+
+// ---- 字节流：与 SVGPathByteStream 同构（每个 float 按 float32 存）----
+// 段类型 ushort + 若干 float / flag。用普通数组存，读取时按类型解析。
+// 这里不需要真的按字节布局——只要保证「按 float32 存进去、按 float32 读出来」。
+
+// ---- 数字解析（genericParseNumber，含 FMA 收缩语义）----
+function __svgIsDigit(c) { return c >= '0' && c <= '9'; }
+function __svgIsSpace(c) {
+    return c === ' ' || c === '\t' || c === '\n' || c === '\r';
+}
+function __svgIsValidRange(x) { return x >= -__svgFloatMax && x <= __svgFloatMax; }
+
+function __svgBuf(str) { this.s = str; this.i = 0; }
+__svgBuf.prototype.end = function () { return this.i >= this.s.length; };
+__svgBuf.prototype.rest = function () { return this.i < this.s.length; };
+__svgBuf.prototype.ch = function (o) { return this.s[this.i + (o || 0)]; };
+
+function __svgSkipSpaces(b) {
+    while (b.rest() && __svgIsSpace(b.ch())) { b.i++; }
+    return b.rest();
+}
+function __svgSkipSpacesOrDelim(b) {
+    if (b.rest() && !__svgIsSpace(b.ch()) && b.ch() !== ',') { return false; }
+    if (__svgSkipSpaces(b)) {
+        if (b.rest() && b.ch() === ',') {
+            b.i++;
+            __svgSkipSpaces(b);
+        }
+    }
+    return b.rest();
+}
+
+// 忠实移植 SVGParserUtilities::genericParseNumber：
+//  - 整数部分从右往左累加，multiplier *= 10
+//  - 小数部分 frac *= 0.1f，decimal += digit * frac
+//  - 乘加全部按 FMA 收缩（-ffp-contract=fast）：f32(a*b + c)
+//  - 指数段没有生效的 max_exponent 检查，只有最后 isValidRange
+function __svgParseNumber(b, skip) {
+    var number = 0, integer = 0, decimal = 0, frac = 1, exponent = 0;
+    var sign = 1, expsign = 1;
+    var start = b.i;
+
+    if (b.rest() && b.ch() === '+') { b.i++; }
+    else if (b.rest() && b.ch() === '-') { b.i++; sign = -1; }
+
+    if (b.end() || (!__svgIsDigit(b.ch()) && b.ch() !== '.')) { return null; }
+
+    var intStart = b.i;
+    while (b.rest() && __svgIsDigit(b.ch())) { b.i++; }
+
+    if (b.i !== intStart) {
+        var scan = b.i - 1;
+        var multiplier = 1;
+        while (scan >= intStart) {
+            integer = __svgf32(multiplier * __svgf32(b.s.charCodeAt(scan) - 48) + integer);
+            multiplier = __svgf32(multiplier * 10);
+            scan--;
+        }
+        if (!__svgIsValidRange(integer)) { return null; }
+    }
+
+    if (b.rest() && b.ch() === '.') {
+        b.i++;
+        if (b.end() || !__svgIsDigit(b.ch())) { return null; }
+        while (b.rest() && __svgIsDigit(b.ch())) {
+            frac = __svgf32(frac * __svgf32(0.1));
+            decimal = __svgf32(__svgf32(b.s.charCodeAt(b.i) - 48) * frac + decimal);
+            b.i++;
+        }
+    }
+
+    if (b.i !== start && b.i + 1 < b.s.length
+        && (b.ch() === 'e' || b.ch() === 'E')
+        && (b.ch(1) !== 'x' && b.ch(1) !== 'm')) {
+        b.i++;
+        if (b.ch() === '+') { b.i++; }
+        else if (b.ch() === '-') { b.i++; expsign = -1; }
+        if (b.end() || !__svgIsDigit(b.ch())) { return null; }
+        while (b.rest() && __svgIsDigit(b.ch())) {
+            exponent = __svgf32(__svgf32(exponent * 10) + __svgf32(b.s.charCodeAt(b.i) - 48));
+            b.i++;
+        }
+        if (!__svgIsValidRange(exponent)) { return null; }
+    }
+
+    number = __svgf32(integer + decimal);
+    number = __svgf32(number * sign);
+
+    if (exponent) {
+        number = __svgf32(number * __svgf32(Math.pow(10, expsign * Math.trunc(exponent))));
+    }
+    if (!__svgIsValidRange(number)) { return null; }
+    if (start === b.i) { return null; }
+    if (skip !== false) { __svgSkipSpacesOrDelim(b); }
+    return number;
+}
+
+function __svgParseNum(b) { return __svgParseNumber(b, true); }
+
+function __svgParseArcFlag(b) {
+    if (b.end()) { return null; }
+    var c = b.ch();
+    b.i++;
+    var flag;
+    if (c === '0') { flag = false; }
+    else if (c === '1') { flag = true; }
+    else { return null; }
+    __svgSkipSpacesOrDelim(b);
+    return flag;
+}
+
+function __svgParsePoint(b) {
+    var x = __svgParseNum(b);
+    if (x === null) { return null; }
+    var y = __svgParseNum(b);
+    if (y === null) { return null; }
+    return __svgP(x, y);
+}
+
+function __svgParseSegType(b) {
+    var c = b.ch();
+    b.i++;
+    switch (c) {
+        case 'Z': case 'z': return __svgClose;
+        case 'M': return __svgMabs;
+        case 'm': return __svgMrel;
+        case 'L': return __svgLabs;
+        case 'l': return __svgLrel;
+        case 'C': return __svgCabs;
+        case 'c': return __svgCrel;
+        case 'Q': return __svgQabs;
+        case 'q': return __svgQrel;
+        case 'A': return __svgAabs;
+        case 'a': return __svgArel;
+        case 'H': return __svgHabs;
+        case 'h': return __svgHrel;
+        case 'V': return __svgVabs;
+        case 'v': return __svgVrel;
+        case 'S': return __svgSabs;
+        case 's': return __svgSrel;
+        case 'T': return __svgTabs;
+        case 't': return __svgTrel;
+        default: return __svgUnknown;
+    }
+}
+
+// 字符串源的隐式重复：只有这里会做 MOVETO→LINETO 提升；
+// 字节流源与段列表源的 nextCommand 忽略参数，不重复。
+function __svgNextCommand(b, prev) {
+    if (b.rest()) {
+        var c = b.ch();
+        if ((c === '+' || c === '-' || c === '.' || __svgIsDigit(c))
+            && prev !== __svgClose) {
+            if (prev === __svgMabs) { return __svgLabs; }
+            if (prev === __svgMrel) { return __svgLrel; }
+            return prev;
+        }
+    }
+    return __svgParseSegType(b);
+}
+
+// ---- 字符串源的段读取器 ----
+function __svgReadMoveTo(b) {
+    var p = __svgParsePoint(b);
+    return p ? { targetPoint: p } : null;
+}
+function __svgReadLineTo(b) {
+    var p = __svgParsePoint(b);
+    return p ? { targetPoint: p } : null;
+}
+function __svgReadHoriz(b) {
+    var x = __svgParseNum(b);
+    return x === null ? null : { x: x };
+}
+function __svgReadVert(b) {
+    var y = __svgParseNum(b);
+    return y === null ? null : { y: y };
+}
+function __svgReadCubic(b) {
+    var p1 = __svgParsePoint(b); if (!p1) { return null; }
+    var p2 = __svgParsePoint(b); if (!p2) { return null; }
+    var t = __svgParsePoint(b); if (!t) { return null; }
+    return { point1: p1, point2: p2, targetPoint: t };
+}
+function __svgReadCubicSmooth(b) {
+    var p2 = __svgParsePoint(b); if (!p2) { return null; }
+    var t = __svgParsePoint(b); if (!t) { return null; }
+    return { point2: p2, targetPoint: t };
+}
+function __svgReadQuad(b) {
+    var p1 = __svgParsePoint(b); if (!p1) { return null; }
+    var t = __svgParsePoint(b); if (!t) { return null; }
+    return { point1: p1, targetPoint: t };
+}
+function __svgReadQuadSmooth(b) {
+    var t = __svgParsePoint(b);
+    return t ? { targetPoint: t } : null;
+}
+function __svgReadArc(b) {
+    var rx = __svgParseNum(b); if (rx === null) { return null; }
+    var ry = __svgParseNum(b); if (ry === null) { return null; }
+    var angle = __svgParseNum(b); if (angle === null) { return null; }
+    var largeArc = __svgParseArcFlag(b); if (largeArc === null) { return null; }
+    var sweep = __svgParseArcFlag(b); if (sweep === null) { return null; }
+    var t = __svgParsePoint(b); if (!t) { return null; }
+    return { rx: rx, ry: ry, angle: angle, largeArc: largeArc, sweep: sweep,
+             targetPoint: t };
+}
+
+// ---- AffineTransform：成员是 double，mapPoint 收窄成 float ----
+function __svgAT() { this.a = 1; this.b = 0; this.c = 0; this.d = 1; this.e = 0; this.f = 0; }
+__svgAT.prototype.identity = function () {
+    this.a = 1; this.b = 0; this.c = 0; this.d = 1; this.e = 0; this.f = 0;
+};
+__svgAT.prototype.rotate = function (deg) {
+    if (!deg) { return; }
+    var rad = deg * __svgPiD / 180;
+    var s = Math.sin(rad), c = Math.cos(rad);
+    var a = this.a, b = this.b, cc = this.c, d = this.d;
+    this.a = a * c + cc * s;
+    this.b = b * c + d * s;
+    this.c = cc * c - a * s;
+    this.d = d * c - b * s;
+};
+__svgAT.prototype.scale = function (sx, sy) {
+    this.a *= sx; this.b *= sx; this.c *= sy; this.d *= sy;
+};
+__svgAT.prototype.mapPoint = function (p) {
+    return __svgP(__svgf32(this.a * p.x + this.c * p.y + this.e),
+                  __svgf32(this.b * p.x + this.d * p.y + this.f));
+};
+// ---- Apple libm 的 float 三角（FreeBSD msun 系）逐位移植 ----
+// WebKit 的 PathTraversalState 用 sinf/cosf/atan2f 计算切向，
+// V8 的 Math.sin/cos/atan2 是另一套实现，末位 ULP 会差 1~2，
+// 于是 getPointAtLength 在曲线上会给出与 iOS 不同的坐标。
+// 这里照抄 msun 的 float 版本（double 中间量、float 输出）。
+
+var __svgM_PI_2 = 1.5707963267948966;   // 双精度 M_PI_2
+
+var __svgS1 = -0.16666666641626524;
+var __svgS2 = 0.008333329385889463;
+var __svgS3 = -0.00019839334836096632;
+var __svgS4 = 2.718311493989822e-06;
+
+var __svgC0 = -0.499999997251031;
+var __svgC1 = 0.04166662332373906;
+var __svgC2 = -0.001388676377460993;
+var __svgC3 = 2.439044879627741e-05;
+
+// 1..4 * M_PI_2，都是编译期算好的 double 常量
+var __svgS1PIO2 = 1 * __svgM_PI_2;
+var __svgS2PIO2 = 2 * __svgM_PI_2;
+var __svgS3PIO2 = 3 * __svgM_PI_2;
+var __svgS4PIO2 = 4 * __svgM_PI_2;
+
+var __svgInvPIO2 = 0.6366197723675814;
+var __svgPIO2_1 = 1.5707963109016418;
+var __svgPIO2_1T = 1.5893254773528196e-08;
+
+// __kernel_sindf(double) -> float
+function __svgKernelSindf(x) {
+    var z = x * x;
+    var w = z * z;
+    var r = __svgS3 + z * __svgS4;
+    var s = z * x;
+    return __svgf32((x + s * (__svgS1 + z * __svgS2)) + s * w * r);
+}
+// __kernel_cosdf(double) -> float
+function __svgKernelCosdf(x) {
+    var z = x * x;
+    var w = z * z;
+    var r = __svgC2 + z * __svgC3;
+    return __svgf32(((1.0 + z * __svgC0) + w * __svgC1) + (w * z) * r);
+}
+
+// __ieee754_rem_pio2f：|x| < 2^28*(pi/2) 走中段路径。
+// 这里只实现中段；更大的 |x| 需要 __kernel_rem_pio2（双精度大参数归约），
+// 而 SVG 坐标在 float 范围内不会落到那里（超过 2^28*pi/2 的坐标已经不可渲染）。
+function __svgRemPio2f(x) {
+    // rnint() = (x + 2^52) - 2^52，即按当前舍入模式取最近整数（round-half-even）
+    var fn = Math.round(__svgf32(__svgf32(x) * __svgInvPIO2));
+    var n = fn;
+    var r = x - fn * __svgPIO2_1;
+    var w = fn * __svgPIO2_1T;
+    return { n: n, y: r - w };
+}
+
+var __svgF32Word = new Int32Array(1);
+var __svgF32View = new Float32Array(__svgF32Word.buffer);
+function __svgF32Bits(x) { __svgF32View[0] = x; return __svgF32Word[0]; }
+
+// sinf(float) -> float
+function __svgSinf(x) {
+    x = __svgf32(x);
+    var hx = __svgF32Bits(x);
+    var ix = hx & 0x7fffffff;
+
+    if (ix <= 0x3f490fda) {          // |x| ~<= pi/4
+        if (ix < 0x39800000) {       // |x| < 2**-12
+            if (Math.trunc(x) === 0) { return x; }
+        }
+        return __svgKernelSindf(x);
+    }
+    if (ix <= 0x407b53d1) {          // |x| ~<= 5*pi/4
+        if (ix <= 0x4016cbe3) {      // |x| ~<= 3pi/4
+            if (hx > 0) { return __svgKernelCosdf(x - __svgS1PIO2); }
+            return __svgf32(-__svgKernelCosdf(x + __svgS1PIO2));
+        }
+        return __svgKernelSindf((hx > 0 ? __svgS2PIO2 : -__svgS2PIO2) - x);
+    }
+    if (ix <= 0x40e231d5) {          // |x| ~<= 9*pi/4
+        if (ix <= 0x40afeddf) {      // |x| ~<= 7*pi/4
+            if (hx > 0) { return __svgf32(-__svgKernelCosdf(x - __svgS3PIO2)); }
+            return __svgKernelCosdf(x + __svgS3PIO2);
+        }
+        return __svgKernelSindf(x + (hx > 0 ? -__svgS4PIO2 : __svgS4PIO2));
+    }
+    if (ix >= 0x7f800000) { return x - x; }  // Inf / NaN
+
+    var red = __svgRemPio2f(x);
+    var y = red.y;
+    switch (red.n & 3) {
+        case 0: return __svgKernelSindf(y);
+        case 1: return __svgKernelCosdf(y);
+        case 2: return __svgKernelSindf(-y);
+        default: return __svgf32(-__svgKernelCosdf(y));
+    }
+}
+
+// cosf(float) -> float
+function __svgCosf(x) {
+    x = __svgf32(x);
+    var hx = __svgF32Bits(x);
+    var ix = hx & 0x7fffffff;
+
+    if (ix <= 0x3f490fda) {          // |x| ~<= pi/4
+        if (ix < 0x39800000) {       // |x| < 2**-12
+            if (Math.trunc(x) === 0) { return 1.0; }
+        }
+        return __svgKernelCosdf(x);
+    }
+    if (ix <= 0x407b53d1) {          // |x| ~<= 5*pi/4
+        if (ix > 0x4016cbe3) {       // |x| ~> 3*pi/4
+            return __svgf32(-__svgKernelCosdf(x + (hx > 0 ? -__svgS2PIO2 : __svgS2PIO2)));
+        }
+        if (hx > 0) { return __svgKernelSindf(__svgS1PIO2 - x); }
+        return __svgKernelSindf(x + __svgS1PIO2);
+    }
+    if (ix <= 0x40e231d5) {          // |x| ~<= 9*pi/4
+        if (ix > 0x40afeddf) {       // |x| ~> 7*pi/4
+            return __svgKernelCosdf(x + (hx > 0 ? -__svgS4PIO2 : __svgS4PIO2));
+        }
+        if (hx > 0) { return __svgKernelSindf(x - __svgS3PIO2); }
+        return __svgKernelSindf(-__svgS3PIO2 - x);
+    }
+    if (ix >= 0x7f800000) { return x - x; }
+
+    var red = __svgRemPio2f(x);
+    var y = red.y;
+    switch (red.n & 3) {
+        case 0: return __svgKernelCosdf(y);
+        case 1: return __svgKernelSindf(-y);
+        case 2: return __svgf32(-__svgKernelCosdf(y));
+        default: return __svgKernelSindf(y);
+    }
+}
+
+// ---- atanf / atan2f：Apple 用的是 Eric Postpischil 的 Intel asm 版
+// （Source/Intel/atanf.s、atan2f.s），不是 msun。中心与尾部都用双精度
+// 四元因式多项式，仅最后一步舍入到 float。以下常量全部照抄 .literal8。
+var __svgA2C2 = 0.0029352921857004596570518;
+var __svgA2c01 = 2.2971562298314633761676433, __svgA2c21 = 0.0207432003007420961489920;
+var __svgA2c00 = 2.4449692297316409651126041, __svgA2c20 = 3.7888879287802702842997915;
+var __svgA2c11 = -2.9466967515109826289085300, __svgA2c31 = -4.9721072376211623038916292;
+var __svgA2c10 = 5.4728447324456990092824269, __svgA2c30 = 6.7197076223592378022736307;
+var __svgA2t01 = 0.9193672354545696501477531, __svgA2t21 = -0.0052035944094405570566862;
+var __svgA2t00 = 0.3992772987220534996563340, __svgA2t20 = 0.2521268658714555740707959;
+var __svgA2t11 = -0.5273186542866779494437308, __svgA2t31 = -0.7201738803584184183894208;
+var __svgA2t10 = 0.1730466268612773143731748, __svgA2t30 = 0.1408679409162453515360961;
+var __svgA2HalfPi = 1.570796326794896619231322;
+var __svgA2Pi = 3.141592653589793238462643;
+var __svgA2Pi1v4 = 0.7853981633974483096156608;
+var __svgA2Pi3v4 = 2.356194490192344928846982;
+var __svgA2AlmostPi = 3.1415924;          // +3.1415924，舍入到 float 仍是 3.1415925
+var __svgA2AlmostHalfPi = 1.5707962;      // ±pi/2 朝零舍入
+var __svgA2Threshold = 2.384185791015625e-07;   // 2**-22
+
+// 符号位 / 复制符号：FloatPoint 的 -0 语义要靠位操作才判得准
+var __svgSgnWord = new Int32Array(1);
+var __svgSgnView = new Float32Array(__svgSgnWord.buffer);
+function __svgSignBit(x) { __svgSgnView[0] = x; return (__svgSgnWord[0] >>> 31) === 1; }
+function __svgCopySign(mag, sgn) {
+    __svgSgnView[0] = mag;
+    var w = __svgSgnWord[0];
+    __svgSgnWord[0] = (w & 0x7fffffff) | ((__svgSignBit(sgn) ? 1 : 0) << 31);
+    return __svgSgnView[0];
+}
+
+// 中心多项式：x*c2 * ((x^4+c01*x^2+c00)) * ((x^4+c11*x^2+c10))
+//             * ((x^4+c21*x^2+c20)) * ((x^4+c31*x^2+c30))
+// asm 用两条 SIMD 道并行算两组四元因式，再 movhlps/mulsd 合成：
+//   lo = ((c01组)*(c11组)) * x,  hi = ((c21组)*(c31组)) * c2,  结果 = base + lo*hi
+function __svgA2Poly(x, base) {
+    var x2 = x * x;
+    var p0lo = (x2 + __svgA2c01) * x2 + __svgA2c00;
+    var p0hi = (x2 + __svgA2c21) * x2 + __svgA2c20;
+    var p1lo = (x2 + __svgA2c11) * x2 + __svgA2c10;
+    var p1hi = (x2 + __svgA2c31) * x2 + __svgA2c30;
+    var lo = (p0lo * p1lo) * x;
+    var hi = (p0hi * p1hi) * __svgA2C2;
+    return base + (lo * hi);
+}
+
+function __svgAtanf(x) {
+    x = __svgf32(x);
+    if (x > 1.0) {
+        if (x >= 16777216.0) { return __svgf32(__svgA2AlmostHalfPi); }   // pPoint1 = 2^24
+        // 尾部：+pi/2 - ((c组))*(r^16) * ((d组))*(r)
+        var t = x * x;
+        var r = 1.0 / x;
+        var r2 = r * r, r4 = r2 * r2, r8 = r4 * r4, r16 = r8 * r8;
+        var ca = (t + __svgA2t11) * t + __svgA2t10;
+        var cb = (t + __svgA2t31) * t + __svgA2t30;
+        var cc = (t + __svgA2t01) * t + __svgA2t00;
+        var cd = (t + __svgA2t21) * t + __svgA2t20;
+        return __svgf32(__svgA2HalfPi - ((cc * ca) * r16) * ((cd * cb) * r));
+    }
+    if (x < -1.0) {
+        if (x <= -16777216.0) { return __svgf32(-__svgA2AlmostHalfPi); }
+        var t2 = x * x;
+        var r_ = 1.0 / x;
+        var s2 = r_ * r_, s4 = s2 * s2, s8 = s4 * s4, s16 = s8 * s8;
+        var qa = (t2 + __svgA2t11) * t2 + __svgA2t10;
+        var qb = (t2 + __svgA2t31) * t2 + __svgA2t30;
+        var qc = (t2 + __svgA2t01) * t2 + __svgA2t00;
+        var qd = (t2 + __svgA2t21) * t2 + __svgA2t20;
+        return __svgf32(-__svgA2HalfPi - ((qc * qa) * s16) * ((qd * qb) * r_));
+    }
+    var t3 = x * x;
+    var a = (t3 + __svgA2c11) * t3 + __svgA2c10;
+    var b = (t3 + __svgA2c31) * t3 + __svgA2c30;
+    var c = (t3 + __svgA2c01) * t3 + __svgA2c00;
+    var d = (t3 + __svgA2c21) * t3 + __svgA2c20;
+    return __svgf32(((a * c) * __svgA2C2) * ((b * d) * x));
+}
+
+// atan2f：Postpischil 的象限分流。y/x 先做双精度除法（asm 的 divsd），
+// 商落在 (-1,1) 内后交给中心多项式。
+function __svgAtan2f(y, x) {
+    y = __svgf32(y);
+    x = __svgf32(x);
+    if (y !== y || x !== x) { return __svgf32(y + x); }   // 任一为 NaN
+    if (y >= x) {                                        // jae yGEx
+        if (y === x) {                                   // yEQx
+            if (y >= 0.0) {                              // ucomisd nZero,y ; jae
+                if (y === 0.0) {                         // je yEQx_and_yEQ0
+                    // x 是 -0 时返回 ±pi（朝零舍入），否则返回 ±0
+                    var p0 = __svgSignBit(x) ? __svgA2AlmostPi : 0.0;
+                    return __svgf32(__svgCopySign(p0, y));
+                }
+                return __svgf32(__svgA2Pi1v4);
+            }
+            return __svgf32(-__svgA2Pi3v4);
+        }
+        if (-x >= y) {                                   // ucomisd y,nx ; jae
+            if (-x === y) { return __svgf32(__svgA2Pi3v4); }
+            // -x < y < x：x < 0，商 y/x 在 (-1,1)
+            var q = y / x;
+            var neg = __svgSignBit(y);
+            if (Math.abs(q) <= __svgA2Threshold) {
+                return __svgf32(neg ? -__svgA2AlmostPi : __svgA2AlmostPi);
+            }
+            return __svgf32(__svgA2Poly(q, neg ? -__svgA2Pi : __svgA2Pi));
+        }
+        // -x < y < x：+pi/2 + atan(-x/y)
+        return __svgf32(__svgA2Poly(-(x / y), __svgA2HalfPi));
+    }
+    if (-x >= y) {                                       // ucomisd y,nx ; jae
+        if (-x === y) { return __svgf32(-__svgA2Pi1v4); }
+        // y < x < -y：-pi/2 + atan(-x/y)
+        return __svgf32(__svgA2Poly(-(x / y), -__svgA2HalfPi));
+    }
+    // -x < y < x：atan(y/x)，符号随 y（Base = -0 保证 -0 结果）
+    return __svgf32(__svgA2Poly(y / x, -0.0));
+}
+
+// tanf：iOS/arm64 的 libm 与 Libm 仓库 Source/ARM/tanf.h 逐位不一致
+// （60019 个样本里 3187 个差 1 ULP），最接近的是「双精度 tan 后舍入到 float」。
+// 这里按后者实现：对 arc 分解而言参数只在 [-0.3927, 0.3927]。
+function __svgTanf(x) { return __svgf32(Math.tan(__svgf32(x))); }
+
+// PathTraversalState 的斜率角：FloatPoint::slopeAngleRadians() = atan2f(m_y, m_x)
+function __svgSlopeAngle(p) { return __svgAtan2f(p.y, p.x); }
+// ---- 消费者基类（对应 SVGPathConsumer）----
+// 每个 consumer 实现：moveTo / lineTo / curveToCubic / closePath /
+// continueConsuming / incrementPathSegmentCount，以及 unaltered 模式专用
+// 的 lineToHorizontal / lineToVertical / curveToCubicSmooth /
+// curveToQuadratic / curveToQuadraticSmooth / arcTo。
+
+// ---- 解析器 ----
+function __svgParser(consumer, source, mode) {
+    this.consumer = consumer;
+    this.source = source;
+    this.mode = mode;                 // 'normalized' | 'unaltered'
+    this.currentPoint = __svgP(0, 0);
+    this.subPathPoint = __svgP(0, 0);
+    this.controlPoint = __svgP(0, 0);
+    this.coordMode = 'abs';
+    this.lastCommand = __svgUnknown;
+    this.closePath = true;
+}
+
+__svgParser.prototype.parseClosePathSegment = function () {
+    if (this.mode === 'normalized') { this.currentPoint = this.subPathPoint; }
+    this.closePath = true;
+    this.consumer.closePath();
+};
+
+__svgParser.prototype.parseMoveToSegment = function () {
+    var r = this.source.readMoveTo();
+    if (!r) { return false; }
+    if (this.mode === 'normalized') {
+        if (this.coordMode === 'rel') { this.currentPoint = __svgPAdd(this.currentPoint, r.targetPoint); }
+        else { this.currentPoint = r.targetPoint; }
+        this.subPathPoint = this.currentPoint;
+        this.consumer.moveTo(this.currentPoint, this.closePath, 'abs');
+    } else {
+        this.consumer.moveTo(r.targetPoint, this.closePath, this.coordMode);
+    }
+    this.closePath = false;
+    return true;
+};
+
+__svgParser.prototype.parseLineToSegment = function () {
+    var r = this.source.readLineTo();
+    if (!r) { return false; }
+    if (this.mode === 'normalized') {
+        if (this.coordMode === 'rel') { this.currentPoint = __svgPAdd(this.currentPoint, r.targetPoint); }
+        else { this.currentPoint = r.targetPoint; }
+        this.consumer.lineTo(this.currentPoint, 'abs');
+    } else { this.consumer.lineTo(r.targetPoint, this.coordMode); }
+    return true;
+};
+
+__svgParser.prototype.parseLineToHorizontalSegment = function () {
+    var r = this.source.readHoriz();
+    if (!r) { return false; }
+    if (this.mode === 'normalized') {
+        if (this.coordMode === 'rel') { this.currentPoint = __svgPMove(this.currentPoint, r.x, 0); }
+        else { this.currentPoint = __svgP(r.x, this.currentPoint.y); }
+        this.consumer.lineTo(this.currentPoint, 'abs');
+    } else { this.consumer.lineToHorizontal(r.x, this.coordMode); }
+    return true;
+};
+
+__svgParser.prototype.parseLineToVerticalSegment = function () {
+    var r = this.source.readVert();
+    if (!r) { return false; }
+    if (this.mode === 'normalized') {
+        if (this.coordMode === 'rel') { this.currentPoint = __svgPMove(this.currentPoint, 0, r.y); }
+        else { this.currentPoint = __svgP(this.currentPoint.x, r.y); }
+        this.consumer.lineTo(this.currentPoint, 'abs');
+    } else { this.consumer.lineToVertical(r.y, this.coordMode); }
+    return true;
+};
+
+__svgParser.prototype.parseCurveToCubicSegment = function () {
+    var r = this.source.readCubic();
+    if (!r) { return false; }
+    if (this.mode === 'normalized') {
+        if (this.coordMode === 'rel') {
+            r.point1 = __svgPAdd(r.point1, this.currentPoint);
+            r.point2 = __svgPAdd(r.point2, this.currentPoint);
+            r.targetPoint = __svgPAdd(r.targetPoint, this.currentPoint);
+        }
+        this.consumer.curveToCubic(r.point1, r.point2, r.targetPoint, 'abs');
+        this.controlPoint = r.point2;
+        this.currentPoint = r.targetPoint;
+    } else { this.consumer.curveToCubic(r.point1, r.point2, r.targetPoint, this.coordMode); }
+    return true;
+};
+
+__svgParser.prototype.parseCurveToCubicSmoothSegment = function () {
+    var r = this.source.readCubicSmooth();
+    if (!r) { return false; }
+    if (this.lastCommand !== __svgCabs && this.lastCommand !== __svgCrel
+        && this.lastCommand !== __svgSabs && this.lastCommand !== __svgSrel) {
+        this.controlPoint = this.currentPoint;
+    }
+    if (this.mode === 'normalized') {
+        var point1 = __svgPScale(this.currentPoint, 2);
+        point1 = __svgPMove(point1, -this.controlPoint.x, -this.controlPoint.y);
+        if (this.coordMode === 'rel') {
+            r.point2 = __svgPAdd(r.point2, this.currentPoint);
+            r.targetPoint = __svgPAdd(r.targetPoint, this.currentPoint);
+        }
+        this.consumer.curveToCubic(point1, r.point2, r.targetPoint, 'abs');
+        this.controlPoint = r.point2;
+        this.currentPoint = r.targetPoint;
+    } else { this.consumer.curveToCubicSmooth(r.point2, r.targetPoint, this.coordMode); }
+    return true;
+};
+
+__svgParser.prototype.parseCurveToQuadraticSegment = function () {
+    var r = this.source.readQuad();
+    if (!r) { return false; }
+    if (this.mode === 'normalized') {
+        this.controlPoint = r.point1;
+        var point1 = this.currentPoint;
+        point1 = __svgPMove(point1, __svgf32(2 * this.controlPoint.x), __svgf32(2 * this.controlPoint.y));
+        var point2 = __svgP(__svgf32(r.targetPoint.x + __svgf32(2 * this.controlPoint.x)),
+                            __svgf32(r.targetPoint.y + __svgf32(2 * this.controlPoint.y)));
+        if (this.coordMode === 'rel') {
+            point1 = __svgPMove(point1, __svgf32(2 * this.currentPoint.x), __svgf32(2 * this.currentPoint.y));
+            point2 = __svgPMove(point2, __svgf32(3 * this.currentPoint.x), __svgf32(3 * this.currentPoint.y));
+            r.targetPoint = __svgPAdd(r.targetPoint, this.currentPoint);
+        }
+        point1 = __svgPScale(point1, __svgOneOverThree);
+        point2 = __svgPScale(point2, __svgOneOverThree);
+        this.consumer.curveToCubic(point1, point2, r.targetPoint, 'abs');
+        if (this.coordMode === 'rel') { this.controlPoint = __svgPAdd(this.controlPoint, this.currentPoint); }
+        this.currentPoint = r.targetPoint;
+    } else { this.consumer.curveToQuadratic(r.point1, r.targetPoint, this.coordMode); }
+    return true;
+};
+
+__svgParser.prototype.parseCurveToQuadraticSmoothSegment = function () {
+    var r = this.source.readQuadSmooth();
+    if (!r) { return false; }
+    if (this.lastCommand !== __svgQabs && this.lastCommand !== __svgQrel
+        && this.lastCommand !== __svgTabs && this.lastCommand !== __svgTrel) {
+        this.controlPoint = this.currentPoint;
+    }
+    if (this.mode === 'normalized') {
+        var cubicPoint = __svgPScale(this.currentPoint, 2);
+        cubicPoint = __svgPMove(cubicPoint, -this.controlPoint.x, -this.controlPoint.y);
+        var point1 = __svgP(__svgf32(this.currentPoint.x + __svgf32(2 * cubicPoint.x)),
+                            __svgf32(this.currentPoint.y + __svgf32(2 * cubicPoint.y)));
+        var point2 = __svgP(__svgf32(r.targetPoint.x + __svgf32(2 * cubicPoint.x)),
+                            __svgf32(r.targetPoint.y + __svgf32(2 * cubicPoint.y)));
+        if (this.coordMode === 'rel') {
+            point2 = __svgPAdd(point2, this.currentPoint);
+            r.targetPoint = __svgPAdd(r.targetPoint, this.currentPoint);
+        }
+        point1 = __svgPScale(point1, __svgOneOverThree);
+        point2 = __svgPScale(point2, __svgOneOverThree);
+        this.consumer.curveToCubic(point1, point2, r.targetPoint, 'abs');
+        this.controlPoint = cubicPoint;
+        this.currentPoint = r.targetPoint;
+    } else { this.consumer.curveToQuadraticSmooth(r.targetPoint, this.coordMode); }
+    return true;
+};
+
+__svgParser.prototype.parseArcToSegment = function () {
+    var r = this.source.readArc();
+    if (!r) { return false; }
+    r.rx = __svgf32(Math.abs(r.rx));
+    r.ry = __svgf32(Math.abs(r.ry));
+    var arcIsZeroLength = false;
+    if (this.mode === 'normalized') {
+        if (this.coordMode === 'rel') { arcIsZeroLength = __svgPEq(r.targetPoint, __svgP(0, 0)); }
+        else { arcIsZeroLength = __svgPEq(r.targetPoint, this.currentPoint); }
+    }
+    if (!r.rx || !r.ry || arcIsZeroLength) {
+        if (this.mode === 'normalized') {
+            if (this.coordMode === 'rel') { this.currentPoint = __svgPAdd(this.currentPoint, r.targetPoint); }
+            else { this.currentPoint = r.targetPoint; }
+            this.consumer.lineTo(this.currentPoint, 'abs');
+        } else { this.consumer.lineTo(r.targetPoint, this.coordMode); }
+        return true;
+    }
+    if (this.mode === 'normalized') {
+        var point1 = this.currentPoint;
+        if (this.coordMode === 'rel') { r.targetPoint = __svgPAdd(r.targetPoint, this.currentPoint); }
+        this.currentPoint = r.targetPoint;
+        return this.decomposeArcToCubic(r.angle, r.rx, r.ry, point1, r.targetPoint,
+                                        r.largeArc, r.sweep);
+    }
+    this.consumer.arcTo(r.rx, r.ry, r.angle, r.largeArc, r.sweep, r.targetPoint, this.coordMode);
+    return true;
+};
+
+__svgParser.prototype.decomposeArcToCubic = function (angle, rx, ry, point1, point2,
+                                                      largeArcFlag, sweepFlag) {
+    var midPointDistance = __svgPScale(__svgPSub(point1, point2), 0.5);
+
+    var pointTransform = new __svgAT();
+    pointTransform.rotate(-angle);
+
+    var transformedMidPoint = pointTransform.mapPoint(midPointDistance);
+    var squareRx = __svgf32(rx * rx);
+    var squareRy = __svgf32(ry * ry);
+    var squareX = __svgf32(transformedMidPoint.x * transformedMidPoint.x);
+    var squareY = __svgf32(transformedMidPoint.y * transformedMidPoint.y);
+
+    var radiiScale = __svgf32(__svgf32(squareX / squareRx) + __svgf32(squareY / squareRy));
+    if (radiiScale > 1) {
+        var rs = __svgf32(Math.sqrt(radiiScale));
+        rx = __svgf32(rx * rs);
+        ry = __svgf32(ry * rs);
+    }
+
+    pointTransform.identity();
+    pointTransform.scale(__svgf32(1 / rx), __svgf32(1 / ry));
+    pointTransform.rotate(-angle);
+
+    point1 = pointTransform.mapPoint(point1);
+    point2 = pointTransform.mapPoint(point2);
+    var delta = __svgPSub(point2, point1);
+
+    var d = __svgf32(__svgf32(delta.x * delta.x) + __svgf32(delta.y * delta.y));
+    var scaleFactorSquared = __svgf32(Math.max(__svgf32(__svgf32(1 / d) - 0.25), 0));
+
+    var scaleFactor = __svgf32(Math.sqrt(scaleFactorSquared));
+    if (sweepFlag === largeArcFlag) { scaleFactor = -scaleFactor; }
+
+    delta = __svgPScale(delta, scaleFactor);
+    var centerPoint = __svgPAdd(point1, point2);
+    centerPoint = __svgPScale(centerPoint, 0.5);
+    centerPoint = __svgPMove(centerPoint, -delta.y, delta.x);
+
+    // SVGPathParser::decomposeArcToCubic 用的是 FloatPoint::slopeAngleRadians()
+    // = atan2f，不是双精度 atan2
+    var theta1 = __svgAtan2f(__svgf32(point1.y - centerPoint.y), __svgf32(point1.x - centerPoint.x));
+    var theta2 = __svgAtan2f(__svgf32(point2.y - centerPoint.y), __svgf32(point2.x - centerPoint.x));
+
+    var thetaArc = __svgf32(theta2 - theta1);
+    if (thetaArc < 0 && sweepFlag) { thetaArc = __svgf32(thetaArc + 2 * __svgPiF); }
+    else if (thetaArc > 0 && !sweepFlag) { thetaArc = __svgf32(thetaArc - 2 * __svgPiF); }
+
+    pointTransform.identity();
+    pointTransform.rotate(angle);
+    pointTransform.scale(rx, ry);
+
+    var segments = Math.ceil(__svgf32(Math.abs(__svgf32(thetaArc / __svgf32(__svgPiOverTwoF + 0.001)))));
+    for (var i = 0; i < segments; ++i) {
+        var startTheta = __svgf32(theta1 + __svgf32(i * thetaArc / segments));
+        var endTheta = __svgf32(theta1 + __svgf32((i + 1) * thetaArc / segments));
+
+        var t = __svgf32(__svgf32(8 / 6) * __svgTanf(__svgf32(0.25 * __svgf32(endTheta - startTheta))));
+        if (!isFinite(t)) { return false; }
+        var sinStartTheta = __svgSinf(startTheta);
+        var cosStartTheta = __svgCosf(startTheta);
+        var sinEndTheta = __svgSinf(endTheta);
+        var cosEndTheta = __svgCosf(endTheta);
+
+        point1 = __svgP(__svgf32(cosStartTheta - __svgf32(t * sinStartTheta)),
+                        __svgf32(sinStartTheta + __svgf32(t * cosStartTheta)));
+        point1 = __svgPMove(point1, centerPoint.x, centerPoint.y);
+        var targetPoint = __svgP(cosEndTheta, sinEndTheta);
+        targetPoint = __svgPMove(targetPoint, centerPoint.x, centerPoint.y);
+        point2 = targetPoint;
+        point2 = __svgPMove(point2, __svgf32(t * sinEndTheta), __svgf32(-t * cosEndTheta));
+
+        this.consumer.curveToCubic(pointTransform.mapPoint(point1),
+                                   pointTransform.mapPoint(point2),
+                                   pointTransform.mapPoint(targetPoint), 'abs');
+    }
+    return true;
+};
+
+__svgParser.prototype.parsePathData = function (checkForInitialMoveTo) {
+    if (!this.source.moveToNextToken()) { return true; }
+    var command = this.source.parseSegType();
+    if (command === null) { return false; }
+    if (checkForInitialMoveTo && command !== __svgMabs && command !== __svgMrel) {
+        return false;
+    }
+
+    while (true) {
+        this.source.moveToNextToken();
+        this.coordMode = 'abs';
+        var ok = true;
+        switch (command) {
+            case __svgMrel: this.coordMode = 'rel'; // fallthrough
+            case __svgMabs: ok = this.parseMoveToSegment(); break;
+            case __svgLrel: this.coordMode = 'rel'; // fallthrough
+            case __svgLabs: ok = this.parseLineToSegment(); break;
+            case __svgHrel: this.coordMode = 'rel'; // fallthrough
+            case __svgHabs: ok = this.parseLineToHorizontalSegment(); break;
+            case __svgVrel: this.coordMode = 'rel'; // fallthrough
+            case __svgVabs: ok = this.parseLineToVerticalSegment(); break;
+            case __svgClose: this.parseClosePathSegment(); break;
+            case __svgCrel: this.coordMode = 'rel'; // fallthrough
+            case __svgCabs: ok = this.parseCurveToCubicSegment(); break;
+            case __svgSrel: this.coordMode = 'rel'; // fallthrough
+            case __svgSabs: ok = this.parseCurveToCubicSmoothSegment(); break;
+            case __svgQrel: this.coordMode = 'rel'; // fallthrough
+            case __svgQabs: ok = this.parseCurveToQuadraticSegment(); break;
+            case __svgTrel: this.coordMode = 'rel'; // fallthrough
+            case __svgTabs: ok = this.parseCurveToQuadraticSmoothSegment(); break;
+            case __svgArel: this.coordMode = 'rel'; // fallthrough
+            case __svgAabs: ok = this.parseArcToSegment(); break;
+            default: return false;
+        }
+        if (!ok) { return false; }
+        if (!this.consumer.continueConsuming()) { return true; }
+
+        this.lastCommand = command;
+        if (!this.source.hasMoreData()) { return true; }
+
+        command = this.source.nextCommand(command);
+
+        if (this.lastCommand !== __svgCabs && this.lastCommand !== __svgCrel
+            && this.lastCommand !== __svgSabs && this.lastCommand !== __svgSrel
+            && this.lastCommand !== __svgQabs && this.lastCommand !== __svgQrel
+            && this.lastCommand !== __svgTabs && this.lastCommand !== __svgTrel) {
+            this.controlPoint = this.currentPoint;
+        }
+        this.consumer.incrementPathSegmentCount();
+    }
+};
+
+// ---- 字符串源（唯一带隐式重复的源）----
+function __svgStringSource(d) {
+    this.buf = new __svgBuf(d);
+}
+__svgStringSource.prototype.hasMoreData = function () { return this.buf.rest(); };
+__svgStringSource.prototype.moveToNextToken = function () { return __svgSkipSpaces(this.buf); };
+__svgStringSource.prototype.parseSegType = function () {
+    if (!this.buf.rest()) { return null; }
+    return __svgParseSegType(this.buf);
+};
+__svgStringSource.prototype.nextCommand = function (prev) { return __svgNextCommand(this.buf, prev); };
+__svgStringSource.prototype.readMoveTo = function () { return __svgReadMoveTo(this.buf); };
+__svgStringSource.prototype.readLineTo = function () { return __svgReadLineTo(this.buf); };
+__svgStringSource.prototype.readHoriz = function () { return __svgReadHoriz(this.buf); };
+__svgStringSource.prototype.readVert = function () { return __svgReadVert(this.buf); };
+__svgStringSource.prototype.readCubic = function () { return __svgReadCubic(this.buf); };
+__svgStringSource.prototype.readCubicSmooth = function () { return __svgReadCubicSmooth(this.buf); };
+__svgStringSource.prototype.readQuad = function () { return __svgReadQuad(this.buf); };
+__svgStringSource.prototype.readQuadSmooth = function () { return __svgReadQuadSmooth(this.buf); };
+__svgStringSource.prototype.readArc = function () { return __svgReadArc(this.buf); };
+// ---- 遍历状态（PathTraversalState）----
+function __svgQuadBez(s, c, e) { this.start = s; this.control = c; this.end = e; }
+__svgQuadBez.prototype.approxDist = function () {
+    return __svgf32(__svgDistLine(this.start, this.control) + __svgDistLine(this.control, this.end));
+};
+__svgQuadBez.prototype.split = function (left, right) {
+    left.control = __svgMid(this.start, this.control);
+    right.control = __svgMid(this.control, this.end);
+    var mid = __svgMid(left.control, right.control);
+    left.end = mid;
+    right.start = mid;
+    left.start = this.start;
+    right.end = this.end;
+    return !__svgQEq(left, this) && !__svgQEq(right, this);
+};
+function __svgQEq(a, b) {
+    return __svgPEq(a.start, b.start) && __svgPEq(a.control, b.control) && __svgPEq(a.end, b.end);
+}
+
+function __svgCubicBez(s, c1, c2, e) {
+    this.start = s; this.control1 = c1; this.control2 = c2; this.end = e;
+}
+__svgCubicBez.prototype.approxDist = function () {
+    return __svgf32(__svgf32(__svgDistLine(this.start, this.control1)
+                             + __svgDistLine(this.control1, this.control2))
+                    + __svgDistLine(this.control2, this.end));
+};
+__svgCubicBez.prototype.split = function (left, right) {
+    var sToC1 = __svgMid(this.control1, this.control2);
+    left.start = this.start;
+    left.control1 = __svgMid(this.start, this.control1);
+    left.control2 = __svgMid(left.control1, sToC1);
+    right.control2 = __svgMid(this.control2, this.end);
+    right.control1 = __svgMid(right.control2, sToC1);
+    right.end = this.end;
+    var lc2ToRc1 = __svgMid(left.control2, right.control1);
+    left.end = lc2ToRc1;
+    right.start = lc2ToRc1;
+    return !__svgCEq(left, this) && !__svgCEq(right, this);
+};
+function __svgCEq(a, b) {
+    return __svgPEq(a.start, b.start) && __svgPEq(a.control1, b.control1)
+        && __svgPEq(a.control2, b.control2) && __svgPEq(a.end, b.end);
+}
+
+function __svgCurveLength(state, originalCurve, holder) {
+    var depthLimit = 20;
+    var curve = originalCurve;
+    var stack = [];
+    var totalLength = 0;
+
+    while (true) {
+        var length = curve.approxDist();
+        var left, right;
+        if (__svgf32(length - __svgDistLine(curve.start, curve.end)) > __svgTol
+            && stack.length < depthLimit
+            && curve.split(left = new curve.constructor(), right = new curve.constructor())) {
+            curve = left;
+            stack.push(right);
+            continue;
+        }
+        totalLength = __svgf32(totalLength + length);
+        if (state.action === 'vector') {
+            holder.previous = curve.start;
+            holder.current = curve.end;
+            if (__svgf32(state.totalLength + totalLength) > state.desiredLength) { break; }
+        }
+        if (stack.length === 0) { break; }
+        curve = stack.pop();
+    }
+
+    if (state.action !== 'vector') {
+        holder.previous = curve.start;
+        holder.current = curve.end;
+    }
+    return totalLength;
+}
+
+function __svgTraversalState(action, desiredLength) {
+    this.action = action;            // 'total' | 'vector' | 'segment'
+    this.success = false;
+    this.current = __svgP(0, 0);
+    this.start = __svgP(0, 0);
+    this.totalLength = 0;
+    this.desiredLength = __svgf32(desiredLength === undefined ? 0 : desiredLength);
+    this.previous = __svgP(0, 0);
+    this.normalAngle = 0;
+    this.isZeroVector = false;
+}
+__svgTraversalState.prototype.closeSubpath = function () {
+    this.totalLength = __svgf32(this.totalLength + __svgDistLine(this.current, this.start));
+    this.current = this.start;
+};
+__svgTraversalState.prototype.moveTo = function (p) {
+    this.previous = this.current = this.start = p;
+};
+__svgTraversalState.prototype.lineTo = function (p) {
+    this.totalLength = __svgf32(this.totalLength + __svgDistLine(this.current, p));
+    this.current = p;
+};
+__svgTraversalState.prototype.quadTo = function (newControl, newEnd) {
+    var holder = { previous: this.previous, current: this.current };
+    this.totalLength = __svgf32(this.totalLength + __svgCurveLength(this,
+        new __svgQuadBez(this.current, newControl, newEnd), holder));
+    this.previous = holder.previous;
+    this.current = holder.current;
+};
+__svgTraversalState.prototype.cubicTo = function (c1, c2, newEnd) {
+    var holder = { previous: this.previous, current: this.current };
+    this.totalLength = __svgf32(this.totalLength + __svgCurveLength(this,
+        new __svgCubicBez(this.current, c1, c2, newEnd), holder));
+    this.previous = holder.previous;
+    this.current = holder.current;
+};
+__svgTraversalState.prototype.finalize = function () {
+    if (this.action === 'total') { return false; }
+    if (this.action === 'segment') {
+        if (this.totalLength >= this.desiredLength) { this.success = true; }
+        return this.success;
+    }
+    if (this.totalLength >= this.desiredLength) {
+        // PathTraversalState::finalizeAppendPathElement 用 float 版 libm：
+        //   slope = FloatPoint(m_current - m_previous).slopeAngleRadians()  // atan2f
+        //   m_current.move(offset * cosf(slope), offset * sinf(slope))
+        var slope = __svgSlopeAngle(__svgPSub(this.current, this.previous));
+        var offset = __svgf32(this.desiredLength - this.totalLength);
+        this.current = __svgPMove(this.current, __svgf32(offset * __svgCosf(slope)),
+                                  __svgf32(offset * __svgSinf(slope)));
+        if (!this.isZeroVector && !this.desiredLength) { this.isZeroVector = true; }
+        else {
+            this.success = true;
+            // rad2deg：float 版 (slope * 180/pi)
+            this.normalAngle = __svgf32(__svgf32(slope) * __svgf32(180 / __svgPiF));
+        }
+    }
+    this.previous = this.current;
+    return this.success;
+};
+__svgTraversalState.prototype.appendElement = function (type, points) {
+    switch (type) {
+        case 'move': this.moveTo(points[0]); break;
+        case 'line': this.lineTo(points[0]); break;
+        case 'quad': this.quadTo(points[0], points[1]); break;
+        case 'cubic': this.cubicTo(points[0], points[1], points[2]); break;
+        case 'close': this.closeSubpath(); break;
+    }
+    return this.finalize();
+};
+__svgTraversalState.prototype.processElement = function (type, points) {
+    if (this.success) { return true; }
+    if (this.isZeroVector) {
+        var copy = new __svgTraversalState(this.action, this.desiredLength);
+        copy.success = this.success;
+        copy.current = this.current;
+        copy.start = this.start;
+        copy.totalLength = this.totalLength;
+        copy.previous = this.previous;
+        copy.normalAngle = this.normalAngle;
+        copy.isZeroVector = this.isZeroVector;
+        this.success = copy.appendElement(type, points);
+        this.normalAngle = copy.normalAngle;
+        return this.success;
+    }
+    return this.appendElement(type, points);
+};
+
+function __svgTraversalBuilder(state, desiredLength) {
+    this.state = state;
+    this.state.desiredLength = __svgf32(desiredLength === undefined ? 0 : desiredLength);
+    this.segmentIndex = 0;
+}
+__svgTraversalBuilder.prototype.moveTo = function (p) { this.state.processElement('move', [p]); };
+__svgTraversalBuilder.prototype.lineTo = function (p) { this.state.processElement('line', [p]); };
+__svgTraversalBuilder.prototype.curveToCubic = function (p1, p2, p3) {
+    this.state.processElement('cubic', [p1, p2, p3]);
+};
+__svgTraversalBuilder.prototype.closePath = function () { this.state.processElement('close', null); };
+__svgTraversalBuilder.prototype.continueConsuming = function () { return !this.state.success; };
+__svgTraversalBuilder.prototype.incrementPathSegmentCount = function () { this.segmentIndex++; };
+// 归一化模式下不会走到这些（ASSERT_NOT_REACHED）
+__svgTraversalBuilder.prototype.lineToHorizontal = function () {};
+__svgTraversalBuilder.prototype.lineToVertical = function () {};
+__svgTraversalBuilder.prototype.curveToCubicSmooth = function () {};
+__svgTraversalBuilder.prototype.curveToQuadratic = function () {};
+__svgTraversalBuilder.prototype.curveToQuadraticSmooth = function () {};
+__svgTraversalBuilder.prototype.arcTo = function () {};
+
+// ---- 字节流源：nextCommand 忽略参数，不做隐式重复 ----
+function __svgByteSource(stream) {
+    this.stream = stream;   // { types: [], pts: [] } —— 见下方 builder
+    this.pos = 0;
+}
+__svgByteSource.prototype.hasMoreData = function () { return this.pos < this.stream.n; };
+__svgByteSource.prototype.moveToNextToken = function () { return true; };
+// 读类型这一步本身就消耗一个槽位：SVGPathByteStreamSource 的
+// parseSVGSegmentType()/nextCommand() 都走 readSVGSegmentType()，游标会前进。
+// Z 段没有参数读调用，全靠这里前进，否则会原地死循环。
+__svgByteSource.prototype.parseSegType = function () {
+    if (this.pos >= this.stream.n) { return null; }
+    var t = this.stream.types[this.pos];
+    this.pos++;
+    return t;
+};
+__svgByteSource.prototype.nextCommand = function () {
+    // 只读下一个段类型，不参考 prev
+    return this.parseSegType();
+};
+// read* 读的是刚才被类型读取推进过去的那一格，自己不再前进。
+// 流里每一段是一串扁平 float（就是字节流里的字段顺序），这里还原成点对象。
+__svgByteSource.prototype.readMoveTo = function () {
+    var v = this.stream.pts[this.pos - 1];
+    return { targetPoint: __svgP(v[0], v[1]) };
+};
+__svgByteSource.prototype.readLineTo = function () {
+    var v = this.stream.pts[this.pos - 1];
+    return { targetPoint: __svgP(v[0], v[1]) };
+};
+__svgByteSource.prototype.readHoriz = function () {
+    return { x: this.stream.pts[this.pos - 1][0] };
+};
+__svgByteSource.prototype.readVert = function () {
+    return { y: this.stream.pts[this.pos - 1][0] };
+};
+__svgByteSource.prototype.readCubic = function () {
+    var v = this.stream.pts[this.pos - 1];
+    return { point1: __svgP(v[0], v[1]), point2: __svgP(v[2], v[3]),
+             targetPoint: __svgP(v[4], v[5]) };
+};
+__svgByteSource.prototype.readCubicSmooth = function () {
+    var v = this.stream.pts[this.pos - 1];
+    return { point2: __svgP(v[0], v[1]), targetPoint: __svgP(v[2], v[3]) };
+};
+__svgByteSource.prototype.readQuad = function () {
+    var v = this.stream.pts[this.pos - 1];
+    return { point1: __svgP(v[0], v[1]), targetPoint: __svgP(v[2], v[3]) };
+};
+__svgByteSource.prototype.readQuadSmooth = function () {
+    var v = this.stream.pts[this.pos - 1];
+    return { targetPoint: __svgP(v[0], v[1]) };
+};
+__svgByteSource.prototype.readArc = function () {
+    var v = this.stream.pts[this.pos - 1];
+    return { rx: v[0], ry: v[1], angle: v[2], largeArc: v[3], sweep: v[4],
+             targetPoint: __svgP(v[5], v[6]) };
+};
+
+// ---- 几何计算：total / pointAtLength / segAtLength ----
+function __svgGeom(stream, action, desiredLength) {
+    if (!stream || !stream.n) {
+        return { empty: true, total: 0, point: __svgP(0, 0), index: 0 };
+    }
+    var state = new __svgTraversalState(action, desiredLength);
+    var builder = new __svgTraversalBuilder(state, desiredLength);
+    var parser = new __svgParser(builder, new __svgByteSource(stream), 'normalized');
+    parser.parsePathData(true);
+    return { empty: false, total: builder.state.totalLength,
+             point: builder.state.current, index: builder.segmentIndex,
+             state: state };
+}
+// ---- DOM 面：SVGPathElement / SVGPathSeg* / SVGPathSegList ----
+// 数据模型：每个 <path> 持有一条「未归一化」段流（源顺序、相对/绝对、H/V/A/Q/T
+// 全部保留），段对象按需物化并缓存。任何一次提交（改坐标或任一 mutator）
+// 都把段重建回流、序列化，再回写 d；序列化结果为空时按 WebKit 的
+// null AtomString 语义**移除**属性（不是置空串）。
+
+// FormattedNumber::fixedPrecision —— toPrecision(6)，去掉尾数里的尾随零。
+// 实测：1e6 → "1e+6"、1234567 → "1.23457e+6"、1/3 → "0.333333"、
+// 123456.7 → "123457"、5e-324 → "0"、1e-45 → "1.4013e-45"。
+function __svgFmt(n) {
+    if (n !== n) { return 'NaN'; }
+    if (n === Infinity) { return 'Infinity'; }
+    if (n === -Infinity) { return '-Infinity'; }
+    if (n === 0) { return '0'; }
+    var s = __svgf32(n).toPrecision(6);
+    var e = s.indexOf('e');
+    var mant = e < 0 ? s : s.slice(0, e);
+    if (mant.indexOf('.') >= 0) {
+        mant = mant.replace(/0+$/, '').replace(/\.$/, '');
+    }
+    if (e < 0) { return mant; }
+    var ex = s.slice(e + 1).replace(/^\+/, '');
+    if (ex.charAt(0) !== '-') { ex = '+' + ex; }
+    return mant + 'e' + ex;
+}
+
+// 段流的一格 → 属性数组。顺序与 SVGPathSegValue 的 tuple 一致（目标点在前）。
+var __svgSegFields = [
+    [], [],
+    ['x', 'y'], ['x', 'y'], ['x', 'y'], ['x', 'y'],
+    ['x', 'y', 'x1', 'y1', 'x2', 'y2'], ['x', 'y', 'x1', 'y1', 'x2', 'y2'],
+    ['x', 'y', 'x1', 'y1'], ['x', 'y', 'x1', 'y1'],
+    ['x', 'y', 'r1', 'r2', 'angle', 'largeArcFlag', 'sweepFlag'],
+    ['x', 'y', 'r1', 'r2', 'angle', 'largeArcFlag', 'sweepFlag'],
+    ['x'], ['x'], ['y'], ['y'],
+    ['x', 'y', 'x2', 'y2'], ['x', 'y', 'x2', 'y2'],
+    ['x', 'y'], ['x', 'y'],
+];
+
+// ---- 段流 <-> 字符串 ----
+// 段流形状 {types: [], pts: [[]], n} 与 __svgGeom 吃的字节流同构。
+function __svgStreamToD(stream) {
+    if (!stream || !stream.n) { return ''; }
+    var out = [];
+    for (var i = 0; i < stream.n; i++) {
+        var t = stream.types[i], a = stream.pts[i];
+        var letter = __svgLetters[t];
+        if (!letter) { return ''; }
+        out.push(letter + ' ');
+        var isArc = (t === __svgAabs || t === __svgArel);
+        var n = a.length;
+        for (var j = 0; j < n; j++) {
+            if (isArc && j >= 3 && j < 5) {
+                out.push(a[j] ? '1' : '0');
+            } else {
+                out.push(__svgFmt(a[j]));
+            }
+            out.push(' ');
+        }
+    }
+    var s = out.join('');
+    // SVGPathStringBuilder::result() 砍掉最后一个字符（尾随空格）
+    return s.slice(0, s.length - 1);
+}
+
+// d 字符串 → 未归一化段流。解析失败只保留成功解析的前缀（实测：
+// 'M 0 0 L 1 0 L 2 0 X 9' → 3 段；'L 5 5' → 0 段）。
+function __svgDToStream(d) {
+    var stream = { types: [], pts: [], n: 0 };
+    if (typeof d !== 'string' || !d) { return stream; }
+    var rel = function (mode) { return mode === 'rel'; };
+    var builder = {
+        moveTo: function (p, closed, mode) {
+            stream.types.push(rel(mode) ? 3 : 2); stream.pts.push([p.x, p.y]);
+        },
+        lineTo: function (p, mode) {
+            stream.types.push(rel(mode) ? 5 : 4); stream.pts.push([p.x, p.y]);
+        },
+        lineToHorizontal: function (x, mode) {
+            stream.types.push(rel(mode) ? 13 : 12); stream.pts.push([x]);
+        },
+        lineToVertical: function (y, mode) {
+            stream.types.push(rel(mode) ? 15 : 14); stream.pts.push([y]);
+        },
+        curveToCubic: function (p1, p2, p3, mode) {
+            stream.types.push(rel(mode) ? 7 : 6);
+            stream.pts.push([p1.x, p1.y, p2.x, p2.y, p3.x, p3.y]);
+        },
+        curveToCubicSmooth: function (p2, p3, mode) {
+            stream.types.push(rel(mode) ? 17 : 16);
+            stream.pts.push([p2.x, p2.y, p3.x, p3.y]);
+        },
+        curveToQuadratic: function (p1, p3, mode) {
+            stream.types.push(rel(mode) ? 9 : 8);
+            stream.pts.push([p1.x, p1.y, p3.x, p3.y]);
+        },
+        curveToQuadraticSmooth: function (p3, mode) {
+            stream.types.push(rel(mode) ? 19 : 18);
+            stream.pts.push([p3.x, p3.y]);
+        },
+        arcTo: function (r1, r2, ang, laf, sf, p, mode) {
+            stream.types.push(rel(mode) ? 11 : 10);
+            stream.pts.push([r1, r2, ang, laf ? 1 : 0, sf ? 1 : 0, p.x, p.y]);
+        },
+        closePath: function () { stream.types.push(1); stream.pts.push([]); },
+        continueConsuming: function () { return true; },
+        incrementPathSegmentCount: function () {},
+    };
+    var parser = new __svgParser(builder, new __svgStringSource(d), 'unaltered');
+    parser.parsePathData(true);
+    stream.n = stream.types.length;
+    return stream;
+}
+
+function __svgStreamClone(stream) {
+    var out = { types: [], pts: [], n: 0 };
+    for (var i = 0; i < stream.n; i++) {
+        out.types.push(stream.types[i]);
+        out.pts.push(stream.pts[i].slice());
+    }
+    out.n = out.types.length;
+    return out;
+}
+// ---------------------------------------------------------------------------
+// part4b：DOM 层
+//   SVGPathSeg / 19 个子类 / SVGPathSegList / SVGPathElement 的路径面
+//
+// 只依赖前四部分的纯计算；元素只通过 getAttribute / setAttribute /
+// removeAttribute 交互，所以同一份实现既装得进注入器，也能在 node 沙箱里
+// 用 mock 元素跑。
+//
+// 模型对齐 WebKit 的 SVGPathSegList.h：
+//   m_pathByteStream  字节流（unaltered，源码字母原样）
+//   m_items           段对象；「已触碰」⇔ 非空
+//   m_path            缓存路径，只作失效标记
+//   ensureItems()     字节流为空就什么都不做 —— 空路径永远「未触碰」
+//   itemsWillChange() 丢字节流 + 丢 path，保留 items
+//   parse()           pathByteStreamWillChange() + 解析字符串
+//
+// SVGPoint / SVGMatrix 不重建：Blink 的形状与数值和 WebKit 一致（已逐描述符
+// 核对），重建反而会切断 getScreenCTM() 等原生返回值与本实现的互操作。
+// 只把三个原型的自有键顺序改成 WebKit 的顺序。
+// ---------------------------------------------------------------------------
+
+// ---- (A) 通用小工具 ----
+
+function __svgDomErr(name, msg) {
+    var e = null;
+    if (typeof DOMException === 'function') {
+        try { e = new DOMException(msg, name); } catch (x) { e = null; }
+    }
+    if (!e) { e = new Error(msg); }
+    try { e.name = name; } catch (x) {}
+    return e;
+}
+
+function __svgTypeErr(msg) { return new TypeError(msg); }
+
+// WebIDL unsigned long → ToUint32
+function __svgToULong(v) { return Number(v) >>> 0; }
+
+// WebIDL restricted float：非有限值一律 TypeError
+function __svgToFloat(v) {
+    var n = Number(v);
+    if (!isFinite(n)) { throw __svgTypeErr('The provided value is non-finite'); }
+    return __svgf32(n);
+}
+
+// WebIDL unrestricted float：允许 NaN / Infinity
+function __svgToUnrestrictedFloat(v) { return __svgf32(Number(v)); }
+
+function __svgNeedArgs(n, got) {
+    if (got < n) { throw __svgTypeErr('Not enough arguments'); }
+}
+
+function __svgBrandErr(iface, member, kind) {
+    if (kind === 'get') {
+        return __svgTypeErr('The ' + iface + '.' + member
+            + ' getter can only be used on instances of ' + iface);
+    }
+    if (kind === 'set') {
+        return __svgTypeErr('The ' + iface + '.' + member
+            + ' setter can only be used on instances of ' + iface);
+    }
+    return __svgTypeErr('Can only call ' + iface + '.' + member
+        + ' on instances of ' + iface);
+}
+
+// 规范索引键（数组索引）；非规范键返回 -1
+function __svgIndexKey(k) {
+    if (typeof k !== 'string' || k === '') { return -1; }
+    var n = Number(k);
+    if (n === 4294967295) { return -1; }
+    if (String(n >>> 0) !== k) { return -1; }
+    return n;
+}
+
+// ---- (B) 段对象模型 ----
+
+var __svgSegState = new WeakMap();     // seg -> { t, a, o, access }
+var __svgListStateMap = new WeakMap(); // proxy -> state
+var __svgSeenD = Object.create(null);  // d 字符串 → 解析过的字节流（PathCache 近似）
+
+var __svgSegClassNames = [
+    '', 'SVGPathSegClosePath',
+    'SVGPathSegMovetoAbs', 'SVGPathSegMovetoRel',
+    'SVGPathSegLinetoAbs', 'SVGPathSegLinetoRel',
+    'SVGPathSegCurvetoCubicAbs', 'SVGPathSegCurvetoCubicRel',
+    'SVGPathSegCurvetoQuadraticAbs', 'SVGPathSegCurvetoQuadraticRel',
+    'SVGPathSegArcAbs', 'SVGPathSegArcRel',
+    'SVGPathSegLinetoHorizontalAbs', 'SVGPathSegLinetoHorizontalRel',
+    'SVGPathSegLinetoVerticalAbs', 'SVGPathSegLinetoVerticalRel',
+    'SVGPathSegCurvetoCubicSmoothAbs', 'SVGPathSegCurvetoCubicSmoothRel',
+    'SVGPathSegCurvetoQuadraticSmoothAbs', 'SVGPathSegCurvetoQuadraticSmoothRel'
+];
+
+// 每个类型的字段在字节流里的顺序（指向 __svgSegFields 的下标）
+var __svgStreamIdx = [
+    [], [],
+    [0, 1], [0, 1],
+    [0, 1], [0, 1],
+    [2, 3, 4, 5, 0, 1], [2, 3, 4, 5, 0, 1],
+    [2, 3, 0, 1], [2, 3, 0, 1],
+    [2, 3, 4, 5, 6, 0, 1], [2, 3, 4, 5, 6, 0, 1],
+    [0], [0],
+    [0], [0],
+    [2, 3, 0, 1], [2, 3, 0, 1],
+    [0, 1], [0, 1]
+];
+
+function __svgIsArcFlagField(t, name) {
+    return (t === __svgAabs || t === __svgArel)
+        && (name === 'largeArcFlag' || name === 'sweepFlag');
+}
+
+function __svgCloneSeg(seg) {
+    var s = __svgSegState.get(seg);
+    var c = Object.create(Object.getPrototypeOf(seg));
+    __svgSegState.set(c, { t: s.t, a: s.a.slice(), o: null, access: 'rw' });
+    return c;
+}
+
+// ---- (C) 列表状态 ----
+
+function __svgListStateNew(el, access) {
+    return {
+        el: el,
+        access: access,        // 'rw' | 'ro'
+        stream: null,          // {types,pts,n} 或 null（空）
+        items: [],
+        path: null,
+        d: undefined,          // 上次读到的 d（undefined 强制首次同步）
+        anim: null,            // 关联的 animated 列表状态
+        base: null,            // 只读列表指向的基础列表状态
+        proxy: null
+    };
+}
+
+function __svgElGetD(el) {
+    var v = null;
+    try { v = el.getAttribute('d'); } catch (e) { v = null; }
+    return (v === null || v === undefined) ? '' : String(v);
+}
+
+function __svgSync(st) {
+    if (!st.el) { return; }
+    var cur = __svgElGetD(st.el);
+    if (cur === st.d) { return; }
+    st.d = cur;
+    st.path = null;
+    if (!cur) {
+        st.items = [];
+        st.stream = null;
+        return;
+    }
+    var seen = __svgSeenD[cur];
+    if (seen) {
+        // PathCache 命中：只换字节流，条目原样保留
+        st.stream = (seen === 1) ? __svgDToStream(cur) : seen;
+        return;
+    }
+    st.items = [];
+    st.stream = __svgDToStream(cur);
+    __svgSeenD[cur] = (st.stream.n ? st.stream : 1);
+}
+
+function __svgEnsureItems(st) {
+    __svgSync(st);
+    if (st.items.length || !st.stream || !st.stream.n) { return; }
+    var out = [];
+    for (var i = 0; i < st.stream.n; i++) {
+        var t = st.stream.types[i];
+        var pts = st.stream.pts[i];
+        var idx = __svgStreamIdx[t];
+        var a = [];
+        for (var j = 0; j < idx.length; j++) {
+            var v = pts[j];
+            var f = __svgSegFields[t][idx[j]];
+            if (__svgIsArcFlagField(t, f)) { v = !!v; }
+            a[idx[j]] = v;
+        }
+        var seg = Object.create(__svgSegProto[t]);
+        __svgSegState.set(seg, { t: t, a: a, o: st, access: st.access });
+        out.push(seg);
+    }
+    st.items = out;
+}
+
+function __svgEnsureStream(st) {
+    __svgSync(st);
+    if ((st.stream && st.stream.n) || !st.items.length) { return; }
+    st.stream = __svgStreamFromItems(st.items);
+}
+
+function __svgStreamFromItems(items) {
+    var out = { types: [], pts: [], n: 0 };
+    for (var i = 0; i < items.length; i++) {
+        var s = __svgSegState.get(items[i]);
+        var idx = __svgStreamIdx[s.t];
+        var pts = [];
+        for (var j = 0; j < idx.length; j++) {
+            var v = s.a[idx[j]];
+            pts.push(v === true ? 1 : (v === false ? 0 : v));
+        }
+        out.types.push(s.t);
+        out.pts.push(pts);
+    }
+    out.n = out.types.length;
+    return out;
+}
+
+// pathByteStream() 的等价物
+function __svgPathStream(st) {
+    __svgSync(st);
+    __svgEnsureStream(st);
+    return st.stream;
+}
+
+function __svgDetachAll(st) {
+    for (var i = 0; i < st.items.length; i++) {
+        var s = __svgSegState.get(st.items[i]);
+        if (s) { s.o = null; }
+    }
+}
+
+// 把 item 挂到列表上；已挂在任何列表上则先克隆
+function __svgAdopt(st, item) {
+    var s = __svgSegState.get(item);
+    if (s.o) { item = __svgCloneSeg(item); s = __svgSegState.get(item); }
+    s.o = st;
+    s.access = st.access;
+    return item;
+}
+
+// 提交：items → 字节流 → d，并刷新 animated 列表
+function __svgCommit(st) {
+    st.path = null;
+    st.stream = __svgStreamFromItems(st.items);
+    var d = __svgStreamToD(st.stream);
+    var lead = st.items.length ? __svgSegState.get(st.items[0]).t : 0;
+    if (!d || (lead !== __svgMabs && lead !== __svgMrel)) {
+        st.d = '';
+        try { st.el.removeAttribute('d'); } catch (e) {}
+    } else {
+        st.d = d;
+        __svgSeenD[d] = st.stream;
+        try { st.el.setAttribute('d', d); } catch (e) {}
+    }
+    if (st.anim) {
+        // SVGAnimatedPropertyList::commitPropertyChange：*m_animVal = m_baseVal
+        st.anim.stream = __svgStreamClone(st.stream);
+        st.anim.items = [];
+        st.anim.path = null;
+    }
+}
+
+// 段属性被改后由段对象回调
+function __svgSegCommit(st) {
+    if (st.access !== 'rw') {
+        // 只读列表上的写入被 *m_animVal = m_baseVal 覆盖掉
+        if (st.base) {
+            st.stream = st.base.stream ? __svgStreamClone(st.base.stream) : null;
+            st.items = [];
+        }
+        return;
+    }
+    __svgCommit(st);
+}
+
+// ---- (D) 列表操作 ----
+
+function __svgCanAlter(st) {
+    if (st.access !== 'rw') {
+        throw __svgDomErr('NoModificationAllowedError', 'The object can not be modified.');
+    }
+}
+
+function __svgRangeCheck(st, i) {
+    if (i >= st.items.length) {
+        throw __svgDomErr('IndexSizeError', 'The index is not in the allowed range.');
+    }
+}
+
+function __svgListClear(st) {
+    __svgCanAlter(st);
+    __svgDetachAll(st);
+    st.items = [];
+    __svgCommit(st);
+    return undefined;
+}
+
+function __svgListInitialize(st, item) {
+    __svgCanAlter(st);
+    __svgDetachAll(st);
+    st.items = [];
+    st.stream = null;
+    st.path = null;
+    var adopted = __svgAdopt(st, item);
+    st.items = [adopted];
+    __svgCommit(st);
+    return adopted;
+}
+
+function __svgListGetItem(st, index) {
+    __svgEnsureItems(st);
+    var i = __svgToULong(index);
+    __svgRangeCheck(st, i);
+    return st.items[i];
+}
+
+function __svgListInsertBefore(st, item, index) {
+    __svgCanAlter(st);
+    __svgEnsureItems(st);
+    var i = __svgToULong(index);
+    if (i > st.items.length) { i = st.items.length; }
+    st.stream = null;
+    st.path = null;
+    var adopted = __svgAdopt(st, item);
+    st.items.splice(i, 0, adopted);
+    __svgCommit(st);
+    return adopted;
+}
+
+function __svgListReplaceItem(st, item, index) {
+    __svgCanAlter(st);
+    __svgEnsureItems(st);
+    var i = __svgToULong(index);
+    __svgRangeCheck(st, i);
+    st.stream = null;
+    st.path = null;
+    var old = st.items[i];
+    var os = __svgSegState.get(old);
+    if (os) { os.o = null; }
+    var adopted = __svgAdopt(st, item);
+    st.items[i] = adopted;
+    __svgCommit(st);
+    return adopted;
+}
+
+function __svgListRemoveItem(st, index) {
+    __svgCanAlter(st);
+    __svgEnsureItems(st);
+    var i = __svgToULong(index);
+    __svgRangeCheck(st, i);
+    st.stream = null;
+    st.path = null;
+    var old = st.items[i];
+    var os = __svgSegState.get(old);
+    if (os) { os.o = null; }
+    st.items.splice(i, 1);
+    __svgCommit(st);
+    return old;
+}
+
+function __svgListAppendItem(st, item) {
+    __svgCanAlter(st);
+    __svgEnsureItems(st);
+    st.path = null;
+    var adopted = __svgAdopt(st, item);
+    st.items.push(adopted);
+    __svgCommit(st);
+    return adopted;
+}
+
+// 列表自身的原型对象与构造器在 __svgBuildSurface 里创建
+var __svgSegProto = [];
+var __svgSurface = null;
+
+// ---- (E) 表面构造 ----
+
+function __svgBuildSurface(mask) {
+    mask = mask || function (f) { return f; };
+
+    // getPointAtLength 的落点由宿主注入（注入器里换成原生 SVGPoint）
+    var newPoint = function (x, y) { return { x: x, y: y }; };
+
+    function defineValue(obj, name, value, w, e, c) {
+        Object.defineProperty(obj, name, {
+            value: value,
+            writable: !!w,
+            enumerable: !!e,
+            configurable: !!c
+        });
+    }
+
+    function defineAccessor(obj, name, getter, setter, e, c) {
+        var d = { enumerable: e !== false, configurable: c !== false };
+        if (getter) { d.get = getter; }
+        if (setter) { d.set = setter; }
+        Object.defineProperty(obj, name, d);
+    }
+
+    function makeIllegalCtor(name) {
+        // 严格模式函数没有自有的 arguments/caller，与 JSC 的接口对象一致
+        var C = mask(function () {
+            'use strict';
+            throw __svgTypeErr('Illegal constructor');
+        }, name, null, true);
+        try {
+            Object.defineProperty(C, 'name', { value: name, configurable: true });
+        } catch (e) {}
+        try { Object.defineProperty(C, 'length', { value: 0, configurable: true }); } catch (e) {}
+        return C;
+    }
+
+    function sealProto(C, proto) {
+        Object.defineProperty(C, 'prototype', {
+            value: proto, writable: false, enumerable: false, configurable: false
+        });
+    }
+
+    // ================= SVGPathSeg 基类 =================
+
+    var segProtoBase = {};
+    var BaseCtor = makeIllegalCtor('SVGPathSeg');
+    sealProto(BaseCtor, segProtoBase);
+    defineValue(segProtoBase, 'constructor', BaseCtor, true, false, true);
+
+    defineAccessor(segProtoBase, 'pathSegType', mask(function () {
+        var st = __svgSegState.get(this);
+        if (!st) { throw __svgBrandErr('SVGPathSeg', 'pathSegType', 'get'); }
+        return st.t;
+    }, 'get pathSegType'), null, true, true);
+
+    defineAccessor(segProtoBase, 'pathSegTypeAsLetter', mask(function () {
+        var st = __svgSegState.get(this);
+        if (!st) { throw __svgBrandErr('SVGPathSeg', 'pathSegTypeAsLetter', 'get'); }
+        return __svgLetters[st.t];
+    }, 'get pathSegTypeAsLetter'), null, true, true);
+
+    var segConstNames = ['UNKNOWN', 'CLOSEPATH', 'MOVETO_ABS', 'MOVETO_REL',
+        'LINETO_ABS', 'LINETO_REL', 'CURVETO_CUBIC_ABS', 'CURVETO_CUBIC_REL',
+        'CURVETO_QUADRATIC_ABS', 'CURVETO_QUADRATIC_REL', 'ARC_ABS', 'ARC_REL',
+        'LINETO_HORIZONTAL_ABS', 'LINETO_HORIZONTAL_REL',
+        'LINETO_VERTICAL_ABS', 'LINETO_VERTICAL_REL',
+        'CURVETO_CUBIC_SMOOTH_ABS', 'CURVETO_CUBIC_SMOOTH_REL',
+        'CURVETO_QUADRATIC_SMOOTH_ABS', 'CURVETO_QUADRATIC_SMOOTH_REL'];
+    for (var ci = 0; ci < segConstNames.length; ci++) {
+        var cn = 'PATHSEG_' + segConstNames[ci];
+        defineValue(BaseCtor, cn, ci, false, true, false);
+        defineValue(segProtoBase, cn, ci, false, true, false);
+    }
+
+    defineValue(segProtoBase, Symbol.toStringTag, 'SVGPathSeg', false, false, true);
+
+    __svgSegProto[0] = segProtoBase;
+    var segCtors = [BaseCtor];
+
+    for (var ti = 1; ti <= 19; ti++) {
+        (function (t) {
+            var protoName = __svgSegClassNames[t];
+            var proto = {};
+            var C = makeIllegalCtor(protoName);
+            sealProto(C, proto);
+            defineValue(proto, 'constructor', C, true, false, true);
+
+            var fields = __svgSegFields[t];
+            for (var fi = 0; fi < fields.length; fi++) {
+                (function (field, idx) {
+                    var isFlag = __svgIsArcFlagField(t, field);
+                    var getter = mask(function () {
+                        var st = __svgSegState.get(this);
+                        if (!st || st.t !== t) {
+                            throw __svgBrandErr(protoName, field, 'get');
+                        }
+                        var v = st.a[idx];
+                        return isFlag ? !!v : v;
+                    }, 'get ' + field);
+                    var setter = mask(function (v) {
+                        var st = __svgSegState.get(this);
+                        if (!st || st.t !== t) {
+                            throw __svgBrandErr(protoName, field, 'set');
+                        }
+                        st.a[idx] = isFlag ? !!v : __svgToUnrestrictedFloat(v);
+                        if (st.o) { __svgSegCommit(st.o); }
+                    }, 'set ' + field);
+                    defineAccessor(proto, field, getter, setter, true, true);
+                })(fields[fi], fi);
+            }
+
+            defineValue(proto, Symbol.toStringTag, protoName, false, false, true);
+            Object.setPrototypeOf(proto, segProtoBase);
+            // WebIDL：派生接口对象的 [[Prototype]] 是父接口对象
+            Object.setPrototypeOf(C, BaseCtor);
+            __svgSegProto[t] = proto;
+            segCtors[t] = C;
+        })(ti);
+    }
+
+    // ================= SVGPathSegList =================
+
+    var listProto = {};
+    var ListCtor = makeIllegalCtor('SVGPathSegList');
+    sealProto(ListCtor, listProto);
+    defineValue(listProto, 'constructor', ListCtor, true, false, true);
+
+    defineAccessor(listProto, 'length', mask(function () {
+        var st = __svgListStateMap.get(this);
+        if (!st) { throw __svgBrandErr('SVGPathSegList', 'length', 'get'); }
+        __svgEnsureItems(st);
+        return st.items.length;
+    }, 'get length'), null, true, true);
+
+    defineAccessor(listProto, 'numberOfItems', mask(function () {
+        var st = __svgListStateMap.get(this);
+        if (!st) { throw __svgBrandErr('SVGPathSegList', 'numberOfItems', 'get'); }
+        __svgEnsureItems(st);
+        return st.items.length;
+    }, 'get numberOfItems'), null, true, true);
+
+    function listMethod(name, fn, arity) {
+        var m = mask(fn, name);
+        try { Object.defineProperty(m, 'length', { value: arity, configurable: true }); } catch (e) {}
+        defineValue(listProto, name, m, true, true, true);
+    }
+
+    function listStateOf(self, member) {
+        var st = __svgListStateMap.get(self);
+        if (!st) { throw __svgBrandErr('SVGPathSegList', member, 'method'); }
+        return st;
+    }
+
+    listMethod('clear', function () {
+        return __svgListClear(listStateOf(this, 'clear'));
+    }, 0);
+
+    listMethod('initialize', function (item) {
+        var st = listStateOf(this, 'initialize');
+        __svgNeedArgs(1, arguments.length);
+        return __svgListInitialize(st, item);
+    }, 1);
+
+    listMethod('getItem', function (index) {
+        var st = listStateOf(this, 'getItem');
+        __svgNeedArgs(1, arguments.length);
+        return __svgListGetItem(st, index);
+    }, 1);
+
+    listMethod('insertItemBefore', function (item, index) {
+        var st = listStateOf(this, 'insertItemBefore');
+        __svgNeedArgs(2, arguments.length);
+        return __svgListInsertBefore(st, item, index);
+    }, 2);
+
+    listMethod('replaceItem', function (item, index) {
+        var st = listStateOf(this, 'replaceItem');
+        __svgNeedArgs(2, arguments.length);
+        return __svgListReplaceItem(st, item, index);
+    }, 2);
+
+    listMethod('removeItem', function (index) {
+        var st = listStateOf(this, 'removeItem');
+        __svgNeedArgs(1, arguments.length);
+        return __svgListRemoveItem(st, index);
+    }, 1);
+
+    listMethod('appendItem', function (item) {
+        var st = listStateOf(this, 'appendItem');
+        __svgNeedArgs(1, arguments.length);
+        return __svgListAppendItem(st, item);
+    }, 1);
+
+    // WebKit 的迭代器不做品牌检查：按 this.length / this[i] 通用取值
+    var iterFn = mask(function () {
+        var st = __svgListStateMap.get(this);
+        var arr = [];
+        if (st) {
+            __svgEnsureItems(st);
+            arr = st.items.slice();
+        } else {
+            var n = Number(this.length) || 0;
+            for (var i = 0; i < n; i++) { arr.push(this[i]); }
+        }
+        return Array.prototype.values.call(arr);
+    }, 'values');
+    try { Object.defineProperty(iterFn, 'length', { value: 0, configurable: true }); } catch (e) {}
+    defineValue(listProto, Symbol.iterator, iterFn, true, false, true);
+
+    defineValue(listProto, Symbol.toStringTag, 'SVGPathSegList', false, false, true);
+
+    // ---- 列表实例（Proxy）----
+
+    function handlerFor(st) {
+        return {
+            get: function (t, k, r) {
+                if (typeof k === 'string') {
+                    var n = __svgIndexKey(k);
+                    if (n >= 0) {
+                        __svgEnsureItems(st);
+                        return (n < st.items.length) ? st.items[n] : undefined;
+                    }
+                }
+                return Reflect.get(t, k, r);
+            },
+            set: function (t, k, v, r) {
+                if (typeof k === 'string') {
+                    var n = __svgIndexKey(k);
+                    if (n >= 0) {
+                        __svgCanAlter(st);
+                        __svgEnsureItems(st);
+                        if (n >= st.items.length) {
+                            throw __svgDomErr('IndexSizeError', 'The index is not in the allowed range.');
+                        }
+                        __svgListReplaceItem(st, v, n);
+                        return true;
+                    }
+                    if (k === 'length' || k === 'numberOfItems') { return true; }
+                }
+                return Reflect.set(t, k, v, r);
+            },
+            has: function (t, k) {
+                if (typeof k === 'string') {
+                    var n = __svgIndexKey(k);
+                    if (n >= 0) {
+                        __svgEnsureItems(st);
+                        return n < st.items.length;
+                    }
+                }
+                return Reflect.has(t, k);
+            },
+            deleteProperty: function (t, k) {
+                if (typeof k === 'string') {
+                    var n = __svgIndexKey(k);
+                    if (n >= 0) {
+                        if (st.access !== 'rw') { return true; }
+                        __svgEnsureItems(st);
+                        if (n < st.items.length) { return false; }
+                        return true;
+                    }
+                }
+                return Reflect.deleteProperty(t, k);
+            },
+            defineProperty: function (t, k, d) {
+                if (typeof k === 'string') {
+                    var n = __svgIndexKey(k);
+                    if (n >= 0) {
+                        if (d.get || d.set) {
+                            throw __svgTypeErr('Cannot set indexed properties on this object');
+                        }
+                        __svgCanAlter(st);
+                        __svgEnsureItems(st);
+                        if (n >= st.items.length) {
+                            throw __svgDomErr('IndexSizeError', 'The index is not in the allowed range.');
+                        }
+                        __svgListReplaceItem(st, d.value, n);
+                        return true;
+                    }
+                    if (k === 'length' || k === 'numberOfItems') {
+                        Object.defineProperty(t, k, {
+                            value: d.value,
+                            writable: !!d.writable,
+                            enumerable: !!d.enumerable,
+                            configurable: !!d.configurable
+                        });
+                        return true;
+                    }
+                }
+                return Reflect.defineProperty(t, k, d);
+            },
+            getOwnPropertyDescriptor: function (t, k) {
+                if (typeof k === 'string') {
+                    var n = __svgIndexKey(k);
+                    if (n >= 0) {
+                        __svgEnsureItems(st);
+                        if (n >= st.items.length) { return undefined; }
+                        return {
+                            value: st.items[n], writable: true,
+                            enumerable: true, configurable: true
+                        };
+                    }
+                }
+                return Reflect.getOwnPropertyDescriptor(t, k);
+            },
+            ownKeys: function (t) {
+                __svgEnsureItems(st);
+                var out = [];
+                for (var i = 0; i < st.items.length; i++) { out.push(String(i)); }
+                var rest = Reflect.ownKeys(t);
+                for (var j = 0; j < rest.length; j++) {
+                    if (typeof rest[j] !== 'string' || __svgIndexKey(rest[j]) < 0) {
+                        out.push(rest[j]);
+                    }
+                }
+                return out;
+            }
+        };
+    }
+
+    function newList(el, access) {
+        var st = __svgListStateNew(el, access);
+        var proxy = new Proxy(Object.create(listProto), handlerFor(st));
+        __svgListStateMap.set(proxy, st);
+        st.proxy = proxy;
+        return proxy;
+    }
+
+    // ---- 元素状态 ----
+
+    var elementStates = new WeakMap();
+
+    function elementState(el) {
+        var s = elementStates.get(el);
+        if (!s) { s = { base: null, anim: null }; elementStates.set(el, s); }
+        return s;
+    }
+
+    function baseListOf(el) {
+        var s = elementState(el);
+        if (!s.base) {
+            s.base = newList(el, 'rw');
+            if (s.anim) { __svgListStateMap.get(s.anim).base = __svgListStateMap.get(s.base); }
+        }
+        return s.base;
+    }
+
+    function animListOf(el) {
+        var s = elementState(el);
+        if (!s.anim) {
+            var base = s.base;
+            var bst = base ? __svgListStateMap.get(base) : null;
+            var st = __svgListStateNew(null, 'ro');
+            st.base = bst;
+            if (bst) {
+                __svgEnsureStream(bst);
+                st.stream = bst.stream ? __svgStreamClone(bst.stream) : null;
+            }
+            var proxy = new Proxy(Object.create(listProto), handlerFor(st));
+            __svgListStateMap.set(proxy, st);
+            st.proxy = proxy;
+            s.anim = proxy;
+            if (bst) { bst.anim = st; }
+        }
+        return s.anim;
+    }
+
+    // ---- 段工厂（createSVGPathSeg*）----
+
+    function createSeg(t, argv) {
+        var fields = __svgSegFields[t];
+        var a = [];
+        for (var i = 0; i < fields.length; i++) {
+            var f = fields[i];
+            if (__svgIsArcFlagField(t, f)) {
+                a.push(argv.length > i ? !!argv[i] : false);
+            } else {
+                var raw = (argv.length > i && argv[i] !== undefined) ? argv[i] : NaN;
+                a.push(__svgToUnrestrictedFloat(raw));
+            }
+        }
+        var seg = Object.create(__svgSegProto[t]);
+        __svgSegState.set(seg, { t: t, a: a, o: null, access: 'rw' });
+        return seg;
+    }
+
+    // ---- 几何 ----
+
+    function geomStream(el) {
+        return __svgPathStream(__svgListStateMap.get(baseListOf(el)));
+    }
+
+    function geomTotal(el) {
+        var stream = geomStream(el);
+        if (!stream || !stream.n) { return 0; }
+        return __svgGeom(stream, 'total').total;
+    }
+
+    function geomPoint(el, dist) {
+        var stream = geomStream(el);
+        if (!stream || !stream.n) {
+            throw __svgDomErr('InvalidStateError', "The element's path is empty.");
+        }
+        var total = __svgGeom(stream, 'total').total;
+        var v = dist < 0 ? 0 : (dist > total ? total : dist);
+        return __svgGeom(stream, 'vector', v).point;
+    }
+
+    function geomSegAt(el, len) {
+        var stream = geomStream(el);
+        if (!stream || !stream.n) { return 0; }
+        return __svgGeom(stream, 'segment', len).index;
+    }
+
+    // ================= 安装 =================
+
+    var PATH_MEMBERS = [
+        'pathSegList', 'animatedPathSegList', 'getPathSegAtLength',
+        'createSVGPathSegClosePath',
+        'createSVGPathSegMovetoAbs', 'createSVGPathSegMovetoRel',
+        'createSVGPathSegLinetoAbs', 'createSVGPathSegLinetoRel',
+        'createSVGPathSegCurvetoCubicAbs', 'createSVGPathSegCurvetoCubicRel',
+        'createSVGPathSegCurvetoQuadraticAbs', 'createSVGPathSegCurvetoQuadraticRel',
+        'createSVGPathSegArcAbs', 'createSVGPathSegArcRel',
+        'createSVGPathSegLinetoHorizontalAbs', 'createSVGPathSegLinetoHorizontalRel',
+        'createSVGPathSegLinetoVerticalAbs', 'createSVGPathSegLinetoVerticalRel',
+        'createSVGPathSegCurvetoCubicSmoothAbs', 'createSVGPathSegCurvetoCubicSmoothRel',
+        'createSVGPathSegCurvetoQuadraticSmoothAbs', 'createSVGPathSegCurvetoQuadraticSmoothRel'
+    ];
+
+    var FACTORY_TYPES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+
+    // 把自有的字符串键按给定顺序重排（删掉再按序定义；描述符原样保留）
+    function reorderOwnKeys(proto, order) {
+        var descs = [];
+        for (var i = 0; i < order.length; i++) {
+            var d = Object.getOwnPropertyDescriptor(proto, order[i]);
+            if (!d) { continue; }
+            try { delete proto[order[i]]; } catch (e) { continue; }
+            descs.push([order[i], d]);
+        }
+        for (var j = 0; j < descs.length; j++) {
+            Object.defineProperty(proto, descs[j][0], descs[j][1]);
+        }
+    }
+
+    function method(name, fn, arity) {
+        var m = mask(fn, name);
+        try { Object.defineProperty(m, 'length', { value: arity, configurable: true }); } catch (e) {}
+        return m;
+    }
+
+    function putMethod(proto, name, fn, arity) {
+        Object.defineProperty(proto, name, {
+            value: method(name, fn, arity),
+            writable: true, enumerable: true, configurable: true
+        });
+    }
+
+    function putGetter(proto, name, fn) {
+        Object.defineProperty(proto, name, {
+            get: mask(fn, 'get ' + name),
+            enumerable: true, configurable: true
+        });
+    }
+
+    function isPath(el) {
+        var name = '';
+        try { name = el.localName || el.nodeName || ''; } catch (e) { name = ''; }
+        return String(name).toLowerCase() === 'path';
+    }
+
+    var installed = false;
+
+    function install(win) {
+        if (installed) { return; }
+        installed = true;
+
+        var W = win || (typeof window !== 'undefined' ? window : null);
+        if (!W) { return; }
+
+        W.SVGPathSeg = BaseCtor;
+        W.SVGPathSegList = ListCtor;
+        for (var t = 1; t <= 19; t++) { W[__svgSegClassNames[t]] = segCtors[t]; }
+
+        var doc = W.document;
+        var mintSvg = null;
+        newPoint = function (x, y) {
+            if (!doc) { return { x: x, y: y }; }
+            if (!mintSvg) { mintSvg = doc.createElementNS('http://www.w3.org/2000/svg', 'svg'); }
+            var p = mintSvg.createSVGPoint();
+            p.x = x;
+            p.y = y;
+            return p;
+        };
+
+        // ---- SVGPathElement ----
+        var elProto = W.SVGPathElement && W.SVGPathElement.prototype;
+        if (elProto) {
+            putGetter(elProto, 'pathSegList', function () { return baseListOf(this); });
+            putGetter(elProto, 'animatedPathSegList', function () { return animListOf(this); });
+
+            putMethod(elProto, 'getPathSegAtLength', function (distance) {
+                var len = (arguments.length < 1) ? NaN : __svgToUnrestrictedFloat(distance);
+                return geomSegAt(this, len);
+            }, 0);
+
+            for (var fi = 0; fi < FACTORY_TYPES.length; fi++) {
+                (function (name, type) {
+                    putMethod(elProto, name, function () {
+                        return createSeg(type, arguments);
+                    }, 0);
+                })(PATH_MEMBERS[fi + 3], FACTORY_TYPES[fi]);
+            }
+
+            reorderOwnKeys(elProto, ['constructor'].concat(PATH_MEMBERS));
+        }
+
+        // ---- SVGGeometryElement ----
+        var geoProto = W.SVGGeometryElement && W.SVGGeometryElement.prototype;
+        if (geoProto) {
+            var origTotal = geoProto.getTotalLength;
+            var origPoint = geoProto.getPointAtLength;
+
+            putMethod(geoProto, 'getTotalLength', function () {
+                if (!isPath(this)) { return origTotal.call(this); }
+                return geomTotal(this);
+            }, 0);
+
+            putMethod(geoProto, 'getPointAtLength', function (distance) {
+                if (!isPath(this)) { return origPoint.apply(this, arguments); }
+                __svgNeedArgs(1, arguments.length);
+                var p = geomPoint(this, __svgToFloat(distance));
+                return newPoint(p.x, p.y);
+            }, 1);
+
+            reorderOwnKeys(geoProto, ['constructor', 'pathLength',
+                'isPointInFill', 'isPointInStroke', 'getTotalLength', 'getPointAtLength']);
+        }
+
+        // ---- 只调键顺序（形状与数值 Blink 已与 WebKit 一致） ----
+        var ptProto = W.SVGPoint && W.SVGPoint.prototype;
+        if (ptProto) {
+            reorderOwnKeys(ptProto, ['constructor', 'x', 'y', 'matrixTransform']);
+        }
+
+        var mxProto = W.SVGMatrix && W.SVGMatrix.prototype;
+        if (mxProto) {
+            reorderOwnKeys(mxProto, ['constructor', 'a', 'b', 'c', 'd', 'e', 'f',
+                'multiply', 'inverse', 'translate', 'scale', 'scaleNonUniform',
+                'rotate', 'rotateFromVector', 'flipX', 'flipY', 'skewX', 'skewY']);
+        }
+    }
+
+    __svgSurface = {
+        SVGPathSeg: BaseCtor,
+        SVGPathSegList: ListCtor,
+        segCtors: segCtors,
+        segProto: __svgSegProto,
+        listProto: listProto,
+        baseList: function (el) { return baseListOf(el); },
+        animList: function (el) { return animListOf(el); },
+        listState: function (proxy) { return __svgListStateMap.get(proxy); },
+        segState: function (seg) { return __svgSegState.get(seg); },
+        createSeg: createSeg,
+        geomTotal: geomTotal,
+        geomPoint: geomPoint,
+        geomSegAt: geomSegAt,
+        install: install
+    };
+    return __svgSurface;
+}
+
+function __svgMakeSurface(mask) {
+    if (!__svgSurface) { __svgBuildSurface(mask); }
+    return __svgSurface;
+}
+"""
 _FONT_FACE_SRC = r"""var __ffNative = null;
 var __ffWrap = (function () {
     try {
@@ -3929,6 +6137,9 @@ __WC_SRC__
 __MC_SRC__
     // F-163：FontFace 的 local() 源裁剪（见模块级 _FONT_FACE_SRC）
 __FF_SRC__
+
+    // F-25：SVG 路径面（见模块级 _SVG_SRC）
+__SVG_SRC__
 
     // ---- F-93③：宿主字体族按名字解析，用同名 FontFace 抢占 ----
     // 字体探测（IPHey/mixvisit 的 span.offsetWidth 三组比对）读的是族名解析
@@ -11706,6 +13917,14 @@ __FF_SRC__
         //   constants  : 接口对象与原型上同时存在的 WebIDL 常量
         if (D.addMembers && D.ios) {
             try {
+                // F-25：先落地 SVG 路径面，下面 __addIface 的
+                // existing && !repair 规则就会跳过同名的空壳 spec 条目。
+                // 单独 try：这里的失败不能带塌整个补成员流程。
+                try {
+                    if (typeof window !== "undefined" && window) {
+                        __svgMakeSurface(__maskNative).install(window);
+                    }
+                } catch (eSvg) {}
                 var __add = D.addMembers;
                 var __addConst = function (host, name, value) {
                     try {
@@ -14899,6 +17118,7 @@ def build_mobile_patch(spec: Dict[str, Any]) -> str:
             .replace("__WC_SRC__", _WEBCODECS_ICS_SRC)
             .replace("__MC_SRC__", _MC_SRC)
             .replace("__FF_SRC__", _FONT_FACE_SRC)
+            .replace("__SVG_SRC__", _SVG_SRC)
             .replace("__SPEC__", json.dumps(payload, ensure_ascii=False)))
 
 
