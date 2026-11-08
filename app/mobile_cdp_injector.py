@@ -5873,6 +5873,8 @@ function __svgBuildSurface(mask) {
     }
 
     var installed = false;
+    // install() 内赋值；此处先声明，供 __svgSurface 导出与事后调用。
+    var applyViewSpecPatch = function () {};
 
     function install(win) {
         if (installed) { return; }
@@ -5952,6 +5954,688 @@ function __svgBuildSurface(mask) {
                 'multiply', 'inverse', 'translate', 'scale', 'scaleNonUniform',
                 'rotate', 'rotateFromVector', 'flipX', 'flipY', 'skewX', 'skewY']);
         }
+
+        // ---- SVGSVGElement / SVGGraphicsElement（F-213） ----
+        // 品牌报错文案、键序、动画时钟、SVGViewSpec、命中测试。
+        // 常量成员不可配置（delete 返回 false），带常量的原型只能部分对齐。
+        var SVGNS = 'http://www.w3.org/2000/svg';
+        var svgProto = W.SVGSVGElement && W.SVGSVGElement.prototype;
+        var gfxProto = W.SVGGraphicsElement && W.SVGGraphicsElement.prototype;
+
+        function cssOf(el) {
+            try {
+                if (!W.getComputedStyle) { return null; }
+                return W.getComputedStyle(el);
+            } catch (e) { return null; }
+        }
+
+        function brandHit(proto, recv, iface, member, kind) {
+            if (__slotHas(proto, recv)) { return; }
+            throw __svgBrandErr(iface, member, kind);
+        }
+
+        function wrapGetter(proto, name, iface) {
+            var d = Object.getOwnPropertyDescriptor(proto, name);
+            if (!d || !d.get) { return; }
+            var g = d.get, s = d.set;
+            var nd = { enumerable: d.enumerable, configurable: true };
+            nd.get = mask(function () {
+                brandHit(proto, this, iface, name, 'get');
+                return g.call(this);
+            }, 'get ' + name);
+            if (s) {
+                nd.set = mask(function (v) {
+                    brandHit(proto, this, iface, name, 'set');
+                    return s.call(this, v);
+                }, 'set ' + name);
+            }
+            Object.defineProperty(proto, name, nd);
+        }
+
+        function wrapMethod(proto, name, iface) {
+            var orig = proto[name];
+            if (typeof orig !== 'function') { return; }
+            putMethod(proto, name, function () {
+                brandHit(proto, this, iface, name, null);
+                return orig.apply(this, arguments);
+            }, orig.length);
+        }
+
+        if (gfxProto) {
+            // WebKit 无这两个遗留访问器；Blink 多出两条可枚举成员。
+            try { delete gfxProto.nearestViewportElement; } catch (e) {}
+            try { delete gfxProto.farthestViewportElement; } catch (e) {}
+            wrapGetter(gfxProto, 'transform', 'SVGGraphicsElement');
+            wrapGetter(gfxProto, 'requiredExtensions', 'SVGGraphicsElement');
+            wrapGetter(gfxProto, 'systemLanguage', 'SVGGraphicsElement');
+            wrapMethod(gfxProto, 'getBBox', 'SVGGraphicsElement');
+            wrapMethod(gfxProto, 'getCTM', 'SVGGraphicsElement');
+            wrapMethod(gfxProto, 'getScreenCTM', 'SVGGraphicsElement');
+            reorderOwnKeys(gfxProto, ['constructor', 'transform', 'requiredExtensions',
+                'systemLanguage', 'getBBox', 'getCTM', 'getScreenCTM']);
+        }
+
+        // ---- 动画时钟（WebKit 的时间轴从文档开始计时） ----
+        var clockPaused = false;
+        var clockFrozen = 0;
+        var clockOffset = 0;
+
+        function nowSec() {
+            try {
+                if (W.performance && W.performance.now) { return W.performance.now() / 1000; }
+            } catch (e) {}
+            return Date.now() / 1000;
+        }
+
+        // WebKit 的 SMIL 时间容器在 load 事件结束后才 begin()（SVGSVGElement.cpp:497），
+        // 不是脚本注入时刻。注入早于 load 时挂监听，晚于 load 时（暂停态注入）就地锚定。
+        var clockEpoch = null;
+
+        function markClockEpoch() {
+            if (clockEpoch === null) { clockEpoch = nowSec(); }
+        }
+
+        try {
+            if (doc && doc.readyState !== 'complete') {
+                W.addEventListener('load', markClockEpoch, true);
+            }
+        } catch (eL) {}
+
+        function clockNow() {
+            if (clockEpoch === null) { markClockEpoch(); }
+            return clockPaused ? clockFrozen : nowSec() - clockEpoch + clockOffset;
+        }
+
+        // ---- SVGViewSpec ----
+        var viewSpecData = new WeakMap();
+        var viewSpecReal = new WeakSet();
+        var viewSpecBySvg = new WeakMap();
+
+        function readonlyRect(raw) {
+            return new Proxy(raw, {
+                get: function (t, k) { return Reflect.get(t, k, t); },
+                set: function () {
+                    throw __svgDomErr('NoModificationAllowedError',
+                        'The object can not be modified.');
+                }
+            });
+        }
+
+        function readonlyAnimated(raw, subNames) {
+            var cache = {};
+            return new Proxy(raw, {
+                get: function (t, k) {
+                    if (typeof k === 'string' && subNames.indexOf(k) >= 0) {
+                        if (!cache[k]) { cache[k] = readonlyRect(Reflect.get(t, k, t)); }
+                        return cache[k];
+                    }
+                    return Reflect.get(t, k, t);
+                },
+                set: function () {
+                    throw __svgDomErr('NoModificationAllowedError',
+                        'The object can not be modified.');
+                }
+            });
+        }
+
+        function readonlyTransformList(raw) {
+            var ro = function () {
+                throw __svgDomErr('NoModificationAllowedError',
+                    'The object can not be modified.');
+            };
+            return new Proxy(raw, {
+                get: function (t, k) {
+                    if (k === 'clear' || k === 'initialize' || k === 'insertItemBefore'
+                        || k === 'replaceItem' || k === 'removeItem' || k === 'appendItem'
+                        || k === 'consolidate') {
+                        return mask(function () { ro(); }, k, null, false);
+                    }
+                    if (k === 'getItem') {
+                        return mask(function (index) {
+                            __svgNeedArgs(1, arguments.length);
+                            throw __svgDomErr('IndexSizeError',
+                                'The index is not in the allowed range.');
+                        }, 'getItem');
+                    }
+                    // 读方法要绑到原对象上；经 Proxy 调用会因品牌检查抛
+                    // Illegal invocation（原生方法看 this 的内部槽）。
+                    var v = Reflect.get(t, k, t);
+                    if (typeof v === 'function' && !v.__svgBound) {
+                        var b = mask(function () {
+                            return v.apply(t, arguments);
+                        }, k, null, false);
+                        try { Object.defineProperty(b, '__svgBound', { value: true }); } catch (e) {}
+                        return b;
+                    }
+                    return v;
+                },
+                set: function () { ro(); }
+            });
+        }
+
+        function buildViewSpec() {
+            var VVS = W.SVGViewSpec;
+            if (!VVS || !VVS.prototype || !doc) { return null; }
+            if (!mintSvg) { mintSvg = doc.createElementNS(SVGNS, 'svg'); }
+            var spec = Object.create(VVS.prototype);
+            viewSpecReal.add(spec);
+            viewSpecData.set(spec, {
+                transform: readonlyTransformList(mintSvg.transform.baseVal),
+                viewBoxString: '0 0 0 0',
+                preserveAspectRatioString: 'xMidYMid meet',
+                transformString: '',
+                viewBox: readonlyAnimated(mintSvg.viewBox, ['baseVal', 'animVal']),
+                preserveAspectRatio: readonlyAnimated(mintSvg.preserveAspectRatio,
+                    ['baseVal', 'animVal']),
+                zoomAndPan: 2
+            });
+            return spec;
+        }
+
+        // SVGViewSpec 在 fp-chromium 上不存在，是 __addIfaceObj 事后合成的；
+        // install() 跑在那之前，所以这里只能导出补丁，由补成员流程收尾时调用。
+        // 闭包依赖 install() 内的 viewSpecData/viewSpecReal，故在 install 里赋值。
+        applyViewSpecPatch = function (P) {
+            if (!P) { return; }
+            var names = ['transform', 'viewBoxString', 'preserveAspectRatioString',
+                'transformString', 'viewBox', 'preserveAspectRatio', 'zoomAndPan'];
+            for (var i = 0; i < names.length; i++) {
+                (function (n) {
+                    var d = {
+                        get: mask(function () {
+                            if (!viewSpecReal.has(this)) {
+                                throw __svgBrandErr('SVGViewSpec', n, 'get');
+                            }
+                            return viewSpecData.get(this)[n];
+                        }, 'get ' + n),
+                        enumerable: true, configurable: true
+                    };
+                    // WebKit 上只有 zoomAndPan 的赋值会抛；viewBoxString /
+                    // transformString / viewBox 等是「只读属性」，sloppy 赋值静默无效。
+                    if (n === 'zoomAndPan') {
+                        var s = mask(function () {
+                            throw __svgDomErr('NoModificationAllowedError',
+                                'The object can not be modified.');
+                        }, 'set ' + n);
+                        try {
+                            Object.defineProperty(s, 'length', { value: 1, configurable: true });
+                        } catch (eS) {}
+                        d.set = s;
+                    }
+                    Object.defineProperty(P, n, d);
+                })(names[i]);
+            }
+        };
+        applyViewSpecPatch(W.SVGViewSpec && W.SVGViewSpec.prototype);
+
+        // ---- 命中测试 ----
+        var GRAPHICS = { rect: 1, circle: 1, ellipse: 1, line: 1, polyline: 1,
+            polygon: 1, path: 1, text: 1, image: 1, use: 1 };
+
+        function isGraphics(el) {
+            var n = '';
+            try { n = String(el.localName || '').toLowerCase(); } catch (e) { return false; }
+            return GRAPHICS[n] === 1;
+        }
+
+        function nearestViewport(el) {
+            var p = el;
+            try { p = el.parentNode; } catch (e) { return null; }
+            while (p && p.nodeType === 1) {
+                if (String(p.localName || '').toLowerCase() === 'svg') { return p; }
+                p = p.parentNode;
+            }
+            return null;
+        }
+
+        // 查询矩形所处的空间 = 候选元素 getElementCTM 的落点空间，
+        // 比较空间是「最近视口元素」的父坐标系：WebKit 的 getElementCTM
+        // 从元素一路乘 localToParentTransform 到 nvp 为止（含 nvp 自身），
+        // 传进来的 rect 不做任何变换，所以 rect 必须按那个空间解释。
+        // 嵌套 svg 时 nvp 的父级仍是 SVG，父级 getScreenCTM 正好是那个空间；
+        // 顶层 svg 没有 SVG 祖先，得用 nvp 自己的 getScreenCTM——退回文档空间
+        // （减滚动）会把 rect 和元素错开一个 svg 的布局位置。
+        function spaceToClient(nvp) {
+            var pe = nvp ? nvp.parentNode : null;
+            while (pe && pe.nodeType === 1) {
+                if (typeof pe.getScreenCTM === 'function'
+                    && String(pe.namespaceURI || '') === SVGNS) {
+                    return pe.getScreenCTM();
+                }
+                pe = pe.parentNode;
+            }
+            if (nvp && typeof nvp.getScreenCTM === 'function') {
+                try {
+                    var own = nvp.getScreenCTM();
+                    if (own) { return own; }
+                } catch (eOwn) {}
+            }
+            return { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+        }
+
+        function mapRect(m, x, y, w, h) {
+            var xs = [], ys = [];
+            var px = [x, x + w, x, x + w], py = [y, y, y + h, y + h];
+            for (var i = 0; i < 4; i++) {
+                xs.push(m.a * px[i] + m.c * py[i] + m.e);
+                ys.push(m.b * px[i] + m.d * py[i] + m.f);
+            }
+            var x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+            var y0 = Math.min.apply(null, ys), y1 = Math.max.apply(null, ys);
+            return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+        }
+
+        // repaintRectInLocalCoordinates：getBBox() 按 stroke-width/2 外扩
+        // （RenderSVGShape::calculateStrokeBoundingBox 走 CoreGraphics
+        // CGContextReplacePathWithStrokedPath，无描边时也是恒等外扩）。
+        function localRepaint(el) {
+            var bb;
+            try { bb = el.getBBox(); } catch (e) { return null; }
+            if (!bb) { return null; }
+            // <defs> / <clipPath> 等非渲染容器的子图形在 Blink 上 getBBox()
+            // 返回空框，WebKit 仍给出几何框；用 x/y/width/height 兜底。
+            if (!(bb.width > 0) && !(bb.height > 0)) {
+                var ax = parseFloat(el.getAttribute && el.getAttribute('x'));
+                var ay = parseFloat(el.getAttribute && el.getAttribute('y'));
+                var aw = parseFloat(el.getAttribute && el.getAttribute('width'));
+                var ah = parseFloat(el.getAttribute && el.getAttribute('height'));
+                if (isFinite(ax) || isFinite(ay) || isFinite(aw) || isFinite(ah)) {
+                    bb = { x: isFinite(ax) ? ax : 0, y: isFinite(ay) ? ay : 0,
+                        width: isFinite(aw) ? aw : 0, height: isFinite(ah) ? ah : 0 };
+                }
+            }
+            var inf = 0;
+            var cs = cssOf(el);
+            if (cs) {
+                var stroke = cs.stroke;
+                if (stroke && stroke !== 'none') {
+                    var sw = parseFloat(cs.strokeWidth);
+                    if (isFinite(sw) && sw > 0) { inf = sw / 2; }
+                }
+            }
+            return { x: bb.x - inf, y: bb.y - inf,
+                w: bb.width + 2 * inf, h: bb.height + 2 * inf };
+        }
+
+        // 元素是否落在候选集里：WebKit 只排除 display:none 与
+        // pointer-events:none；visibility:hidden 仍然命中。
+        // <symbol> 子树照样命中——SVGSVGElement.cpp 的
+        // collectIntersectionOrEnclosureList 只按 descendantsOfType<SVGElement>
+        // 遍历，不做可渲染性过滤，<symbol> 子元素自身有 RenderSVGModelObject。
+        function isCandidate(el) {
+            var cs = cssOf(el);
+            if (cs) {
+                if (cs.display === 'none') { return false; }
+                if (cs.pointerEvents === 'none') { return false; }
+            }
+            for (var p = el.parentNode; p && p.nodeType === 1; p = p.parentNode) {
+                var pcs = cssOf(p);
+                if (pcs && pcs.display === 'none') { return false; }
+            }
+            return true;
+        }
+
+        // RenderSVGModelObject 把 repaintRect 映射到 absolute 空间后先按像素
+        // 吸附（location 取整、尺寸不动），再与查询矩形比较——实测
+        // checkEnclosure 的边界随 svg 的整数像素偏移量漂移 ±0.5，正是这一
+        // 步吸附造成的。见 docs/移动端仿真问题清单.md F-213③。
+        function snapRect(r) {
+            return { x: Math.round(r.x), y: Math.round(r.y),
+                w: r.w, h: r.h };
+        }
+
+        function isEmptyRect(r) { return !(r.w > 0 && r.h > 0); }
+
+        function pointInRect(r, px, py) {
+            return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+        }
+
+        // WebKit SVGSVGElement.cpp 的 intersectsAllowingEmpty，逐字对应。
+        function intersectsAllowingEmpty(r, other) {
+            if (isEmptyRect(r) && isEmptyRect(other)) { return false; }
+            if (isEmptyRect(r) && !isEmptyRect(other)) {
+                var a = pointInRect(other, r.x, r.y);
+                var b = pointInRect(other, r.x + r.w, r.y + r.h);
+                return (a && !b) || (!a && b);
+            }
+            if (isEmptyRect(other)) { return intersectsAllowingEmpty(other, r); }
+            return r.x < other.x + other.w && other.x < r.x + r.w
+                && r.y < other.y + other.h && other.y < r.y + r.h;
+        }
+
+        function containsRect(r, other) {
+            return r.x <= other.x && r.x + r.w >= other.x + other.w
+                && r.y <= other.y && r.y + r.h >= other.y + other.h;
+        }
+
+        function hitTest(el, rect, enclose) {
+            if (!isGraphics(el)) { return false; }
+            if (!isCandidate(el)) { return false; }
+            var rp = localRepaint(el);
+            if (!rp) { return false; }
+            var M = null;
+            try { M = el.getScreenCTM(); } catch (e) { M = null; }
+            if (!M) { return false; }
+            var nvp = nearestViewport(el);
+            if (!nvp) { return false; }
+            var P = spaceToClient(nvp);
+            if (!P) { return false; }
+            var cr = snapRect(mapRect(M, rp.x, rp.y, rp.w, rp.h));
+            var qr = mapRect(P, rect.x, rect.y, rect.w, rect.h);
+            if (enclose) { return containsRect(qr, cr); }
+            return intersectsAllowingEmpty(qr, cr);
+        }
+
+        function collect(host, scope, rect, enclose) {
+            var out = [];
+            var root = scope || host;
+            var all;
+            try { all = root.querySelectorAll('*'); } catch (e) { return out; }
+            for (var i = 0; i < all.length; i++) {
+                var el = all[i];
+                if (String(el.namespaceURI || '') !== SVGNS) { continue; }
+                if (!isGraphics(el)) { continue; }
+                if (hitTest(el, rect, enclose)) { out.push(el); }
+            }
+            return out;
+        }
+
+        var emptyNodeList = null;
+        function mintNodeList(items) {
+            if (!emptyNodeList) {
+                try { emptyNodeList = doc.querySelectorAll('__fpwb_none__'); } catch (e) {
+                    emptyNodeList = null;
+                }
+            }
+            if (!emptyNodeList) { return items; }
+            var T = emptyNodeList;
+            return new Proxy(T, {
+                get: function (t, k) {
+                    if (k === 'length') { return items.length; }
+                    if (k === 'item') {
+                        return mask(function (index) {
+                            var n = __svgToULong(index);
+                            return n < items.length ? items[n] : null;
+                        }, 'item');
+                    }
+                    if (k === Symbol.iterator) {
+                        return function () {
+                            var i = 0;
+                            return { next: function () {
+                                if (i < items.length) { return { value: items[i++], done: false }; }
+                                return { value: undefined, done: true };
+                            } };
+                        };
+                    }
+                    if (typeof k === 'string') {
+                        var idx = k >>> 0;
+                        if (String(idx) === k) {
+                            return idx < items.length ? items[idx] : undefined;
+                        }
+                    }
+                    return Reflect.get(t, k, t);
+                },
+                has: function (t, k) {
+                    if (k === 'length') { return true; }
+                    if (typeof k === 'string') {
+                        var idx = k >>> 0;
+                        if (String(idx) === k) { return idx < items.length; }
+                    }
+                    return Reflect.has(t, k);
+                },
+                ownKeys: function () {
+                    var ks = [];
+                    for (var i = 0; i < items.length; i++) { ks.push(String(i)); }
+                    return ks;
+                },
+                getOwnPropertyDescriptor: function (t, k) {
+                    if (typeof k === 'string') {
+                        var idx = k >>> 0;
+                        if (String(idx) === k && idx < items.length) {
+                            return { value: items[idx], writable: false,
+                                enumerable: true, configurable: true };
+                        }
+                    }
+                    return Reflect.getOwnPropertyDescriptor(t, k);
+                }
+            });
+        }
+
+        function rectArg(v, method, iface, idx, pname) {
+            if (v === null || v === undefined || !(v instanceof W.SVGRect)) {
+                throw __svgTypeErr('Argument ' + idx + " ('" + pname + "') to "
+                    + iface + '.' + method + ' must be an instance of SVGRect');
+            }
+            return { x: Number(v.x) || 0, y: Number(v.y) || 0,
+                w: Number(v.width) || 0, h: Number(v.height) || 0 };
+        }
+
+        function elementArg(v, method, iface, idx, pname, nullable) {
+            if (nullable && (v === null || v === undefined)) { return null; }
+            if (v === null || v === undefined || !(v instanceof W.SVGElement)) {
+                throw __svgTypeErr('Argument ' + idx + " ('" + pname + "') to "
+                    + iface + '.' + method + ' must be an instance of SVGElement');
+            }
+            return v;
+        }
+
+        if (svgProto) {
+            var IFACE = 'SVGSVGElement';
+            var i;
+
+            // ---- 访问器 ----
+            var attrGetters = ['x', 'y', 'width', 'height', 'currentTranslate',
+                'viewBox', 'preserveAspectRatio'];
+            for (i = 0; i < attrGetters.length; i++) {
+                wrapGetter(svgProto, attrGetters[i], IFACE);
+            }
+
+            defineAccessor(svgProto, 'currentScale',
+                mask(function () {
+                    brandHit(svgProto, this, IFACE, 'currentScale', 'get');
+                    return 1;
+                }, 'get currentScale'),
+                mask(function (value) {
+                    brandHit(svgProto, this, IFACE, 'currentScale', 'set');
+                    // WebKit 先按 float 转换（非有限值抛错），随后丢弃写入值。
+                    __svgToFloat(value);
+                }, 'set currentScale'),
+                true, true);
+
+            defineAccessor(svgProto, 'useCurrentView',
+                mask(function () {
+                    brandHit(svgProto, this, IFACE, 'useCurrentView', 'get');
+                    return false;
+                }, 'get useCurrentView'),
+                null, true, true);
+
+            defineAccessor(svgProto, 'currentView',
+                mask(function () {
+                    brandHit(svgProto, this, IFACE, 'currentView', 'get');
+                    var spec = viewSpecBySvg.get(this);
+                    if (!spec) {
+                        spec = buildViewSpec();
+                        if (spec) { viewSpecBySvg.set(this, spec); }
+                    }
+                    return spec;
+                }, 'get currentView'),
+                null, true, true);
+
+            var zapDesc = Object.getOwnPropertyDescriptor(svgProto, 'zoomAndPan');
+            if (zapDesc && zapDesc.get) {
+                var zapGet = zapDesc.get;
+                var zapSet = mask(function () {
+                    brandHit(svgProto, this, IFACE, 'zoomAndPan', 'set');
+                    throw __svgDomErr('NoModificationAllowedError',
+                        'The object can not be modified.');
+                }, 'set zoomAndPan');
+                // IDL 里 zoomAndPan 来自 SVGZoomAndPan mixin，setter 带一个参数；
+                // defineAccessor 不会补 length，这里手动对齐。
+                try {
+                    Object.defineProperty(zapSet, 'length', { value: 1, configurable: true });
+                } catch (eZ) {}
+                Object.defineProperty(svgProto, 'zoomAndPan', {
+                    get: mask(function () {
+                        brandHit(svgProto, this, IFACE, 'zoomAndPan', 'get');
+                        return zapGet.call(this);
+                    }, 'get zoomAndPan'),
+                    set: zapSet,
+                    enumerable: true, configurable: true
+                });
+            }
+
+            // ---- 命中测试四件套 ----
+            putMethod(svgProto, 'getIntersectionList', function (rect, reference) {
+                brandHit(svgProto, this, IFACE, 'getIntersectionList', null);
+                __svgNeedArgs(2, arguments.length);
+                var r = rectArg(rect, 'getIntersectionList', IFACE, 1, 'rect');
+                var ref = elementArg(reference, 'getIntersectionList', IFACE, 2,
+                    'referenceElement', true);
+                return mintNodeList(collect(this, ref, r, false));
+            }, 2);
+
+            putMethod(svgProto, 'getEnclosureList', function (rect, reference) {
+                brandHit(svgProto, this, IFACE, 'getEnclosureList', null);
+                __svgNeedArgs(2, arguments.length);
+                var r = rectArg(rect, 'getEnclosureList', IFACE, 1, 'rect');
+                var ref = elementArg(reference, 'getEnclosureList', IFACE, 2,
+                    'referenceElement', true);
+                return mintNodeList(collect(this, ref, r, true));
+            }, 2);
+
+            putMethod(svgProto, 'checkIntersection', function (element, rect) {
+                brandHit(svgProto, this, IFACE, 'checkIntersection', null);
+                __svgNeedArgs(2, arguments.length);
+                var el = elementArg(element, 'checkIntersection', IFACE, 1, 'element', false);
+                var r = rectArg(rect, 'checkIntersection', IFACE, 2, 'rect');
+                return hitTest(el, r, false);
+            }, 2);
+
+            putMethod(svgProto, 'checkEnclosure', function (element, rect) {
+                brandHit(svgProto, this, IFACE, 'checkEnclosure', null);
+                __svgNeedArgs(2, arguments.length);
+                var el = elementArg(element, 'checkEnclosure', IFACE, 1, 'element', false);
+                var r = rectArg(rect, 'checkEnclosure', IFACE, 2, 'rect');
+                return hitTest(el, r, true);
+            }, 2);
+
+            // ---- 工厂与查询 ----
+            var origTfFromMatrix = svgProto.createSVGTransformFromMatrix;
+            putMethod(svgProto, 'createSVGTransformFromMatrix', function (dict) {
+                brandHit(svgProto, this, IFACE, 'createSVGTransformFromMatrix', null);
+                if (dict !== undefined && dict !== null
+                    && typeof dict !== 'object' && typeof dict !== 'function') {
+                    throw __svgTypeErr('Type error');
+                }
+                var names = ['a', 'b', 'c', 'd', 'e', 'f'];
+                var mx = null;
+                if (doc) {
+                    if (!mintSvg) { mintSvg = doc.createElementNS(SVGNS, 'svg'); }
+                    mx = mintSvg.createSVGMatrix();
+                }
+                for (var k = 0; k < 6; k++) {
+                    var key = names[k];
+                    var val = (dict !== null && dict !== undefined && (key in dict))
+                        ? __svgToUnrestrictedFloat(dict[key]) : null;
+                    if (mx && val !== null) { mx[key] = val; }
+                }
+                if (mx && origTfFromMatrix) {
+                    return origTfFromMatrix.call(mintSvg, mx);
+                }
+                return mx;
+            }, 0);
+
+            var factoryNames = ['createSVGNumber', 'createSVGLength', 'createSVGAngle',
+                'createSVGPoint', 'createSVGMatrix', 'createSVGRect', 'createSVGTransform'];
+            for (i = 0; i < factoryNames.length; i++) {
+                wrapMethod(svgProto, factoryNames[i], IFACE);
+            }
+
+            putMethod(svgProto, 'getElementById', function (id) {
+                brandHit(svgProto, this, IFACE, 'getElementById', null);
+                __svgNeedArgs(1, arguments.length);
+                return Element.prototype.querySelector.call(this,
+                    '[id="' + String(id).replace(/["\\]/g, '\\$&') + '"]');
+            }, 1);
+
+            // ---- 动画时钟 ----
+            putMethod(svgProto, 'pauseAnimations', function () {
+                brandHit(svgProto, this, IFACE, 'pauseAnimations', null);
+                if (!clockPaused) { clockFrozen = clockNow(); clockPaused = true; }
+            }, 0);
+
+            putMethod(svgProto, 'unpauseAnimations', function () {
+                brandHit(svgProto, this, IFACE, 'unpauseAnimations', null);
+                if (clockPaused) {
+                    if (clockEpoch === null) { markClockEpoch(); }
+                    clockOffset = clockFrozen - (nowSec() - clockEpoch);
+                    clockPaused = false;
+                }
+            }, 0);
+
+            putMethod(svgProto, 'animationsPaused', function () {
+                brandHit(svgProto, this, IFACE, 'animationsPaused', null);
+                return clockPaused;
+            }, 0);
+
+            putMethod(svgProto, 'getCurrentTime', function () {
+                brandHit(svgProto, this, IFACE, 'getCurrentTime', null);
+                return clockNow();
+            }, 0);
+
+            putMethod(svgProto, 'setCurrentTime', function (seconds) {
+                brandHit(svgProto, this, IFACE, 'setCurrentTime', null);
+                __svgNeedArgs(1, arguments.length);
+                // IDL 声明为 restricted float，非有限值先抛 TypeError 再截断。
+                var t = __svgf32(__svgToFloat(seconds));
+                if (!(t > 0)) { t = 0; }
+                if (clockPaused) { clockFrozen = t; }
+                else {
+                    if (clockEpoch === null) { markClockEpoch(); }
+                    clockOffset = t - (nowSec() - clockEpoch);
+                }
+            }, 1);
+
+            // ---- 重绘族 ----
+            putMethod(svgProto, 'suspendRedraw', function () {
+                brandHit(svgProto, this, IFACE, 'suspendRedraw', null);
+                __svgNeedArgs(1, arguments.length);
+                return 1;
+            }, 1);
+
+            putMethod(svgProto, 'unsuspendRedraw', function () {
+                brandHit(svgProto, this, IFACE, 'unsuspendRedraw', null);
+                __svgNeedArgs(1, arguments.length);
+            }, 1);
+
+            var restMethods = ['unsuspendRedrawAll', 'forceRedraw', 'deselectAll'];
+            for (i = 0; i < restMethods.length; i++) {
+                wrapMethod(svgProto, restMethods[i], IFACE);
+            }
+
+            // SVGSVGElement 的 SVG_* 常量不可配置，无法整体重排键序。
+        }
+
+        // ---- 无常量原型的键序（可完整对齐） ----
+        var orderTable = [
+            ['SVGTransformList', ['constructor', 'length', 'numberOfItems', 'clear',
+                'initialize', 'getItem', 'insertItemBefore', 'replaceItem', 'removeItem',
+                'appendItem', 'createSVGTransformFromMatrix', 'consolidate']],
+            ['SVGAnimatedRect', ['constructor', 'baseVal', 'animVal']],
+            ['SVGRect', ['constructor', 'x', 'y', 'width', 'height']],
+            ['SVGAnimatedPreserveAspectRatio', ['constructor', 'baseVal', 'animVal']],
+            ['SVGNumber', ['constructor', 'value']],
+            ['SVGAnimatedTransformList', ['constructor', 'baseVal', 'animVal']],
+            ['SVGAnimatedAngle', ['constructor', 'baseVal', 'animVal']],
+            ['SVGAnimatedLength', ['constructor', 'baseVal', 'animVal']]
+        ];
+        for (i = 0; i < orderTable.length; i++) {
+            var ifaceName = orderTable[i][0];
+            var ctor = W[ifaceName];
+            if (ctor && ctor.prototype) {
+                reorderOwnKeys(ctor.prototype, orderTable[i][1]);
+            }
+        }
     }
 
     __svgSurface = {
@@ -5968,6 +6652,7 @@ function __svgBuildSurface(mask) {
         geomTotal: geomTotal,
         geomPoint: geomPoint,
         geomSegAt: geomSegAt,
+        applyViewSpecPatch: function (P) { return applyViewSpecPatch(P); },
         install: install
     };
     return __svgSurface;
@@ -15347,6 +16032,14 @@ __SVG_SRC__
                     __addConst(C, c.name, c.value);
                     if (C.prototype) { __addConst(C.prototype, c.name, c.value); }
                 });
+                // SVGViewSpec 是这张表事后合成的接口，install() 跑在那之前，
+                // 只能在这里补访问器（见 __svgSurface.applyViewSpecPatch）。
+                try {
+                    if (__svgSurface) {
+                        __svgSurface.applyViewSpecPatch(
+                            window.SVGViewSpec && window.SVGViewSpec.prototype);
+                    }
+                } catch (e) {}
                 // 静态量：DataView.BYTES_PER_ELEMENT（WebKit 里是 1，JS 里被
                 // 实现成构造函数上的普通属性）、RegExp.multiline（legacy）。
                 (__add.statics || []).forEach(function (s) {
