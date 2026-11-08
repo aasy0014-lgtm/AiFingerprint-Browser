@@ -6253,32 +6253,169 @@ function __svgBuildSurface(mask) {
         }
 
         // 脱离常规流的元素，x()/y() 相对 CSS 包含块，不是 DOM 父盒。
-        // 返回 null 表示参照的是初始包含块。
+        // 返回 null 表示参照的是初始包含块（WebKit 的 RenderView）。
+        //
+        // 判定逐字对应 WebKit RenderElementStyleInlines.h：
+        //   mayContainOutOfFlowPositionedObjects() =
+        //       canEstablishContainingBlockWithTransform() && hasTransformRelatedProperty()
+        //    || filter != none      || backdrop-filter != none
+        //    || SVG foreignObject   || shouldApplyLayoutContainment()
+        //    || shouldApplyPaintContainment()
+        //   canContainAbsolutelyPositionedObjects() = 上式 || position != static
+        //    || (isRenderBlock && willChange 含 position 或 out-of-flow 那一组)
+        //   canContainFixedPositionObjects()        = 上式 || (isRenderBlock && 同 willChange)
+        // 其中 hasTransformRelatedProperty() 含 transform / translate / rotate /
+        // scale / transform-style:preserve-3d / perspective；containment 含
+        // contain 的 layout|paint|strict|content 与 content-visibility 非 visible。
+        //
+        // 两点与直觉不同、实测确认：
+        //   1. filter / backdrop-filter **不要求块级**（RenderElement.h 里没有
+        //      isRenderBlock 门槛），行内元素照样成为包含块；
+        //   2. 找到候选后 WebKit 还要 nearestNonAnonymousContainingBlockIncludingSelf()
+        //      继续往上找最近的非匿名 RenderBlock，所以行内候选的包含块实际是它
+        //      最近的那个块级祖先。
+        //   3. transform 那一组要求 canEstablishContainingBlockWithTransform()，
+        //      即 isRenderBlock 或表元（表列除外）。
+        // RenderStyle::hasTransformRelatedProperty() =
+        //   hasTransform() || translate || scale || rotate
+        //   || transformStyle3D == preserve-3d || hasPerspective()
+        function hasTransformRelated(cs) {
+            return String(cs.transform || 'none') !== 'none'
+                || String(cs.translate || 'none') !== 'none'
+                || String(cs.rotate || 'none') !== 'none'
+                || String(cs.scale || 'none') !== 'none'
+                || String(cs.transformStyle || 'flat') === 'preserve-3d'
+                || String(cs.perspective || 'none') !== 'none';
+        }
+
+        // shouldApplyLayoutOrPaintContainment(containsAccordingToStyle) =
+        //   containsAccordingToStyle && (!isInline() || isAtomicInlineLevelBox())
+        //   && !isRubyText() && (!isTablePart() || isRenderBlockFlow())
+        // 表元里只有 table-cell / table-caption 是 RenderBlockFlow，其余
+        // （row / row-group / column / column-group）即使写了 contain 也不生效。
+        function isTablePartBox(d) {
+            return /^table-(cell|row|row-group|header-group|footer-group|column|column-group|caption)$/.test(d);
+        }
+
+        function appliesContainment(cs) {
+            var d = String((cs && cs.display) || '');
+            if (!d || d === 'none' || d === 'contents') { return false; }
+            if (d === 'ruby-text') { return false; }
+            if (/^inline/.test(d) && !isAtomicInline(d)) { return false; }
+            if (isTablePartBox(d) && d !== 'table-cell' && d !== 'table-caption') { return false; }
+            return true;
+        }
+
+        function hasContainment(cs) {
+            if (!appliesContainment(cs)) { return false; }
+            if (String(cs.contentVisibility || 'visible') !== 'visible') { return true; }
+            return / (layout|paint|strict|content) /.test(' ' + String(cs.contain || 'none') + ' ');
+        }
+
+        function isAtomicInline(d) {
+            return /^inline-(block|flex|grid|table)$/.test(d) || d === 'inline-table';
+        }
+
+        // isRenderBlock()：WebKit 的 TypeFlag::IsRenderBlock，按渲染器类型而非
+        // display 关键字决定。RenderTableRow 继承 RenderBlock（是），
+        // RenderTableSection / RenderTableColumn 继承 RenderBox（不是）。
+        // 纯行内与 ruby 不是；inline-block/inline-flex/inline-grid/inline-table
+        // 这类原子行内级盒是。
+        function isBlockLevel(cs) {
+            var d = String((cs && cs.display) || '');
+            if (!d || d === 'none' || d === 'contents') { return false; }
+            if (/^ruby/.test(d)) { return false; }
+            if (isTablePartBox(d)) { return d !== 'table-row-group' && d !== 'table-header-group'
+                && d !== 'table-footer-group' && d !== 'table-column' && d !== 'table-column-group'; }
+            if (/^inline/.test(d)) { return isAtomicInline(d); }
+            return true;
+        }
+
+        // display:contents 的元素不生成盒子，本身不可能成为包含块，
+        // 属性（filter / transform / contain）一律不生效。
+        function generatesBox(cs) {
+            var d = String((cs && cs.display) || '');
+            return !!d && d !== 'none' && d !== 'contents';
+        }
+
+        // WillChangeData::createsContainingBlockForOutOfFlowPositioned()
+        function willChangeOutOfFlow(cs) {
+            var wc = String(cs.willChange || 'auto');
+            if (!wc || wc === 'auto' || wc === 'normal') { return false; }
+            return /,(perspective|transform|transform-style|translate|rotate|scale|contain|-webkit-backdrop-filter|backdrop-filter|filter),/
+                .test(',' + wc.replace(/\s+/g, '') + ',');
+        }
+
+        function willChangePosition(cs) {
+            var wc = String(cs.willChange || 'auto');
+            if (!wc || wc === 'auto' || wc === 'normal') { return false; }
+            return /,position,/.test(',' + wc.replace(/\s+/g, '') + ',');
+        }
+
+        // canEstablishContainingBlockWithTransform() = isRenderBlock()
+        //   || (isTablePart() && !isRenderTableCol())
+        // 比 isRenderBlock() 宽一格：table-row-group / header-group /
+        // footer-group 是 RenderTableSection（不是 RenderBlock），transform
+        // 照样建包含块；但 will-change 那条路要求 isRenderBlock()，对它们无效。
+        // 表列（column / column-group）是 RenderTableCol，两者都不算。
+        function canEstablishCBWithTransform(cs) {
+            var d = String((cs && cs.display) || '');
+            if (d === 'table-column' || d === 'table-column-group') { return false; }
+            return isBlockLevel(cs) || isTablePartBox(d);
+        }
+
+        function mayContainOutOfFlow(cs) {
+            if (!generatesBox(cs)) { return false; }
+            if (canEstablishCBWithTransform(cs) && hasTransformRelated(cs)) { return true; }
+            if (String(cs.filter || 'none') !== 'none') { return true; }
+            if (String(cs.webkitBackdropFilter || cs.backdropFilter || 'none') !== 'none') { return true; }
+            return hasContainment(cs);
+        }
+
         function containingBlock(el) {
             var cs = cssOf(el);
             var pos = String((cs && cs.position) || 'static');
             if (pos !== 'absolute' && pos !== 'fixed') { return null; }
+            var isAbs = (pos === 'absolute');
             var p = el.parentNode;
-            if (pos === 'fixed') {
-                while (p && p.nodeType === 1) {
-                    var pcs = cssOf(p);
-                    if (!pcs) { break; }
-                    var wc = String(pcs.willChange || '');
-                    if (String(pcs.transform || 'none') !== 'none'
-                        || String(pcs.perspective || 'none') !== 'none'
-                        || String(pcs.filter || 'none') !== 'none'
-                        || (wc !== 'auto' && /transform|perspective|filter/.test(wc))) {
-                        return p;
-                    }
-                    p = p.parentNode;
-                }
-                return null;
-            }
             while (p && p.nodeType === 1) {
+                // 走到文档根还没命中就是初始包含块（RenderView）。
+                if (p === document.documentElement) { return null; }
                 var pcs = cssOf(p);
                 if (!pcs) { break; }
-                if (/^(absolute|relative|fixed|sticky)$/.test(String(pcs.position || ''))) {
-                    return p;
+                var hit = mayContainOutOfFlow(pcs)
+                    || (isAbs && generatesBox(pcs) && String(pcs.position || 'static') !== 'static')
+                    || (isBlockLevel(pcs) && willChangeOutOfFlow(pcs))
+                    || (isAbs && isBlockLevel(pcs) && willChangePosition(pcs));
+                if (hit) {
+                    // 相对/粘性定位的纯行内自己就是包含块：实测（WebKit 26.5）
+                    // x() = 该行内 border-box 原点 + used left/top，行内 padding
+                    // 与祖先盒子都不参与。这与 nearestNonAnonymousContainingBlock
+                    // IncludingSelf() 的字面规则相反（它会跳过行内走到最近的块），
+                    // 但渲染位置只认行内本身，故以实测为准。
+                    if (isAbs && String(pcs.position || 'static') !== 'static'
+                        && !isBlockLevel(pcs) && generatesBox(pcs)) {
+                        return p;
+                    }
+                    // 表格部件一律以自身为包含块。实测（WebKit 26.5，body288-
+                    // body290）：给 tbody / thead / tfoot / tr / td / caption /
+                    // table 加 transform 后，x() 原点都锚在该元素自己的
+                    // border-box 上——把表格边框从 50 换成 3、把 tbody 边框从 3
+                    // 换成 50，scan 就跟着 tbody 的边框走，与 table 无关。
+                    // 这与 nearestNonAnonymousContainingBlockIncludingSelf()
+                    // 的字面规则相反：RenderTableSection 继承 RenderBox 而非
+                    // RenderBlock，按源码该走到 table，但渲染位置只认它自己。
+                    if (isTablePartBox(String(pcs.display || ''))
+                        && String(pcs.display || '') !== 'table-column'
+                        && String(pcs.display || '') !== 'table-column-group') { return p; }
+                    // nearestNonAnonymousContainingBlockIncludingSelf()
+                    while (p && p.nodeType === 1) {
+                        var qcs = cssOf(p);
+                        if (!qcs) { break; }
+                        if (isBlockLevel(qcs)) { return p; }
+                        p = p.parentNode;
+                    }
+                    return null;
                 }
                 p = p.parentNode;
             }
