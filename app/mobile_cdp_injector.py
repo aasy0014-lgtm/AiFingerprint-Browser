@@ -6422,6 +6422,20 @@ function __svgBuildSurface(mask) {
             return null;
         }
 
+        // 包含块参照盒取**第一分片**的 border-box，不是 getBoundingClientRect()
+        // 的并集。WebKit 的 PositionedLayoutConstraints::containingBlockOffsetFor
+        // NonStaticAxes() 用的是 container.firstFragmentBorderBoxRect()。两者只在
+        // 行内包含块被 block-in-inline 拆片时才有差别：后续分片会回退到外层行内
+        // 的左沿，把并集的 left 拉回（body292：lv1 并集 20.0、首片 28.0），
+        // 直接导致嵌套相对行内的绝对定位 svg 偏 8px。
+        function firstFragmentRect(el, cs) {
+            if (el.getClientRects && INLINE_LEVEL.test(String((cs && cs.display) || ''))) {
+                var rs = el.getClientRects();
+                if (rs && rs.length) { return rs[0]; }
+            }
+            return el.getBoundingClientRect();
+        }
+
         function rootOffset(nvp) {
             var cs = cssOf(nvp);
             var bl = numOf(cs && cs.borderLeftWidth);
@@ -6432,18 +6446,36 @@ function __svgBuildSurface(mask) {
             if (!par || par.nodeType !== 1) { return { x: bl + pl, y: bt + pt }; }
             var posv = String((cs && cs.position) || 'static');
             var outOfFlow = (posv === 'absolute' || posv === 'fixed');
-            var ref = par, refICB = false;
+            var ref = par, refICB = false, scOwner = par;
             if (outOfFlow) {
                 var cb = containingBlock(nvp);
                 if (cb) { ref = cb; } else { refICB = true; }
+            } else if (INLINE_LEVEL.test(String((cs && cs.display) || ''))) {
+                // 常规流里的行内级盒，x() 相对的是承载它那一行盒的**块容器**
+                // 的 border-box，不是最近的 DOM 祖先。纯行内祖先只提供行盒、
+                // 不提供坐标原点：实测（WebKit 26.5，body295 / body299）把
+                // svg 埋进多层 <span>，x() 仍等于它到最近块级祖先 border-box
+                // 的偏移，与 span 自己的 border/padding 无关（span 上写
+                // padding:23px 后 pred 从 58,84 变 148,104，实测始终是 168,97）。
+                // 原子行内级盒（inline-block/-flex/-grid/-table）本身就是块
+                // 容器，isBlockLevel() 返回真，循环不会越过它们。
+                while (ref && ref.nodeType === 1 && ref !== document.documentElement
+                    && !isBlockLevel(cssOf(ref))) {
+                    ref = ref.parentNode;
+                }
+                if (!ref || ref.nodeType !== 1) { ref = par; }
+                // 缩放仍按最近 DOM 祖先算：行内祖先上的 transform 位于
+                // 「块布局空间 → 屏幕」这段映射里，必须除掉的正是它。
+                scOwner = par;
             }
             var sr, pr;
             try {
                 sr = nvp.getBoundingClientRect();
-                pr = refICB ? { left: -scrollX, top: -scrollY } : ref.getBoundingClientRect();
+                pr = refICB ? { left: -scrollX, top: -scrollY }
+                    : firstFragmentRect(ref, cssOf(ref));
             } catch (eR) { return { x: bl + pl, y: bt + pt }; }
             if (!sr || !pr) { return { x: bl + pl, y: bt + pt }; }
-            var sc = ancestorScale(refICB ? document.documentElement : ref);
+            var sc = ancestorScale(refICB ? document.documentElement : scOwner);
             var dx = (sr.left - pr.left) / sc.x;
             var dy = (sr.top - pr.top) / sc.y;
             var tf = String((cs && cs.transform) || 'none');
