@@ -6188,29 +6188,128 @@ function __svgBuildSurface(mask) {
             return null;
         }
 
-        // 查询矩形所处的空间 = 候选元素 getElementCTM 的落点空间，
-        // 比较空间是「最近视口元素」的父坐标系：WebKit 的 getElementCTM
-        // 从元素一路乘 localToParentTransform 到 nvp 为止（含 nvp 自身），
-        // 传进来的 rect 不做任何变换，所以 rect 必须按那个空间解释。
-        // 嵌套 svg 时 nvp 的父级仍是 SVG，父级 getScreenCTM 正好是那个空间；
-        // 顶层 svg 没有 SVG 祖先，得用 nvp 自己的 getScreenCTM——退回文档空间
-        // （减滚动）会把 rect 和元素错开一个 svg 的布局位置。
-        function spaceToClient(nvp) {
-            var pe = nvp ? nvp.parentNode : null;
-            while (pe && pe.nodeType === 1) {
-                if (typeof pe.getScreenCTM === 'function'
-                    && String(pe.namespaceURI || '') === SVGNS) {
-                    return pe.getScreenCTM();
+        // WebKit 的 getElementCTM 从元素一路乘 localToParentTransform 到 nvp
+        // 为止（含 nvp 自身），落点是「nvp 的父坐标系」；传进来的 rect 不做
+        // 任何变换，必须按同一空间解释。嵌套 svg 时 nvp 的父级仍是 SVG，
+        // 此时 getCTM 与「父 svg 的 getScreenCTM」完全重合，无需补偿。
+        // 顶层 svg 的 localToParentTransform 是
+        // AffineTransform(1,0,0,1,borderLeft+paddingLeft,borderTop+paddingTop)
+        // × viewBoxToViewTransform，再加上 roundToInt(x())/roundToInt(y())；
+        // 其中 viewBox 部分已经含在 getCTM 里，这里只补 border/padding 与
+        // 未变换的布局位置。
+        function isNestedViewport(nvp) {
+            var p = nvp ? nvp.parentNode : null;
+            while (p && p.nodeType === 1) {
+                if (String(p.localName || '').toLowerCase() === 'svg') { return true; }
+                p = p.parentNode;
+            }
+            return false;
+        }
+
+        // 顶层 svg 的 localToParentTransform 里那个 roundToInt(x()/y()) 是
+        // 「渲染器自身的布局位置」，原点因 svg 的 display 而不同：
+        //   - 块级 / inline-block：原点是父盒的内容框，故减掉父的 border+padding；
+        //   - 行内且前面没有块级兄弟：svg 自己就是行盒的起点，原点落在父盒
+        //     内容框左上角，所以 dx/dy 里的 border+padding 要保留（即不扣）；
+        //   - 行内但前面有块级兄弟：CSS 会为行内内容生成匿名块，svg 在匿名块
+        //     里的 y 是从 0 起算的，父盒的 border+padding 和前面那些块的
+        //     高度（含 margin-bottom）都要扣掉，x 同理扣掉父盒 border+padding。
+        // 另外 position:relative 的 left/top 只移动绘制位置、不进 x()/y()。
+        var INLINE_LEVEL = /^inline|^ruby/;
+
+        function numOf(v) {
+            var n = parseFloat(v);
+            return isFinite(n) ? n : 0;
+        }
+
+        // getBoundingClientRect 带祖先的 transform，用祖先链上累积的矩阵
+        // 把 rect 差值换算回布局单位。
+        function ancestorScale(par) {
+            var a = 1, b = 0, c = 0, d = 1;
+            for (var e = par; e && e.nodeType === 1; e = e.parentNode) {
+                var cs = cssOf(e);
+                if (!cs) { break; }
+                var tf = String(cs.transform || 'none');
+                if (!tf || tf === 'none') { continue; }
+                var mm = /^matrix\(([^)]*)\)$/.exec(tf);
+                if (!mm) { continue; }
+                var v = mm[1].split(',');
+                if (v.length !== 6) { continue; }
+                var va = parseFloat(v[0]), vb = parseFloat(v[1]);
+                var vc = parseFloat(v[2]), vd = parseFloat(v[3]);
+                if (!isFinite(va) || !isFinite(vd)) { continue; }
+                var na = va * a + vc * b, nb = vb * a + vd * b;
+                var nc = va * c + vc * d, nd = vb * c + vd * d;
+                a = na; b = nb; c = nc; d = nd;
+            }
+            return {
+                x: Math.sqrt(a * a + b * b) || 1,
+                y: Math.sqrt(c * c + d * d) || 1
+            };
+        }
+
+        function rootOffset(nvp) {
+            var cs = cssOf(nvp);
+            var bl = numOf(cs && cs.borderLeftWidth);
+            var bt = numOf(cs && cs.borderTopWidth);
+            var pl = numOf(cs && cs.paddingLeft);
+            var pt = numOf(cs && cs.paddingTop);
+            var par = nvp.parentNode;
+            if (!par || par.nodeType !== 1) { return { x: bl + pl, y: bt + pt }; }
+            var sr, pr;
+            try {
+                sr = nvp.getBoundingClientRect();
+                pr = par.getBoundingClientRect();
+            } catch (eR) { return { x: bl + pl, y: bt + pt }; }
+            if (!sr || !pr) { return { x: bl + pl, y: bt + pt }; }
+            var sc = ancestorScale(par);
+            var dx = (sr.left - pr.left) / sc.x;
+            var dy = (sr.top - pr.top) / sc.y;
+            var tf = String((cs && cs.transform) || 'none');
+            if (tf && tf !== 'none') {
+                var mm = /^matrix\(([^)]*)\)$/.exec(tf);
+                if (mm) {
+                    var v = mm[1].split(',');
+                    if (v.length === 6) {
+                        var ma = parseFloat(v[0]), md = parseFloat(v[3]);
+                        var me = parseFloat(v[4]), mf = parseFloat(v[5]);
+                        if (isFinite(ma) && isFinite(md)) {
+                            var org = String((cs && cs.transformOrigin) || '0 0').split(' ');
+                            dx -= numOf(org[0]) * (1 - ma) + me;
+                            dy -= numOf(org[1]) * (1 - md) + mf;
+                        }
+                    }
                 }
-                pe = pe.parentNode;
             }
-            if (nvp && typeof nvp.getScreenCTM === 'function') {
-                try {
-                    var own = nvp.getScreenCTM();
-                    if (own) { return own; }
-                } catch (eOwn) {}
+            if (String((cs && cs.position) || 'static') === 'relative') {
+                dx -= numOf(cs.left);
+                dy -= numOf(cs.top);
             }
-            return { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+            if (INLINE_LEVEL.test(String((cs && cs.display) || ''))) {
+                var pcs = cssOf(par);
+                var contentLeft = numOf(pcs && pcs.borderLeftWidth)
+                    + numOf(pcs && pcs.paddingLeft);
+                var contentTop = numOf(pcs && pcs.borderTopWidth)
+                    + numOf(pcs && pcs.paddingTop);
+                var prevH = 0, sawBlock = false;
+                for (var s = nvp.previousSibling; s; s = s.previousSibling) {
+                    if (s.nodeType !== 1) { continue; }
+                    var scs = cssOf(s);
+                    if (!scs) { continue; }
+                    var sd = String(scs.display || '');
+                    if (INLINE_LEVEL.test(sd) || sd === 'none' || sd === 'contents') { continue; }
+                    var r = s.getBoundingClientRect();
+                    var bottom = (r.bottom - pr.top) / sc.y
+                        - contentTop + numOf(scs.marginBottom);
+                    if (bottom > prevH) { prevH = bottom; }
+                    sawBlock = true;
+                }
+                if (sawBlock) {
+                    dx -= contentLeft;
+                    dy -= contentTop + prevH;
+                }
+            }
+            return { x: Math.round(dx) + bl + pl, y: Math.round(dy) + bt + pt };
         }
 
         function mapRect(m, x, y, w, h) {
@@ -6275,15 +6374,6 @@ function __svgBuildSurface(mask) {
             return true;
         }
 
-        // RenderSVGModelObject 把 repaintRect 映射到 absolute 空间后先按像素
-        // 吸附（location 取整、尺寸不动），再与查询矩形比较——实测
-        // checkEnclosure 的边界随 svg 的整数像素偏移量漂移 ±0.5，正是这一
-        // 步吸附造成的。见 docs/移动端仿真问题清单.md F-213③。
-        function snapRect(r) {
-            return { x: Math.round(r.x), y: Math.round(r.y),
-                w: r.w, h: r.h };
-        }
-
         function isEmptyRect(r) { return !(r.w > 0 && r.h > 0); }
 
         function pointInRect(r, px, py) {
@@ -6308,22 +6398,29 @@ function __svgBuildSurface(mask) {
                 && r.y <= other.y && r.y + r.h >= other.y + other.h;
         }
 
+        // getElementCTM 用的是 localToParentTransform，不是公开的 getCTM()：
+        // 顶层 svg 的 localToParentTransform 额外含 border/padding 与
+        // roundToInt(x()/y())，公开 getCTM() 把这两项都省掉了；嵌套 svg 的
+        // 两者一致。映射后的重绘矩形不做任何取整——WebKit 直接拿
+        // ctm.mapRect(repaintRectInLocalCoordinates()) 与原始 rect 比较。
         function hitTest(el, rect, enclose) {
             if (!isGraphics(el)) { return false; }
             if (!isCandidate(el)) { return false; }
             var rp = localRepaint(el);
             if (!rp) { return false; }
             var M = null;
-            try { M = el.getScreenCTM(); } catch (e) { M = null; }
+            try { M = el.getCTM(); } catch (e) { M = null; }
             if (!M) { return false; }
             var nvp = nearestViewport(el);
             if (!nvp) { return false; }
-            var P = spaceToClient(nvp);
-            if (!P) { return false; }
-            var cr = snapRect(mapRect(M, rp.x, rp.y, rp.w, rp.h));
-            var qr = mapRect(P, rect.x, rect.y, rect.w, rect.h);
-            if (enclose) { return containsRect(qr, cr); }
-            return intersectsAllowingEmpty(qr, cr);
+            var cr = mapRect(M, rp.x, rp.y, rp.w, rp.h);
+            if (!isNestedViewport(nvp)) {
+                var off = rootOffset(nvp);
+                cr.x += off.x;
+                cr.y += off.y;
+            }
+            if (enclose) { return containsRect(rect, cr); }
+            return intersectsAllowingEmpty(rect, cr);
         }
 
         function collect(host, scope, rect, enclose) {
