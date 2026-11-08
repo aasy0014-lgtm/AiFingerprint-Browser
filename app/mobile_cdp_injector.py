@@ -6539,7 +6539,16 @@ function __svgBuildSurface(mask) {
 
         // repaintRectInLocalCoordinates：getBBox() 按 stroke-width/2 外扩
         // （RenderSVGShape::calculateStrokeBoundingBox 走 CoreGraphics
-        // CGContextReplacePathWithStrokedPath，无描边时也是恒等外扩）。
+        // CGContextReplacePathWithStrokedPath，无描边时也是恒等外扩），再交给
+        // SVGRenderSupport::intersectRepaintRectWithResources 过一遍资源：
+        //   filter  → **整体替换**成 filter 元素的 filterUnits 区域；
+        //   clipper → **交集** clipPath 子树 repaintRect 的并集；
+        //   masker  → **交集** mask 子树 repaintRect 的并集，再与 mask 元素
+        //             自身的 maskUnits 区域求交。
+        // 只认元素**自己**的这三个属性（实测 b313/b315：祖先 <g>、<svg>、
+        // 嵌套 <svg> 上的 clip-path 一律不改 repaintRect）。滤镜**不**外扩：
+        // CSS filter 属性完全不进这条路（实测 b316 f1/f2/f3 与无滤镜逐值相同），
+        // 只有 SVG filter 属性的 filterUnits 区域顶替整个矩形。
         function localRepaint(el) {
             var bb;
             try { bb = el.getBBox(); } catch (e) { return null; }
@@ -6565,8 +6574,153 @@ function __svgBuildSurface(mask) {
                     if (isFinite(sw) && sw > 0) { inf = sw / 2; }
                 }
             }
-            return { x: bb.x - inf, y: bb.y - inf,
+            var r = { x: bb.x - inf, y: bb.y - inf,
                 w: bb.width + 2 * inf, h: bb.height + 2 * inf };
+            intersectRepaintWithResources(el, r, bb);
+            return r;
+        }
+
+        // SVGLengthContext::resolveRectangle<T>：把 filter/mask 元素的
+        // x/y/width/height 按 units 解析成矩形。缺省属性是 DOM 层的默认值
+        // -10%/-10%/120%/120%，百分比在这种元素上恒按 **viewport** 解析
+        // （SVGLengthContext::resolveRectangle 里 determinant()>0 用
+        // viewportSize，objectBoundingBox 只是再叠一层 objectBoundingBox
+        // 变换），所以 userSpaceOnUse 下也不能退回 bbox 尺寸。
+        // 实测 b319 e9：mask maskUnits=userSpaceOnUse 且不写几何时，
+        // bounds = viewport 的 -10%..110%，不裁掉任何东西。
+        function resourceViewportSize(resEl) {
+            var nvp = nearestViewport(resEl) || resEl.ownerSVGElement;
+            if (!nvp) { return { w: 0, h: 0 }; }
+            var vb = nvp.viewBox && nvp.viewBox.baseVal;
+            if (vb && vb.width > 0 && vb.height > 0) {
+                return { w: vb.width, h: vb.height };
+            }
+            return { w: numOf(nvp.getAttribute('width')), h: numOf(nvp.getAttribute('height')) };
+        }
+        function resolveUnitsRect(resEl, units, obb) {
+            var obbUnits = (units === 'objectBoundingBox');
+            var vp = resourceViewportSize(resEl);
+            var refW = obbUnits ? (obb ? obb.width : 0) : vp.w;
+            var refH = obbUnits ? (obb ? obb.height : 0) : vp.h;
+            function axis(name, ref, dflt) {
+                var raw = resEl.getAttribute && resEl.getAttribute(name);
+                if (raw === null || raw === undefined || raw === '') {
+                    return ref * dflt;
+                }
+                raw = String(raw).trim();
+                var m;
+                if ((m = /^(-?[\d.]+(?:e[-+]?\d+)?)%$/.exec(raw))) {
+                    return ref * parseFloat(m[1]) / 100;
+                }
+                var n = parseFloat(raw);
+                if (!isFinite(n)) { return ref * dflt; }
+                return obbUnits ? ref * n : n;
+            }
+            var x = axis('x', refW, -0.1);
+            var y = axis('y', refH, -0.1);
+            var w = axis('width', refW, 1.2);
+            var h = axis('height', refH, 1.2);
+            if (obbUnits && obb) { x += obb.x; y += obb.y; }
+            return { x: x, y: y, w: w, h: h };
+        }
+
+        // 资源子树的 repaintRect 并集：只算直接子元素里的 shape / text / use，
+        // 跳过 display:none 与 visibility:hidden，以及 <g> 这类容器
+        // （RenderSVGResourceClipper::calculateClipContentRepaintRect 的口径）。
+        // 每个子元素再按自己的 clip/mask 递归收紧。
+        function resourceContentRect(resEl) {
+            var acc = null;
+            for (var c = resEl.firstChild; c; c = c.nextSibling) {
+                if (!c || c.nodeType !== 1) { continue; }
+                var tag = String(c.localName || '');
+                if (tag !== 'use' && !isGraphics(c) && tag !== 'text') { continue; }
+                var ccs = cssOf(c);
+                if (ccs && (ccs.display === 'none' || ccs.visibility === 'hidden')) { continue; }
+                var sub = c;
+                if (tag === 'use') {
+                    // <use> 的裁剪贡献来自它引用的那个渲染子元素。
+                    var href = c.getAttribute('href') || c.getAttribute('xlink:href') || '';
+                    var id = href.charAt(0) === '#' ? href.slice(1) : '';
+                    if (!id) { continue; }
+                    try { sub = doc.getElementById(id); } catch (eS) { sub = null; }
+                    if (!sub) { continue; }
+                } else if (!isGraphics(sub) && tag !== 'text') {
+                    continue;
+                }
+                var r = localRepaint(sub);
+                if (!r) { continue; }
+                // localToParentTransform：包含子元素自己的 transform / x-y /
+                // translate 属性（<use> 的 x/y 也在这里）。
+                var mtx = null;
+                try { mtx = c.getCTM && c.getCTM(); } catch (eM) { mtx = null; }
+                var rr = mtx ? mapRect(mtx, r.x, r.y, r.w, r.h) : r;
+                if (!acc) { acc = { x: rr.x, y: rr.y, w: rr.w, h: rr.h }; }
+                else {
+                    var x0 = Math.min(acc.x, rr.x), y0 = Math.min(acc.y, rr.y);
+                    var x1 = Math.max(acc.x + acc.w, rr.x + rr.w);
+                    var y1 = Math.max(acc.y + acc.h, rr.y + rr.h);
+                    acc = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+                }
+            }
+            // 资源里没有一个可用的裁剪/遮罩子元素时，裁剪区域为空，整条命中
+            // 归零（实测 b317 c11 空 <clipPath>、m3 空 <mask>、c8 子元素裹在
+            // <g> 里 —— 三种都 obs=0+0）。注意这与「没有 clip/mask 属性」不同，
+            // 后者压根不进这条分支。
+            if (!acc) { return { x: 0, y: 0, w: 0, h: 0 }; }
+            return acc;
+        }
+
+        function intersectRect(r, o) {
+            if (!o) { return; }
+            var x0 = Math.max(r.x, o.x), y0 = Math.max(r.y, o.y);
+            var x1 = Math.min(r.x + r.w, o.x + o.w);
+            var y1 = Math.min(r.y + r.h, o.y + o.h);
+            if (x1 <= x0 || y1 <= y0) { r.x = 0; r.y = 0; r.w = 0; r.h = 0; return; }
+            r.x = x0; r.y = y0; r.w = x1 - x0; r.h = y1 - y0;
+        }
+
+        function resourceById(el, attr) {
+            var v = el.getAttribute && el.getAttribute(attr);
+            if (!v) { return null; }
+            var m = /url\(\s*['"]?#([^'")\s]+)['"]?\s*\)/.exec(String(v));
+            if (!m) { return null; }
+            var node = null;
+            try { node = doc.getElementById(m[1]); } catch (eR2) { node = null; }
+            return node;
+        }
+
+        // SVGRenderSupport::intersectRepaintRectWithResources，逐条对应。
+        function intersectRepaintWithResources(el, r, obb) {
+            var f = resourceById(el, 'filter');
+            if (f && String(f.localName || '') === 'filter') {
+                var fr = resolveUnitsRect(f, f.getAttribute('filterUnits') || 'objectBoundingBox', obb);
+                r.x = fr.x; r.y = fr.y; r.w = fr.w; r.h = fr.h;
+            }
+            var c = resourceById(el, 'clip-path');
+            if (c && String(c.localName || '') === 'clipPath') {
+                var cr = resourceContentRect(c);
+                if (cr) {
+                    if ((c.getAttribute('clipPathUnits') || 'userSpaceOnUse') === 'objectBoundingBox') {
+                        cr = { x: obb.x + cr.x * obb.width, y: obb.y + cr.y * obb.height,
+                            w: cr.w * obb.width, h: cr.h * obb.height };
+                    }
+                    intersectRect(r, cr);
+                }
+            }
+            var m = resourceById(el, 'mask');
+            if (m && String(m.localName || '') === 'mask') {
+                var mr = resourceContentRect(m);
+                if (mr) {
+                    if ((m.getAttribute('maskContentUnits') || 'userSpaceOnUse') === 'objectBoundingBox') {
+                        mr = { x: obb.x + mr.x * obb.width, y: obb.y + mr.y * obb.height,
+                            w: mr.w * obb.width, h: mr.h * obb.height };
+                    }
+                    // mask 元素自身的 maskUnits 区域再交一次（含默认 -10%/120%）。
+                    var bounds = resolveUnitsRect(m, m.getAttribute('maskUnits') || 'objectBoundingBox', obb);
+                    intersectRect(mr, bounds);
+                    intersectRect(r, mr);
+                }
+            }
         }
 
         // 元素是否落在候选集里：WebKit 只排除 display:none 与
