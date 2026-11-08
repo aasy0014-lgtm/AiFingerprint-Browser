@@ -6207,13 +6207,17 @@ function __svgBuildSurface(mask) {
         }
 
         // 顶层 svg 的 localToParentTransform 里那个 roundToInt(x()/y()) 是
-        // 「渲染器自身的布局位置」，原点因 svg 的 display 而不同：
-        //   - 块级 / inline-block：原点是父盒的内容框，故减掉父的 border+padding；
-        //   - 行内且前面没有块级兄弟：svg 自己就是行盒的起点，原点落在父盒
-        //     内容框左上角，所以 dx/dy 里的 border+padding 要保留（即不扣）；
+        // 「渲染器自身的布局位置」，原点因定位方式而不同：
+        //   - 常规流（static/relative）：原点是父盒内容框；
+        //   - 脱离常规流（absolute/fixed）：原点是 **CSS 包含块**（不是父盒），
+        //     父盒只是 DOM 父级，两者可以完全不同；没有定位祖先时是初始包含块。
+        // 在此基础上再看 display：
+        //   - 块级 / inline-block：扣掉参照盒的 border+padding；
+        //   - 行内且前面没有块级兄弟：svg 自己就是行盒的起点，参照盒的
+        //     border+padding 保留（不扣）；
         //   - 行内但前面有块级兄弟：CSS 会为行内内容生成匿名块，svg 在匿名块
-        //     里的 y 是从 0 起算的，父盒的 border+padding 和前面那些块的
-        //     高度（含 margin-bottom）都要扣掉，x 同理扣掉父盒 border+padding。
+        //     里的 y 从 0 起算，参照盒的 border+padding 和前面那些块的高度
+        //     （含 margin-bottom）都要扣掉，x 同理扣掉参照盒 border+padding。
         // 另外 position:relative 的 left/top 只移动绘制位置、不进 x()/y()。
         var INLINE_LEVEL = /^inline|^ruby/;
 
@@ -6248,6 +6252,39 @@ function __svgBuildSurface(mask) {
             };
         }
 
+        // 脱离常规流的元素，x()/y() 相对 CSS 包含块，不是 DOM 父盒。
+        // 返回 null 表示参照的是初始包含块。
+        function containingBlock(el) {
+            var cs = cssOf(el);
+            var pos = String((cs && cs.position) || 'static');
+            if (pos !== 'absolute' && pos !== 'fixed') { return null; }
+            var p = el.parentNode;
+            if (pos === 'fixed') {
+                while (p && p.nodeType === 1) {
+                    var pcs = cssOf(p);
+                    if (!pcs) { break; }
+                    var wc = String(pcs.willChange || '');
+                    if (String(pcs.transform || 'none') !== 'none'
+                        || String(pcs.perspective || 'none') !== 'none'
+                        || String(pcs.filter || 'none') !== 'none'
+                        || (wc !== 'auto' && /transform|perspective|filter/.test(wc))) {
+                        return p;
+                    }
+                    p = p.parentNode;
+                }
+                return null;
+            }
+            while (p && p.nodeType === 1) {
+                var pcs = cssOf(p);
+                if (!pcs) { break; }
+                if (/^(absolute|relative|fixed|sticky)$/.test(String(pcs.position || ''))) {
+                    return p;
+                }
+                p = p.parentNode;
+            }
+            return null;
+        }
+
         function rootOffset(nvp) {
             var cs = cssOf(nvp);
             var bl = numOf(cs && cs.borderLeftWidth);
@@ -6256,13 +6293,20 @@ function __svgBuildSurface(mask) {
             var pt = numOf(cs && cs.paddingTop);
             var par = nvp.parentNode;
             if (!par || par.nodeType !== 1) { return { x: bl + pl, y: bt + pt }; }
+            var posv = String((cs && cs.position) || 'static');
+            var outOfFlow = (posv === 'absolute' || posv === 'fixed');
+            var ref = par, refICB = false;
+            if (outOfFlow) {
+                var cb = containingBlock(nvp);
+                if (cb) { ref = cb; } else { refICB = true; }
+            }
             var sr, pr;
             try {
                 sr = nvp.getBoundingClientRect();
-                pr = par.getBoundingClientRect();
+                pr = refICB ? { left: -scrollX, top: -scrollY } : ref.getBoundingClientRect();
             } catch (eR) { return { x: bl + pl, y: bt + pt }; }
             if (!sr || !pr) { return { x: bl + pl, y: bt + pt }; }
-            var sc = ancestorScale(par);
+            var sc = ancestorScale(refICB ? document.documentElement : ref);
             var dx = (sr.left - pr.left) / sc.x;
             var dy = (sr.top - pr.top) / sc.y;
             var tf = String((cs && cs.transform) || 'none');
@@ -6281,11 +6325,11 @@ function __svgBuildSurface(mask) {
                     }
                 }
             }
-            if (String((cs && cs.position) || 'static') === 'relative') {
+            if (posv === 'relative') {
                 dx -= numOf(cs.left);
                 dy -= numOf(cs.top);
             }
-            if (INLINE_LEVEL.test(String((cs && cs.display) || ''))) {
+            if (!outOfFlow && INLINE_LEVEL.test(String((cs && cs.display) || ''))) {
                 var pcs = cssOf(par);
                 var contentLeft = numOf(pcs && pcs.borderLeftWidth)
                     + numOf(pcs && pcs.paddingLeft);
