@@ -6537,9 +6537,7 @@ function __svgBuildSurface(mask) {
             return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
         }
 
-        // repaintRectInLocalCoordinates：getBBox() 按 stroke-width/2 外扩
-        // （RenderSVGShape::calculateStrokeBoundingBox 走 CoreGraphics
-        // CGContextReplacePathWithStrokedPath，无描边时也是恒等外扩），再交给
+        // repaintRectInLocalCoordinates：getBBox() 外扩描边后再交给
         // SVGRenderSupport::intersectRepaintRectWithResources 过一遍资源：
         //   filter  → **整体替换**成 filter 元素的 filterUnits 区域；
         //   clipper → **交集** clipPath 子树 repaintRect 的并集；
@@ -6549,6 +6547,14 @@ function __svgBuildSurface(mask) {
         // 嵌套 <svg> 上的 clip-path 一律不改 repaintRect）。滤镜**不**外扩：
         // CSS filter 属性完全不进这条路（实测 b316 f1/f2/f3 与无滤镜逐值相同），
         // 只有 SVG filter 属性的 filterUnits 区域顶替整个矩形。
+        //
+        // 外扩量分两条路，WebKit 自己就是两套实现：
+        //   <text>            RenderSVGText::strokeBoundingBox() 用
+        //                     inflate(strokeWidth) —— 四边各外扩**整段** sw。
+        //   其余 shape        LegacyRenderSVGShape::calculateStrokeBoundingBox()
+        //                     对路径做真实 stroking 再取包围盒：直线段按 cap/join
+        //                     精确外扩（butt 端点不外扩、miter 尖端可达 w/2/sin(θ/2)），
+        //                     不再是无脑 ±w/2。见 strokeOutlineRect()。
         function localRepaint(el) {
             var bb;
             try { bb = el.getBBox(); } catch (e) { return null; }
@@ -6565,19 +6571,263 @@ function __svgBuildSurface(mask) {
                         width: isFinite(aw) ? aw : 0, height: isFinite(ah) ? ah : 0 };
                 }
             }
-            var inf = 0;
             var cs = cssOf(el);
-            if (cs) {
-                var stroke = cs.stroke;
-                if (stroke && stroke !== 'none') {
-                    var sw = parseFloat(cs.strokeWidth);
-                    if (isFinite(sw) && sw > 0) { inf = sw / 2; }
-                }
-            }
-            var r = { x: bb.x - inf, y: bb.y - inf,
-                w: bb.width + 2 * inf, h: bb.height + 2 * inf };
+            var r = strokeRepaintRect(el, bb, cs);
             intersectRepaintWithResources(el, r, bb);
             return r;
+        }
+
+        // 描边外扩。四种口径（实测 b324/b328/b329/b330）：
+        //   <text>   inflate(sw)：四边各外扩**整段** sw（RenderSVGText::strokeBoundingBox）。
+        //   <image>  完全不外扩（RenderSVGImage 没有描边包围盒这条路）。
+        //   <use>    外扩取自引用链上的描边（见 useStrokeBox）。
+        //   line/polyline/polygon/path
+        //            路径真实 stroking 的包围盒：直线段按 cap/join/miter 精确算，
+        //            曲线段退化成均匀 ±sw/2（实测该口径本身就是精确解）。
+        function strokeRepaintRect(el, bb, cs) {
+            var tag = String(el.localName || '').toLowerCase();
+            if (tag === 'image') {
+                return { x: bb.x, y: bb.y, w: bb.width, h: bb.height };
+            }
+            if (tag === 'use') {
+                return useStrokeBox(el, bb, cs);
+            }
+            return withStrokeInflation(tag, el, bb, cs);
+        }
+
+        // <use> 的 stroke 是**继承属性**：自己的声明沿引用链继承给被引用元素，
+        // 被引用元素自己的声明优先（实测 b330 k22/k23：use sw4 + ref sw2 → 外扩 1，
+        // 取的是 ref 的 2，不是两者取宽）。所以按 CSS 继承顺序沿引用链逐层解析。
+        // 几何盒直接用 <use> 自己的 getBBox()——它已经把 x/y 偏移算进去了。
+        function useStrokeBox(el, bb, cs) {
+            var eff = effectiveStroke(el, cs);
+            var node = el, tag = 'use', guard = 0;
+            while (guard++ < 16) {
+                var ref = referencedElement(node);
+                if (!ref) { break; }
+                node = ref;
+                tag = String(ref.localName || '').toLowerCase();
+            }
+            return inflateFor(tag, eff.stroke, eff.strokeWidth, node, bb, cs);
+        }
+
+        // 沿引用链解析出**生效**的 stroke / stroke-width。每一层只在元素自己
+        // **声明**了该属性时才覆盖（computed 值会带上 defs 祖先的继承值，不能用来判断）。
+        function effectiveStroke(el, cs) {
+            var stroke = cs ? cs.stroke : 'none';
+            var sw = cs ? parseFloat(cs.strokeWidth) : 1;
+            var node = el, guard = 0;
+            while (guard++ < 16) {
+                var ref = referencedElement(node);
+                if (!ref) { break; }
+                var rcs = cssOf(ref);
+                if (rcs) {
+                    if (declaresStyleProp(ref, 'stroke')) { stroke = rcs.stroke; }
+                    if (declaresStyleProp(ref, 'stroke-width')) {
+                        var v = parseFloat(rcs.strokeWidth);
+                        if (isFinite(v)) { sw = v; }
+                    }
+                }
+                node = ref;
+            }
+            if (!isFinite(sw)) { sw = 1; }
+            return { stroke: stroke, strokeWidth: sw };
+        }
+
+        function declaresStyleProp(el, prop) {
+            try {
+                if (el.style && el.style.getPropertyValue(prop)) { return true; }
+            } catch (eS) { /* 无 style 属性 */ }
+            try { return el.hasAttribute(prop); } catch (eA) { return false; }
+        }
+
+        function withStrokeInflation(tag, el, bb, cs) {
+            var sw = 0, stroke = cs ? cs.stroke : 'none';
+            if (cs && stroke && stroke !== 'none') {
+                var v = parseFloat(cs.strokeWidth);
+                if (isFinite(v) && v > 0) { sw = v; }
+            }
+            return inflateFor(tag, stroke, sw, el, bb, cs);
+        }
+
+        function inflateFor(tag, stroke, sw, el, bb, cs) {
+            if (!(sw > 0) || !stroke || stroke === 'none') {
+                return { x: bb.x, y: bb.y, w: bb.width, h: bb.height };
+            }
+            if (tag === 'text') {
+                // RenderSVGText::strokeBoundingBox：inflate(strokeWidth)。
+                return { x: bb.x - sw, y: bb.y - sw,
+                    w: bb.width + 2 * sw, h: bb.height + 2 * sw };
+            }
+            var box = strokeOutlineRect(tag, el, sw / 2, cs);
+            if (!box) {
+                var inf = sw / 2;
+                return { x: bb.x - inf, y: bb.y - inf,
+                    w: bb.width + 2 * inf, h: bb.height + 2 * inf };
+            }
+            // 路径的 stroking 包围盒含填充盒，直接与 bbox 求并。
+            var x0 = Math.min(bb.x, box.x0), y0 = Math.min(bb.y, box.y0);
+            var x1 = Math.max(bb.x + bb.width, box.x1);
+            var y1 = Math.max(bb.y + bb.height, box.y1);
+            return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+        }
+
+        function referencedElement(el) {
+            var href = '';
+            try {
+                href = el.getAttribute('href') || el.getAttribute('xlink:href') || '';
+            } catch (eH) { return null; }
+            if (!href || href.charAt(0) !== '#') { return null; }
+            try { return doc.getElementById(href.slice(1)); } catch (eG) { return null; }
+        }
+
+        // 路径真实 stroking 的包围盒（仅直线段精确）。返回 null 表示这一段算不了，
+        // 调用方退回均匀 ±sw/2。曲线（C/S/Q/T/A）一律返回 null —— 实测（b330
+        // k26~k37）曲线路径的外扩量恰好就是 sw/2、与曲线形状无关，均匀口径已是
+        // 精确解；用折线近似反而偏 2~7px（b326 a4/a5/a11）。
+        function strokeOutlineRect(tag, el, r, cs) {
+            var subs = null;
+            if (tag === 'line') {
+                var x1 = numOf(el.getAttribute('x1')), y1 = numOf(el.getAttribute('y1'));
+                var x2 = numOf(el.getAttribute('x2')), y2 = numOf(el.getAttribute('y2'));
+                subs = [{ pts: [[x1, y1], [x2, y2]], closed: false }];
+            } else if (tag === 'polyline' || tag === 'polygon') {
+                var pts = parsePoints(el.getAttribute('points'));
+                if (!pts || pts.length < 2) { return null; }
+                subs = [{ pts: pts, closed: tag === 'polygon' }];
+            } else if (tag === 'path') {
+                subs = parsePathSubpaths(el.getAttribute('d'));
+                if (!subs) { return null; }
+            } else {
+                // rect/circle/ellipse/未知：均匀外扩已经精确（b328 全 err=0）。
+                return null;
+            }
+            var cap = String((cs && cs.strokeLinecap) || 'butt');
+            var join = String((cs && cs.strokeLinejoin) || 'miter');
+            var ml = parseFloat(cs && cs.strokeMiterlimit);
+            if (!isFinite(ml) || ml <= 0) { ml = 4; }
+            var box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+            var add = function (x, y) {
+                if (x < box.x0) { box.x0 = x; }
+                if (y < box.y0) { box.y0 = y; }
+                if (x > box.x1) { box.x1 = x; }
+                if (y > box.y1) { box.y1 = y; }
+            };
+            for (var si = 0; si < subs.length; si++) {
+                polylineStrokeBox(subs[si].pts, subs[si].closed, r, cap, join, ml, add);
+            }
+            if (!(box.x0 <= box.x1) || !(box.y0 <= box.y1)) { return null; }
+            return box;
+        }
+
+        function parsePoints(str) {
+            if (!str) { return null; }
+            var a = String(str).trim().split(/[\s,]+/);
+            var pts = [];
+            for (var i = 0; i + 1 < a.length; i += 2) {
+                var x = parseFloat(a[i]), y = parseFloat(a[i + 1]);
+                if (!isFinite(x) || !isFinite(y)) { return null; }
+                pts.push([x, y]);
+            }
+            return pts.length ? pts : null;
+        }
+
+        // 一条折线的描边轮廓：每段的矩形带（butt 端点不外扩、square/round 沿切向伸出 r）
+        // + 每个连接点的 miter 尖端（round 按 r 圆盒、bevel 不加）。
+        // 闭合子路径（polygon / path Z）**包含**收尾那一段和收尾顶点处的连接。
+        function polylineStrokeBox(list, closed, r, cap, join, miterLimit, add) {
+            var n = list.length;
+            if (n === 1) { add(list[0][0] - r, list[0][1] - r); add(list[0][0] + r, list[0][1] + r); return; }
+            var nseg = closed ? n : n - 1;
+            for (var i = 0; i < nseg; i++) {
+                var a = list[i], b = list[(i + 1) % n];
+                var dx = b[0] - a[0], dy = b[1] - a[1];
+                var L = Math.sqrt(dx * dx + dy * dy);
+                if (!(L > 0)) { continue; }
+                var ux = dx / L, uy = dy / L, nx = -uy, ny = ux;
+                var extA = (!closed && i === 0 && cap !== 'butt') ? r : 0;
+                var extB = (!closed && i === n - 2 && cap !== 'butt') ? r : 0;
+                var a0x = a[0] - ux * extA, a0y = a[1] - uy * extA;
+                var b0x = b[0] + ux * extB, b0y = b[1] + uy * extB;
+                add(a0x + nx * r, a0y + ny * r); add(a0x - nx * r, a0y - ny * r);
+                add(b0x + nx * r, b0y + ny * r); add(b0x - nx * r, b0y - ny * r);
+            }
+            var k0 = closed ? 0 : 1, k1 = closed ? n : n - 1;
+            for (var k = k0; k < k1; k++) {
+                var p = list[k];
+                var prev = list[(k - 1 + n) % n];
+                var next = list[(k + 1) % n];
+                var v1x = prev[0] - p[0], v1y = prev[1] - p[1];
+                var v2x = next[0] - p[0], v2y = next[1] - p[1];
+                var l1 = Math.sqrt(v1x * v1x + v1y * v1y), l2 = Math.sqrt(v2x * v2x + v2y * v2y);
+                if (!(l1 > 0) || !(l2 > 0)) { continue; }
+                v1x /= l1; v1y /= l1; v2x /= l2; v2y /= l2;
+                var c = v1x * v2x + v1y * v2y;
+                if (c > 1) { c = 1; } else if (c < -1) { c = -1; }
+                var ang = Math.acos(c);
+                if (join === 'round') { add(p[0] - r, p[1] - r); add(p[0] + r, p[1] + r); continue; }
+                if (join === 'bevel') { continue; }
+                var sinH = Math.sin(ang / 2);
+                if (!(sinH > 1e-12)) { continue; }
+                var mlen = r / sinH;
+                if (mlen > miterLimit * r) { continue; }
+                var bx = v1x + v2x, by = v1y + v2y;
+                var bl = Math.sqrt(bx * bx + by * by);
+                if (!(bl > 1e-9)) { continue; }
+                add(p[0] - bx / bl * mlen, p[1] - by / bl * mlen);
+            }
+        }
+
+        // path 的直线段子路径。遇到任何曲线命令返回 null（调用方退回均匀外扩）。
+        // 令牌表必须认**全部**命令字母：漏认会让 `C 20 10 40 10` 里的数字
+        // 被当成上一命令的坐标继续吃，把曲线悄悄解析成折线（实测 k26/k28）。
+        function parsePathSubpaths(d) {
+            if (!d) { return null; }
+            var tok = String(d).match(
+                /[MmLlHhVvCcSsQqTtAaZz]|-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g);
+            if (!tok) { return null; }
+            var i = 0, cur = [0, 0], start = [0, 0], cmd = null, subs = [], pts = null;
+            var rel = false, c = '';
+            while (i < tok.length) {
+                if (/^[MmLlHhVvCcSsQqTtAaZz]$/.test(tok[i])) { cmd = tok[i++]; }
+                else if (!cmd) { return null; }
+                rel = (cmd === cmd.toLowerCase());
+                c = cmd.toUpperCase();
+                if (i >= tok.length && c !== 'Z') { return null; }
+                if (c === 'M') {
+                    var mx = parseFloat(tok[i++]), my = parseFloat(tok[i++]);
+                    if (!isFinite(mx) || !isFinite(my)) { return null; }
+                    if (pts && pts.length > 1) { subs.push({ pts: pts, closed: false }); }
+                    cur = rel ? [cur[0] + mx, cur[1] + my] : [mx, my];
+                    start = cur.slice();
+                    pts = [[cur[0], cur[1]]];
+                    cmd = rel ? 'l' : 'L';
+                } else if (c === 'L') {
+                    var lx = parseFloat(tok[i++]), ly = parseFloat(tok[i++]);
+                    if (!isFinite(lx) || !isFinite(ly)) { return null; }
+                    cur = rel ? [cur[0] + lx, cur[1] + ly] : [lx, ly];
+                    pts.push([cur[0], cur[1]]);
+                } else if (c === 'H') {
+                    var hx = parseFloat(tok[i++]);
+                    if (!isFinite(hx)) { return null; }
+                    cur = [rel ? cur[0] + hx : hx, cur[1]];
+                    pts.push([cur[0], cur[1]]);
+                } else if (c === 'V') {
+                    var vy = parseFloat(tok[i++]);
+                    if (!isFinite(vy)) { return null; }
+                    cur = [cur[0], rel ? cur[1] + vy : vy];
+                    pts.push([cur[0], cur[1]]);
+                } else if (c === 'Z') {
+                    if (pts && pts.length > 1) { subs.push({ pts: pts, closed: true }); }
+                    cur = start.slice();
+                    pts = [[start[0], start[1]]];
+                } else {
+                    // C/S/Q/T/A 及弧线：曲线外扩不可用折线精确复现。
+                    return null;
+                }
+            }
+            if (pts && pts.length > 1) { subs.push({ pts: pts, closed: false }); }
+            return subs.length ? subs : null;
         }
 
         // SVGLengthContext::resolveRectangle<T>：把 filter/mask 元素的
